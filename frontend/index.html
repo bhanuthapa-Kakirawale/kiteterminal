@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kite Terminal</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header id="topbar">
+    <div id="topbar-left">
+      <span class="brand">Kite Terminal</span>
+      <span id="account-name" class="account-name"></span>
+    </div>
+    <div id="topbar-right">
+      <span id="feed-status" class="feed-status" hidden>reconnecting…</span>
+      <span id="connection-status" class="status-dot status-disconnected" title="Disconnected"></span>
+      <button id="refresh-btn" class="btn" hidden>Refresh</button>
+    </div>
+  </header>
+
+  <div id="connect-gate" class="gate" hidden>
+    <p>You're not connected to Zerodha.</p>
+    <button id="connect-btn" class="btn btn-primary">Connect to Zerodha</button>
+  </div>
+
+  <div id="session-expired-banner" class="banner" hidden>
+    Session expired — <button id="reconnect-btn" class="link-btn">click to reconnect</button>
+  </div>
+
+  <div id="generic-error" class="banner banner-neutral" hidden></div>
+
+  <main id="dashboard" hidden>
+    <div id="alert-banner" class="alert-banner" hidden></div>
+
+    <section id="hero-metrics" class="hero-row"></section>
+
+    <section class="table-section">
+      <h2>Holdings</h2>
+      <div class="table-scroll">
+        <table id="holdings-table">
+          <thead>
+            <tr>
+              <th data-sort-key="tradingsymbol">Symbol</th>
+              <th class="num" data-sort-key="quantity">Qty</th>
+              <th class="num" data-sort-key="average_price">Avg Price</th>
+              <th class="num" data-sort-key="last_price">LTP</th>
+              <th class="num" data-sort-key="day_change_percentage">Day Chg %</th>
+              <th class="num" data-sort-key="pnl">P&amp;L ₹</th>
+              <th class="num" data-sort-key="pnl_pct">P&amp;L %</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <details class="table-section" open>
+      <summary><h2>Positions</h2></summary>
+      <div class="table-scroll">
+        <table id="positions-table">
+          <thead>
+            <tr>
+              <th>Symbol</th><th>Product</th><th class="num">Qty</th>
+              <th class="num">Avg Price</th><th class="num">LTP</th><th class="num">P&amp;L ₹</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </details>
+
+    <details class="table-section" open>
+      <summary><h2>Mutual Funds</h2></summary>
+      <div class="table-scroll">
+        <table id="mf-table">
+          <thead>
+            <tr>
+              <th>Fund</th><th>Folio</th><th class="num">Units</th>
+              <th class="num">Avg NAV</th><th class="num">Current NAV</th><th class="num">P&amp;L ₹</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </details>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

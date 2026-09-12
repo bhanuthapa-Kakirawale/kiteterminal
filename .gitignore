@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+backend/kite_terminal.db
+backend/kite_terminal.db-*
+backend/kite_terminal.db.bak

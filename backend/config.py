@@ -1,0 +1,6 @@
+# Alert thresholds — edit these values to tune the dashboard's alert banner.
+HOLDING_LOSS_ALERT_PCT = 8.0
+CONCENTRATION_ALERT_PCT = 20.0
+DAY_PNL_ALERT_PCT = 2.0
+SESSION_EXPIRY_WARNING_MINUTES = 60
+MARGIN_ALERT_THRESHOLD_INR = 10000.0
