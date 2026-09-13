@@ -29,3 +29,15 @@ def get_account(account_id: int, conn: sqlite3.Connection | None = None) -> sqli
     finally:
         if owns_conn:
             conn.close()
+
+
+def get_trading_account(conn: sqlite3.Connection | None = None) -> sqlite3.Row:
+    """Returns the default account only if it's enabled for trading.
+
+    Raises PermissionError if the account exists but isn't account_type='trading' —
+    callers scoping an endpoint to trading-only functionality should catch this.
+    """
+    account = get_default_account(conn)
+    if account["account_type"] != "trading":
+        raise PermissionError("Account is not enabled for trading")
+    return account

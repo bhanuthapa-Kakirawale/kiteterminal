@@ -113,7 +113,7 @@ body {
   border: 1px solid var(--border-strong);
 }
 
-main#dashboard { padding: 12px 24px 40px; }
+#content-area { padding: 12px 24px 40px; flex: 1; min-width: 0; overflow-x: auto; }
 
 /* Alert banner: compact, chip-based, not a blocking modal */
 .alert-banner {
@@ -259,3 +259,397 @@ th.num, td.num { text-align: right; }
   100% { background-color: transparent; }
 }
 .flash-update { animation: flash-update 0.6s ease-out; }
+
+/* Phase 3: market status, mode banner, tickets, dialogs */
+
+.market-status-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+.market-status-badge.open { background: var(--pnl-positive-bg); color: var(--pnl-positive); }
+.market-status-badge.pre_open { background: var(--accent-amber-bg); color: var(--accent-amber); }
+.market-status-badge.closed { background: var(--bg); color: var(--text-secondary); border: 1px solid var(--border-strong); }
+
+.badge-muted {
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-secondary);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  padding: 1px 8px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.mode-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 24px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.mode-banner.mode-dry-run { background: var(--bg); color: var(--text-secondary); border-bottom: 1px solid var(--border); }
+.mode-banner.mode-live { background: var(--pnl-negative); color: #fff; }
+.mode-banner.strategy-off { background: var(--bg); color: var(--text-secondary); border-bottom: 1px solid var(--border); }
+.mode-banner.strategy-on { background: var(--pnl-positive); color: #fff; }
+
+.scan-now-result { margin-top: 8px; font-size: 13px; color: var(--text-secondary); }
+.stop-adjustment-card {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 8px;
+}
+.stop-adjustment-card .btn-reject { font-weight: 600; }
+
+.equity-curve-wrap { margin-top: 12px; }
+.equity-curve-svg { width: 100%; height: 160px; display: block; }
+
+.tab-row { display: flex; gap: 4px; margin-bottom: 12px; border-bottom: 1px solid var(--border); }
+.tab-btn {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  padding: 8px 14px; font-size: 13px; font-weight: 600; color: var(--text-secondary); cursor: pointer;
+}
+.tab-btn.active { color: var(--text); border-bottom-color: var(--accent, #2563eb); }
+.tq-panel h3 { margin-top: 18px; margin-bottom: 6px; font-size: 13px; color: var(--text-secondary); }
+
+.todays-actions-compact .row { display: flex; justify-content: space-between; padding: 4px 0; }
+
+.kill-switch-group { display: flex; align-items: center; gap: 8px; }
+.btn-small { padding: 3px 10px; font-size: 11px; }
+.emergency-exit-dialog { border-color: var(--pnl-negative); border-width: 2px; }
+.emergency-exit-dialog h2 { color: var(--pnl-negative); }
+#emergency-exit-phrase { font-family: monospace; letter-spacing: 0.05em; }
+
+.reconciliation-item {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px; border: 1px solid var(--pnl-negative); border-radius: 6px; margin-bottom: 8px;
+  background: color-mix(in srgb, var(--pnl-negative) 8%, transparent);
+}
+
+.strategy-version-row { border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; margin-bottom: 8px; }
+.strategy-version-row .version-header { font-weight: 600; display: flex; gap: 8px; align-items: baseline; }
+.strategy-version-diff { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
+.strategy-version-diff .changed-key { color: var(--text); font-weight: 600; }
+
+.mode-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.btn-danger {
+  background: var(--pnl-negative);
+  color: #fff;
+  border-color: var(--pnl-negative);
+}
+.btn-danger:hover { filter: brightness(0.9); }
+
+.trailing-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  font-size: 0;
+}
+.trailing-indicator.unknown { background: var(--text-secondary); }
+.trailing-indicator.active { background: var(--pnl-positive); }
+.trailing-indicator.stale { background: var(--pnl-negative); }
+
+/* Ticket form */
+.ticket-form {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px 14px;
+  padding: 4px 2px 12px;
+}
+.ticket-form[hidden] { display: none; }
+.ticket-form .field { display: flex; flex-direction: column; gap: 4px; }
+.ticket-form-fields { display: contents; }
+.ticket-form .field-wide { grid-column: 1 / -1; }
+.ticket-form .checkbox-field { flex-direction: row; align-items: center; gap: 6px; }
+.ticket-form label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.02em; }
+.ticket-form input, .ticket-form select, .ticket-form textarea {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  font: inherit;
+  background: var(--surface);
+  color: var(--text-primary);
+}
+.ticket-form input:disabled, .ticket-form select:disabled { background: var(--bg); color: var(--text-secondary); }
+.form-error { color: var(--pnl-negative); font-size: 12px; margin-left: 10px; }
+
+/* Status badges for ticket history */
+.status-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.status-badge.draft, .status-badge.pending_confirmation { background: var(--accent-amber-bg); color: var(--accent-amber); }
+.status-badge.confirmed { background: var(--bg); color: var(--text-secondary); }
+.status-badge.executed { background: var(--pnl-positive-bg); color: var(--pnl-positive); }
+.status-badge.rejected, .status-badge.cancelled { background: var(--bg); color: var(--text-secondary); }
+.status-badge.failed, .status-badge.protection_failed, .status-badge.risk_rejected { background: var(--pnl-negative-bg); color: var(--pnl-negative); }
+
+.row-linked { border-left: 3px solid var(--accent); }
+.row-linked td:first-child { padding-left: 7px; }
+.row-clickable { cursor: pointer; }
+
+.protection-warning {
+  background: var(--pnl-negative-bg);
+  color: var(--pnl-negative);
+  border: 1px solid var(--pnl-negative);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+/* Dialogs (first use of <dialog> in this app) */
+dialog {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 24px;
+  max-width: 480px;
+  width: 92vw;
+  background: var(--surface);
+  color: var(--text-primary);
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+dialog h2 { margin-top: 0; font-size: 16px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+.ticket-confirm-body { font-size: 13px; line-height: 1.7; }
+.ticket-confirm-body .row { display: flex; justify-content: space-between; gap: 12px; }
+.ticket-confirm-body .rationale { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); color: var(--text-secondary); }
+
+/* Phase 4: risk settings, sector mappings, risk-check breakdown */
+
+.pct-input { display: flex; align-items: center; gap: 4px; }
+.pct-input input { width: 100%; }
+.form-saved { color: var(--pnl-positive); font-size: 12px; margin-left: 10px; }
+
+.risk-check-section { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); font-size: 13px; }
+.risk-check-section h3 {
+  font-size: 11px; font-weight: 600; margin: 0 0 6px; color: var(--text-secondary);
+  text-transform: uppercase; letter-spacing: 0.03em;
+}
+.risk-check-row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
+.risk-check-row .icon { width: 16px; text-align: center; flex-shrink: 0; }
+.risk-check-row.passed .icon { color: var(--pnl-positive); }
+.risk-check-row.failed { color: var(--pnl-negative); }
+.risk-check-row.failed .icon { color: var(--pnl-negative); }
+.risk-check-row.skipped { color: var(--text-secondary); }
+.risk-check-row.skipped .icon { color: var(--accent-amber); }
+
+.ticket-dialog.risk-rejected-mode { border: 2px solid var(--pnl-negative); }
+.ticket-dialog.risk-rejected-mode h2 { color: var(--pnl-negative); }
+
+/* Phase 5: ticket history filters, detail dialog, unmapped-symbols panel */
+
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 14px;
+  padding: 4px 2px 12px;
+}
+.filter-row .field { display: flex; flex-direction: column; gap: 4px; }
+.filter-row label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.02em; }
+.filter-row input, .filter-row select {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  font: inherit;
+  background: var(--surface);
+  color: var(--text-primary);
+}
+.filter-row .checkbox-field { flex-direction: row; align-items: center; gap: 6px; }
+
+#unmapped-symbols-panel { margin-bottom: 12px; }
+#unmapped-symbols-panel h3 {
+  font-size: 11px; font-weight: 600; margin: 0 0 6px; color: var(--text-secondary);
+  text-transform: uppercase; letter-spacing: 0.03em;
+}
+.chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip-row .chip {
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: var(--accent-amber-bg);
+  color: var(--accent-amber);
+  border: 1px solid var(--accent-amber);
+  cursor: pointer;
+}
+.chip-row .empty { color: var(--text-secondary); font-size: 12px; }
+
+.row-action-btn {
+  font-size: 11px;
+  padding: 2px 8px;
+  margin-right: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  cursor: pointer;
+}
+.row-action-btn:hover { background: var(--bg); }
+.row-action-btn.danger { color: var(--pnl-negative); border-color: var(--pnl-negative); }
+
+#ticket-detail-events h3, .risk-check-section h3 {
+  font-size: 11px; font-weight: 600; margin: 10px 0 6px; color: var(--text-secondary);
+  text-transform: uppercase; letter-spacing: 0.03em;
+}
+.event-row { display: flex; gap: 10px; padding: 3px 0; font-size: 12px; border-bottom: 1px solid var(--border); }
+.event-row .event-time { color: var(--text-secondary); white-space: nowrap; font-family: var(--mono); }
+.event-row .event-type { font-weight: 600; white-space: nowrap; }
+.event-row .event-detail { color: var(--text-secondary); }
+
+/* Phase 6: navigation shell (header/sidebar/content) + configurable Dashboard panels */
+
+#topbar-left { gap: 10px; }
+
+#app-shell {
+  display: flex;
+  align-items: flex-start;
+  min-height: calc(100vh - 45px); /* below the fixed-height topbar */
+}
+
+#sidebar {
+  flex-shrink: 0;
+  width: 180px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 10px 0;
+  position: sticky;
+  top: 45px;
+  align-self: flex-start;
+  transition: width 0.15s ease;
+}
+#sidebar.collapsed { width: 48px; }
+#sidebar.collapsed .nav-label { display: none; }
+#sidebar.collapsed .nav-item { justify-content: center; }
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 16px;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  border-left: 3px solid transparent;
+}
+.nav-item:hover { background: var(--bg); color: var(--text-primary); }
+.nav-item.active {
+  background: var(--bg);
+  color: var(--accent);
+  border-left-color: var(--accent);
+  font-weight: 600;
+}
+.nav-icon { width: 16px; text-align: center; flex-shrink: 0; }
+.nav-label { white-space: nowrap; overflow: hidden; }
+
+#content-area { min-width: 0; }
+
+.view .coming-soon {
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+/* Dashboard panel grid */
+
+#dashboard-customize-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+#add-panel-control select {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 5px 8px;
+  font: inherit;
+  background: var(--surface);
+  color: var(--text-primary);
+}
+
+#dashboard-panels-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+.panel-wrapper.panel-small { grid-column: span 1; }
+.panel-wrapper.panel-medium { grid-column: span 2; }
+.panel-wrapper.panel-large { grid-column: span 3; }
+
+/* Below the 3-column threshold, every panel takes the full row regardless
+   of its configured size — not a priority to be fully responsive, but this
+   keeps a narrow window from clipping content sideways. */
+@media (max-width: 900px) {
+  #dashboard-panels-grid { grid-template-columns: 1fr; }
+  .panel-wrapper.panel-small, .panel-wrapper.panel-medium, .panel-wrapper.panel-large { grid-column: span 1; }
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  margin-bottom: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  font-size: 12px;
+}
+.panel-header[hidden] { display: none; }
+.panel-drag-handle { cursor: grab; color: var(--text-secondary); }
+.panel-drag-handle:active { cursor: grabbing; }
+.panel-title { font-weight: 600; flex: 1; }
+.panel-controls { display: flex; gap: 4px; }
+.panel-size-btn {
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  border-radius: var(--radius);
+  font-size: 11px;
+  width: 22px;
+  height: 20px;
+  cursor: pointer;
+}
+.panel-size-btn.active-size { background: var(--accent); color: #fff; border-color: var(--accent); }
+.panel-hide-btn {
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  border-radius: var(--radius);
+  font-size: 11px;
+  width: 20px;
+  height: 20px;
+  cursor: pointer;
+  color: var(--pnl-negative);
+}
+
+#dashboard-panels-grid.customize-mode .panel-wrapper {
+  outline: 1px dashed var(--border-strong);
+  outline-offset: 4px;
+  border-radius: var(--radius);
+}
+#dashboard-panels-grid .sortable-ghost { opacity: 0.4; }

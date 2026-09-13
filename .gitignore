@@ -5,3 +5,6 @@ __pycache__/
 backend/kite_terminal.db
 backend/kite_terminal.db-*
 backend/kite_terminal.db.bak
+backend/kite_terminal*.bak
+backend/kite_terminal*_bak
+backend/ui_prefs.json

@@ -1,10 +1,10 @@
 from datetime import datetime, timedelta, timezone
 
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from kiteconnect import KiteConnect
 
 from backend import crypto
-from backend.accounts import get_account, get_default_account
+from backend.accounts import get_account, get_default_account, get_trading_account
 from backend.db import get_connection
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -121,3 +121,19 @@ def require_kite() -> KiteConnect:
                 "message": "Not connected to Zerodha. Please log in.",
             },
         )
+
+
+def require_trading_account(kite: KiteConnect = Depends(require_kite)) -> KiteConnect:
+    # Hard server-side gate for every ticket/order/execution endpoint: rejects
+    # with 403 regardless of what the UI shows or hides.
+    try:
+        get_trading_account()
+    except PermissionError:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error_code": "NOT_TRADING_ACCOUNT",
+                "message": "This account is not enabled for trading.",
+            },
+        )
+    return kite

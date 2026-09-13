@@ -3,3 +3,4 @@ uvicorn[standard]==0.34.0
 kiteconnect==5.0.1
 python-dotenv==1.0.1
 cryptography==50.0.1
+pandas==2.2.3

@@ -9,15 +9,63 @@
 <body>
   <header id="topbar">
     <div id="topbar-left">
+      <button id="sidebar-toggle-btn" class="btn" title="Toggle sidebar">☰</button>
       <span class="brand">Kite Terminal</span>
       <span id="account-name" class="account-name"></span>
     </div>
     <div id="topbar-right">
+      <span id="market-status-badge" class="market-status-badge" hidden></span>
+      <span id="trailing-indicator" class="trailing-indicator unknown" hidden title="Trailing engine status">⟳</span>
       <span id="feed-status" class="feed-status" hidden>reconnecting…</span>
       <span id="connection-status" class="status-dot status-disconnected" title="Disconnected"></span>
       <button id="refresh-btn" class="btn" hidden>Refresh</button>
+      <button id="logout-btn" class="btn" hidden>Logout</button>
     </div>
   </header>
+
+  <!-- Persistent regardless of active sidebar section. -->
+  <div id="mode-banner" class="mode-banner mode-dry-run" hidden>
+    <span id="mode-banner-text">DRY RUN — no real orders will be placed</span>
+    <span class="kill-switch-group">
+      <button id="cancel-all-pending-btn" class="btn btn-small" title="Cancel every draft/pending ticket">Cancel All Pending</button>
+      <button id="emergency-exit-all-btn" class="btn btn-danger btn-small" title="Exit every open position immediately">⛔ Emergency Exit All</button>
+    </span>
+    <label class="mode-toggle">
+      <input type="checkbox" id="mode-toggle-checkbox" />
+      <span>Live trading</span>
+    </label>
+  </div>
+  <div id="alert-banner" class="alert-banner" hidden></div>
+
+  <dialog id="cancel-all-pending-dialog" class="ticket-dialog">
+    <h2>Cancel All Pending Tickets?</h2>
+    <p id="cancel-all-pending-summary"></p>
+    <div class="dialog-actions">
+      <button id="cancel-all-pending-cancel-btn" class="btn" autofocus>Back</button>
+      <button id="cancel-all-pending-confirm-btn" class="btn btn-danger">Cancel All</button>
+    </div>
+  </dialog>
+
+  <dialog id="emergency-exit-dialog" class="ticket-dialog emergency-exit-dialog">
+    <h2>⛔ Emergency Exit All Open Positions</h2>
+    <p>Every open position below will be closed with a MARKET SELL order, respecting the current
+       <strong id="emergency-exit-mode-label">Dry Run</strong> mode.</p>
+    <div class="table-wrap">
+      <table id="emergency-exit-preview-table">
+        <thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">Stop</th><th>Strategy</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="field">
+      <label for="emergency-exit-phrase">Type <strong>EXIT ALL</strong> to confirm</label>
+      <input id="emergency-exit-phrase" autocomplete="off" placeholder="EXIT ALL" />
+    </div>
+    <span id="emergency-exit-error" class="form-error"></span>
+    <div class="dialog-actions">
+      <button id="emergency-exit-cancel-btn" class="btn" autofocus>Cancel</button>
+      <button id="emergency-exit-confirm-btn" class="btn btn-danger" disabled>Confirm Emergency Exit</button>
+    </div>
+  </dialog>
 
   <div id="connect-gate" class="gate" hidden>
     <p>You're not connected to Zerodha.</p>
@@ -30,62 +78,911 @@
 
   <div id="generic-error" class="banner banner-neutral" hidden></div>
 
-  <main id="dashboard" hidden>
-    <div id="alert-banner" class="alert-banner" hidden></div>
+  <div id="app-shell" hidden>
+    <nav id="sidebar">
+      <button class="nav-item active" data-section-id="dashboard">
+        <span class="nav-icon">▦</span><span class="nav-label">Dashboard</span>
+      </button>
+      <button class="nav-item" data-section-id="new-ticket" hidden>
+        <span class="nav-icon">✎</span><span class="nav-label">New Ticket</span>
+      </button>
+      <button class="nav-item" data-section-id="trade-queue" hidden>
+        <span class="nav-icon">⧉</span><span class="nav-label">Trade Queue</span>
+      </button>
+      <button class="nav-item" data-section-id="ticket-history" hidden>
+        <span class="nav-icon">☰</span><span class="nav-label">Ticket History</span>
+      </button>
+      <button class="nav-item" data-section-id="orders-trades" hidden>
+        <span class="nav-icon">⇄</span><span class="nav-label">Orders &amp; Trades</span>
+      </button>
+      <button class="nav-item" data-section-id="watchlist" hidden>
+        <span class="nav-icon">★</span><span class="nav-label">Watchlist</span>
+      </button>
+      <button class="nav-item" data-section-id="strategies" hidden>
+        <span class="nav-icon">⚙</span><span class="nav-label">Strategies</span>
+      </button>
+      <button class="nav-item" data-section-id="todays-actions" hidden>
+        <span class="nav-icon">☀</span><span class="nav-label">Today's Actions</span>
+      </button>
+      <button class="nav-item" data-section-id="journal" hidden>
+        <span class="nav-icon">▤</span><span class="nav-label">Journal</span>
+      </button>
+      <button class="nav-item" data-section-id="settings" hidden>
+        <span class="nav-icon">⚒</span><span class="nav-label">Settings</span>
+      </button>
+    </nav>
 
-    <section id="hero-metrics" class="hero-row"></section>
+    <main id="content-area">
 
-    <section class="table-section">
-      <h2>Holdings</h2>
-      <div class="table-scroll">
-        <table id="holdings-table">
-          <thead>
-            <tr>
-              <th data-sort-key="tradingsymbol">Symbol</th>
-              <th class="num" data-sort-key="quantity">Qty</th>
-              <th class="num" data-sort-key="average_price">Avg Price</th>
-              <th class="num" data-sort-key="last_price">LTP</th>
-              <th class="num" data-sort-key="day_change_percentage">Day Chg %</th>
-              <th class="num" data-sort-key="pnl">P&amp;L ₹</th>
-              <th class="num" data-sort-key="pnl_pct">P&amp;L %</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
+    <div class="view" id="view-dashboard">
+      <div id="market-closed-note" class="banner banner-neutral" hidden>Market Closed — showing last close</div>
+      <div id="dashboard-customize-bar">
+        <label class="mode-toggle">
+          <input type="checkbox" id="customize-mode-toggle" />
+          <span>Customize Layout</span>
+        </label>
+        <div id="add-panel-control" hidden>
+          <select id="add-panel-select">
+            <option value="">Add Panel…</option>
+          </select>
+        </div>
       </div>
-    </section>
+      <div id="dashboard-panels-grid">
+        <div class="panel-wrapper panel-small" data-panel-type="portfolio_summary">
+          <div class="panel-header" hidden>
+            <span class="panel-drag-handle" title="Drag to reorder">⠿</span>
+            <span class="panel-title">Portfolio Summary</span>
+            <span class="panel-controls">
+              <button class="panel-size-btn" data-size="small">S</button>
+              <button class="panel-size-btn" data-size="medium">M</button>
+              <button class="panel-size-btn" data-size="large">L</button>
+              <button class="panel-hide-btn" title="Hide panel">✕</button>
+            </span>
+          </div>
+          <section id="hero-metrics" class="hero-row"></section>
+        </div>
 
-    <details class="table-section" open>
-      <summary><h2>Positions</h2></summary>
-      <div class="table-scroll">
-        <table id="positions-table">
-          <thead>
-            <tr>
-              <th>Symbol</th><th>Product</th><th class="num">Qty</th>
-              <th class="num">Avg Price</th><th class="num">LTP</th><th class="num">P&amp;L ₹</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
+        <div class="panel-wrapper panel-large" data-panel-type="holdings_table">
+          <div class="panel-header" hidden>
+            <span class="panel-drag-handle" title="Drag to reorder">⠿</span>
+            <span class="panel-title">Holdings</span>
+            <span class="panel-controls">
+              <button class="panel-size-btn" data-size="small">S</button>
+              <button class="panel-size-btn" data-size="medium">M</button>
+              <button class="panel-size-btn" data-size="large">L</button>
+              <button class="panel-hide-btn" title="Hide panel">✕</button>
+            </span>
+          </div>
+          <section class="table-section">
+            <h2>Holdings</h2>
+            <div class="table-scroll">
+              <table id="holdings-table">
+                <thead>
+                  <tr>
+                    <th data-sort-key="tradingsymbol">Symbol</th>
+                    <th class="num" data-sort-key="quantity">Qty</th>
+                    <th class="num" data-sort-key="average_price">Avg Price</th>
+                    <th class="num" data-sort-key="last_price">LTP</th>
+                    <th class="num" data-sort-key="day_change_percentage">Day Chg %</th>
+                    <th class="num" data-sort-key="pnl">P&amp;L ₹</th>
+                    <th class="num" data-sort-key="pnl_pct">P&amp;L %</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+
+        <div class="panel-wrapper panel-large" data-panel-type="positions_table">
+          <div class="panel-header" hidden>
+            <span class="panel-drag-handle" title="Drag to reorder">⠿</span>
+            <span class="panel-title">Positions</span>
+            <span class="panel-controls">
+              <button class="panel-size-btn" data-size="small">S</button>
+              <button class="panel-size-btn" data-size="medium">M</button>
+              <button class="panel-size-btn" data-size="large">L</button>
+              <button class="panel-hide-btn" title="Hide panel">✕</button>
+            </span>
+          </div>
+          <details class="table-section" open>
+            <summary><h2>Positions</h2></summary>
+            <div class="table-scroll">
+              <table id="positions-table">
+                <thead>
+                  <tr>
+                    <th>Symbol</th><th>Product</th><th class="num">Qty</th>
+                    <th class="num">Avg Price</th><th class="num">LTP</th><th class="num">P&amp;L ₹</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </details>
+        </div>
+
+        <div class="panel-wrapper panel-large" data-panel-type="mf_table">
+          <div class="panel-header" hidden>
+            <span class="panel-drag-handle" title="Drag to reorder">⠿</span>
+            <span class="panel-title">Mutual Funds</span>
+            <span class="panel-controls">
+              <button class="panel-size-btn" data-size="small">S</button>
+              <button class="panel-size-btn" data-size="medium">M</button>
+              <button class="panel-size-btn" data-size="large">L</button>
+              <button class="panel-hide-btn" title="Hide panel">✕</button>
+            </span>
+          </div>
+          <details class="table-section" open>
+            <summary><h2>Mutual Funds</h2></summary>
+            <div class="table-scroll">
+              <table id="mf-table">
+                <thead>
+                  <tr>
+                    <th>Fund</th><th>Folio</th><th class="num">Units</th>
+                    <th class="num">Avg NAV</th><th class="num">Current NAV</th><th class="num">P&amp;L ₹</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </details>
+        </div>
+        <div class="panel-wrapper panel-medium" data-panel-type="watchlist_summary" hidden>
+          <div class="panel-header" hidden>
+            <span class="panel-drag-handle" title="Drag to reorder">⠿</span>
+            <span class="panel-title">Watchlist</span>
+            <span class="panel-controls">
+              <button class="panel-size-btn" data-size="small">S</button>
+              <button class="panel-size-btn" data-size="medium">M</button>
+              <button class="panel-size-btn" data-size="large">L</button>
+              <button class="panel-hide-btn" title="Hide panel">✕</button>
+            </span>
+          </div>
+          <section class="table-section">
+            <h2>Watchlist</h2>
+            <div class="table-scroll">
+              <table id="watchlist-summary-table">
+                <thead>
+                  <tr>
+                    <th>Symbol</th><th class="num">LTP</th><th>Trend</th>
+                    <th class="num">RSI-14</th><th>vs 20-day High</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+        <div class="panel-wrapper panel-medium" data-panel-type="todays_actions" hidden>
+          <div class="panel-header" hidden>
+            <span class="panel-drag-handle" title="Drag to reorder">⠿</span>
+            <span class="panel-title">Today's Actions</span>
+            <span class="panel-controls">
+              <button class="panel-size-btn" data-size="small">S</button>
+              <button class="panel-size-btn" data-size="medium">M</button>
+              <button class="panel-size-btn" data-size="large">L</button>
+              <button class="panel-hide-btn" title="Hide panel">✕</button>
+            </span>
+          </div>
+          <section class="table-section">
+            <h2>Today's Actions</h2>
+            <div id="todays-actions-panel-body" class="todays-actions-compact"></div>
+          </section>
+        </div>
       </div>
-    </details>
-
-    <details class="table-section" open>
-      <summary><h2>Mutual Funds</h2></summary>
-      <div class="table-scroll">
-        <table id="mf-table">
-          <thead>
-            <tr>
-              <th>Fund</th><th>Folio</th><th class="num">Units</th>
-              <th class="num">Avg NAV</th><th class="num">Current NAV</th><th class="num">P&amp;L ₹</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
+      <div id="dashboard-empty-note" class="banner banner-neutral" hidden>
+        No panels visible — click Add Panel to get started.
       </div>
-    </details>
-  </main>
+    </div>
 
+    <div class="view" id="view-new-ticket" hidden>
+      <details class="table-section" open>
+        <summary><h2>Create Test Ticket <span class="badge-muted">testing / rare use</span></h2></summary>
+        <form id="ticket-form" class="ticket-form">
+          <div class="field">
+            <label for="ticket-symbol">Symbol</label>
+            <input id="ticket-symbol" name="symbol" list="symbol-options" autocomplete="off" required />
+            <datalist id="symbol-options"></datalist>
+          </div>
+          <div class="field">
+            <label for="ticket-direction">Direction</label>
+            <select id="ticket-direction" name="transaction_type" required>
+              <option value="BUY">BUY</option>
+              <option value="SELL">SELL</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="ticket-quantity">Quantity</label>
+            <input id="ticket-quantity" name="quantity" type="number" min="1" step="1" required />
+          </div>
+          <div class="field">
+            <label for="ticket-entry-type">Entry Order Type</label>
+            <select id="ticket-entry-type" name="entry_order_type" required>
+              <option value="MARKET">MARKET</option>
+              <option value="LIMIT">LIMIT</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="ticket-entry-price">Entry Price</label>
+            <input id="ticket-entry-price" name="entry_price" type="number" step="any" min="0.01" required />
+          </div>
+          <div class="field">
+            <label for="ticket-product-type">Product</label>
+            <select id="ticket-product-type" name="product_type" required>
+              <option value="CNC">CNC</option>
+              <option value="MIS">MIS</option>
+              <option value="NRML">NRML</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="ticket-stop-loss">Stop-loss</label>
+            <input id="ticket-stop-loss" name="stop_loss" type="number" step="any" min="0.01" required />
+          </div>
+          <div class="field">
+            <label for="ticket-target-1">Target 1</label>
+            <input id="ticket-target-1" name="target_1" type="number" step="any" min="0.01" required />
+          </div>
+          <div class="field">
+            <label for="ticket-target-2">Target 2 (optional)</label>
+            <input id="ticket-target-2" name="target_2" type="number" step="any" min="0.01" />
+          </div>
+          <div class="field checkbox-field">
+            <label><input id="ticket-trailing-enabled" name="trailing_enabled" type="checkbox" /> Enable trailing</label>
+          </div>
+          <div class="field">
+            <label for="ticket-trailing-trigger">Trailing trigger</label>
+            <select id="ticket-trailing-trigger" name="trailing_trigger" disabled>
+              <option value="after_target_1">After target 1</option>
+              <option value="manual">Manual</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="ticket-trailing-distance">Trailing distance (₹)</label>
+            <input id="ticket-trailing-distance" name="trailing_distance" type="number" step="any" min="0.01" disabled />
+          </div>
+          <div class="field field-wide">
+            <label for="ticket-rationale">Rationale (required)</label>
+            <textarea id="ticket-rationale" name="rationale" rows="2" required></textarea>
+          </div>
+          <div class="field field-wide">
+            <button type="submit" class="btn btn-primary">Create Ticket</button>
+            <span id="ticket-form-error" class="form-error"></span>
+          </div>
+        </form>
+      </details>
+    </div>
+
+    <div class="view" id="view-ticket-history" hidden>
+      <details class="table-section" open>
+        <summary><h2>Ticket History</h2></summary>
+        <div class="filter-row">
+          <div class="field">
+            <label for="tf-status">Status</label>
+            <select id="tf-status">
+              <option value="">All</option>
+              <option value="draft">Draft</option>
+              <option value="pending_confirmation">Pending Confirmation</option>
+              <option value="confirmed">Confirmed</option>
+              <option value="executed">Executed</option>
+              <option value="rejected">Rejected</option>
+              <option value="risk_rejected">Risk Rejected</option>
+              <option value="cancelled">Cancelled</option>
+              <option value="failed">Failed</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="tf-source">Source</label>
+            <select id="tf-source">
+              <option value="">All</option>
+              <option value="manual">Manual</option>
+              <option value="strategy">Strategy</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="tf-symbol">Symbol</label>
+            <input id="tf-symbol" placeholder="e.g. TCS" />
+          </div>
+          <div class="field">
+            <label for="tf-date-from">From</label>
+            <input id="tf-date-from" type="date" />
+          </div>
+          <div class="field">
+            <label for="tf-date-to">To</label>
+            <input id="tf-date-to" type="date" />
+          </div>
+          <div class="field checkbox-field">
+            <label><input id="tf-show-archived" type="checkbox" /> Show archived</label>
+          </div>
+          <div class="field">
+            <button id="tf-apply-btn" class="btn">Apply</button>
+            <button id="tf-clear-btn" class="btn">Clear</button>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table id="tickets-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th>
+                <th class="num">Stop</th><th class="num">Target 1</th><th>Trailing</th>
+                <th>Status</th><th>Mode</th><th>Created</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+    </div>
+
+    <div class="view" id="view-settings" hidden>
+      <details class="table-section">
+        <summary><h2>Risk Settings</h2></summary>
+        <form id="risk-settings-form" class="ticket-form">
+          <div class="field">
+            <label for="rs-max-risk-per-trade">Max Risk / Trade</label>
+            <div class="pct-input"><input id="rs-max-risk-per-trade" name="max_risk_per_trade_pct" type="number" step="any" min="0.01" max="100" required /><span>%</span></div>
+          </div>
+          <div class="field">
+            <label for="rs-max-capital-per-trade">Max Capital / Trade</label>
+            <div class="pct-input"><input id="rs-max-capital-per-trade" name="max_capital_per_trade_pct" type="number" step="any" min="0.01" max="100" required /><span>%</span></div>
+          </div>
+          <div class="field">
+            <label for="rs-max-open-positions">Max Open Positions</label>
+            <input id="rs-max-open-positions" name="max_open_positions" type="number" step="1" min="1" required />
+          </div>
+          <div class="field">
+            <label for="rs-max-single-stock">Max Single-Stock Exposure</label>
+            <div class="pct-input"><input id="rs-max-single-stock" name="max_single_stock_exposure_pct" type="number" step="any" min="0.01" max="100" required /><span>%</span></div>
+          </div>
+          <div class="field">
+            <label for="rs-max-sector">Max Sector Exposure</label>
+            <div class="pct-input"><input id="rs-max-sector" name="max_sector_exposure_pct" type="number" step="any" min="0.01" max="100" required /><span>%</span></div>
+          </div>
+          <div class="field">
+            <label for="rs-max-total-risk">Max Total Portfolio Risk</label>
+            <div class="pct-input"><input id="rs-max-total-risk" name="max_total_portfolio_risk_pct" type="number" step="any" min="0.01" max="100" required /><span>%</span></div>
+          </div>
+          <div class="field">
+            <label for="rs-min-rr">Min Risk:Reward</label>
+            <input id="rs-min-rr" name="min_risk_reward" type="number" step="any" min="0.01" required />
+          </div>
+          <div class="field field-wide">
+            <button type="submit" class="btn btn-primary">Save Settings</button>
+            <span id="risk-settings-error" class="form-error"></span>
+            <span id="risk-settings-saved" class="form-saved" hidden>Saved</span>
+            <button type="button" id="risk-settings-history-toggle" class="link-btn" style="margin-left:auto">History</button>
+          </div>
+        </form>
+        <div class="table-scroll" id="risk-settings-history-panel" hidden>
+          <table id="risk-settings-history-table">
+            <thead><tr><th>Field</th><th>Old</th><th>New</th><th>Changed</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+
+      <details class="table-section">
+        <summary><h2>Sector Mappings <span class="badge-muted">seeded from holdings; add/edit as needed</span></h2></summary>
+
+        <div id="unmapped-symbols-panel">
+          <h3>Unmapped Symbols</h3>
+          <div id="unmapped-symbols-list" class="chip-row"></div>
+        </div>
+
+        <form id="sector-mapping-form" class="ticket-form">
+          <div class="field"><label for="sm-symbol">Symbol</label><input id="sm-symbol" name="symbol" required /></div>
+          <div class="field">
+            <label for="sm-sector">Sector</label>
+            <input id="sm-sector" name="sector" list="sector-options" required />
+            <datalist id="sector-options"></datalist>
+          </div>
+          <div class="field field-wide">
+            <button type="submit" class="btn">Save Mapping</button>
+            <span id="sector-mapping-error" class="form-error"></span>
+          </div>
+        </form>
+        <div class="table-scroll">
+          <table id="sector-mappings-table">
+            <thead><tr><th>Symbol</th><th>Sector</th><th>Added</th><th>Actions</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+    </div>
+
+    <div class="view" id="view-orders-trades" hidden>
+      <details class="table-section" id="orders-section">
+        <summary><h2>Orders</h2></summary>
+        <div class="table-scroll">
+          <table id="orders-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th>
+                <th>Status</th><th>Order Type</th><th>Ticket</th><th></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+
+      <details class="table-section" id="trades-section">
+        <summary><h2>Trades</h2></summary>
+        <div class="table-scroll">
+          <table id="trades-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th>Ticket</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+
+      <details class="table-section" id="gtts-section">
+        <summary><h2>GTTs</h2></summary>
+        <div class="table-scroll">
+          <table id="gtts-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Type</th><th>Trigger(s)</th><th>Status</th><th>Ticket</th><th></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+    </div>
+
+    <div class="view" id="view-watchlist" hidden>
+      <details class="table-section" open>
+        <summary><h2>Add to Watchlist</h2></summary>
+        <form id="watchlist-add-form" class="ticket-form">
+          <div class="field">
+            <label for="wl-symbol">Symbol</label>
+            <input id="wl-symbol" name="symbol" list="symbol-options" autocomplete="off" required />
+          </div>
+          <div class="field field-wide">
+            <label for="wl-notes">Notes (optional)</label>
+            <input id="wl-notes" name="notes" placeholder="why you're watching this" />
+          </div>
+          <div class="field field-wide">
+            <button type="submit" class="btn btn-primary">Add to Watchlist</button>
+            <span id="watchlist-add-error" class="form-error"></span>
+          </div>
+        </form>
+      </details>
+
+      <details class="table-section" open>
+        <summary><h2>Watchlist</h2></summary>
+        <div class="table-scroll">
+          <table id="watchlist-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th class="num">LTP</th><th class="num">Day Chg %</th>
+                <th>Trend</th><th class="num">RSI-14</th><th>vs 20-day High</th>
+                <th>Notes</th><th></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+    </div>
+    <div class="view" id="view-strategies" hidden>
+      <div class="filter-row">
+        <div class="field">
+          <label for="strategy-select">Strategy</label>
+          <select id="strategy-select"></select>
+        </div>
+      </div>
+
+      <div id="strategy-status-banner" class="mode-banner strategy-off">
+        <span id="strategy-enabled-state">OFF — not scanning</span>
+        <span id="strategy-last-disabled" class="badge-muted" hidden></span>
+        <label class="mode-toggle">
+          <input type="checkbox" id="strategy-enabled-toggle" />
+          <span>Enabled</span>
+        </label>
+      </div>
+
+      <details class="table-section" open>
+        <summary><h2 id="strategy-params-title">Parameters</h2></summary>
+        <form id="strategy-params-form" class="ticket-form">
+          <div id="strategy-params-fields" class="ticket-form-fields"></div>
+          <div class="field field-wide">
+            <button type="submit" class="btn btn-primary">Save Parameters</button>
+            <button type="button" id="scan-now-btn" class="btn">Scan Now (all enabled strategies)</button>
+            <span id="strategy-params-error" class="form-error"></span>
+          </div>
+        </form>
+        <div id="scan-now-result" class="scan-now-result"></div>
+      </details>
+
+      <details class="table-section">
+        <summary><h2>Version History</h2></summary>
+        <div id="strategy-version-history"></div>
+      </details>
+
+      <details class="table-section" open>
+        <summary><h2>Signal Queue</h2></summary>
+        <div class="table-wrap">
+          <table id="signal-queue-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th>
+                <th class="num">Stop</th><th class="num">Target</th><th>Trailing</th>
+                <th>Status</th><th>Mode</th><th>Created</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+
+      <details class="table-section" open>
+        <summary><h2>Breakeven Stop Adjustments</h2></summary>
+        <div id="stop-adjustments-list"></div>
+      </details>
+
+      <details class="table-section" open>
+        <summary><h2>Backtest</h2></summary>
+        <form id="backtest-form" class="ticket-form">
+          <div class="field">
+            <label for="bt-strategy-select">Strategy</label>
+            <select id="bt-strategy-select"></select>
+          </div>
+          <div class="field">
+            <label for="bt-start-date">Start date</label>
+            <input id="bt-start-date" type="date" required />
+          </div>
+          <div class="field">
+            <label for="bt-end-date">End date</label>
+            <input id="bt-end-date" type="date" required />
+          </div>
+          <div class="field field-wide">
+            <label for="bt-symbols">Symbols (comma-separated; blank = current watchlist)</label>
+            <input id="bt-symbols" placeholder="e.g. TCS, INFY" />
+          </div>
+          <div class="field checkbox-field">
+            <input id="bt-run-walk-forward" type="checkbox" />
+            <label for="bt-run-walk-forward">Consistency-check windows</label>
+          </div>
+          <div class="field">
+            <label for="bt-window-days">Window size (days)</label>
+            <input id="bt-window-days" type="number" min="1" step="1" value="90" />
+          </div>
+          <div class="field checkbox-field">
+            <input id="bt-run-monte-carlo" type="checkbox" />
+            <label for="bt-run-monte-carlo">Monte Carlo (1000 reshuffles)</label>
+          </div>
+          <div class="field field-wide">
+            <button type="submit" class="btn btn-primary">Run Backtest</button>
+            <span id="backtest-error" class="form-error"></span>
+          </div>
+        </form>
+        <div id="backtest-results" hidden>
+          <div class="metrics-grid">
+            <div class="row"><span>Signals</span><strong id="bt-r-total"></strong></div>
+            <div class="row"><span>Win rate</span><strong id="bt-r-winrate"></strong></div>
+            <div class="row"><span>Avg R multiple</span><strong id="bt-r-avgr"></strong></div>
+            <div class="row"><span>Profit factor</span><strong id="bt-r-pf"></strong></div>
+            <div class="row"><span>Max drawdown</span><strong id="bt-r-dd"></strong></div>
+            <div class="row"><span>Sharpe ratio</span><strong id="bt-r-sharpe"></strong></div>
+            <div class="row"><span>Sortino ratio</span><strong id="bt-r-sortino"></strong></div>
+            <div class="row"><span>Max consecutive losses</span><strong id="bt-r-maxlosses"></strong></div>
+            <div class="row"><span>Recovery factor</span><strong id="bt-r-recovery"></strong></div>
+            <div class="row"><span>Avg win / loss (R)</span><strong id="bt-r-avgwinloss"></strong></div>
+            <div class="row"><span>Time in market</span><strong id="bt-r-timeinmarket"></strong></div>
+          </div>
+          <div id="bt-monte-carlo-summary" class="scan-now-result" hidden></div>
+          <details id="bt-walk-forward-section" hidden>
+            <summary><h3>Consistency-Check Windows <span class="badge-muted">not walk-forward optimization — no parameter refitting</span></h3></summary>
+            <div class="table-wrap">
+              <table id="bt-walk-forward-table">
+                <thead>
+                  <tr>
+                    <th>Window</th><th class="num">Signals</th><th class="num">Win Rate</th>
+                    <th class="num">Avg R</th><th class="num">Profit Factor</th><th class="num">Max DD</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </details>
+          <div class="table-wrap">
+            <table id="backtest-trades-table">
+              <thead>
+                <tr>
+                  <th>Symbol</th><th>Entry Date</th><th class="num">Entry</th>
+                  <th>Exit Date</th><th class="num">Exit</th><th>Reason</th>
+                  <th class="num">R</th><th>Outcome</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </details>
+    </div>
+    <div class="view" id="view-journal" hidden>
+      <div class="filter-row">
+        <div class="field">
+          <label for="journal-mode-select">Mode</label>
+          <select id="journal-mode-select">
+            <option value="live">Live</option>
+            <option value="dry_run">Dry Run</option>
+          </select>
+        </div>
+      </div>
+      <div id="journal-sample-warning" class="banner banner-neutral" hidden>
+        Small sample size — these stats are not yet statistically meaningful.
+      </div>
+
+      <details class="table-section" open>
+        <summary><h2>Overall Performance</h2></summary>
+        <div class="metrics-grid" id="journal-overall-stats"></div>
+        <div id="journal-equity-curve" class="equity-curve-wrap"></div>
+      </details>
+
+      <details class="table-section" open>
+        <summary><h2>By Strategy</h2></summary>
+        <div class="table-wrap">
+          <table id="journal-strategy-table">
+            <thead>
+              <tr>
+                <th>Strategy</th><th class="num">Trades</th><th class="num">Win Rate</th>
+                <th class="num">Expectancy (R)</th><th class="num">Profit Factor</th><th class="num">Total P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+
+      <details class="table-section" open>
+        <summary><h2>By Symbol</h2></summary>
+        <div class="table-wrap">
+          <table id="journal-symbol-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th class="num">Trades</th><th class="num">Win Rate</th>
+                <th class="num">Expectancy (R)</th><th class="num">Profit Factor</th><th class="num">Total P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+    </div>
+
+    <div class="view" id="view-todays-actions" hidden>
+      <details class="table-section" open>
+        <summary><h2>Buy Candidates</h2></summary>
+        <div class="table-wrap">
+          <table id="ta-buy-table">
+            <thead><tr><th>Symbol</th><th class="num">Entry</th><th class="num">Stop</th><th class="num">Target</th><th>Rationale</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+      <details class="table-section" open>
+        <summary><h2>Exit Candidates</h2></summary>
+        <div class="table-wrap">
+          <table id="ta-exit-table">
+            <thead><tr><th>Symbol</th><th class="num">Qty</th><th>Rationale</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+      <details class="table-section" open>
+        <summary><h2>Pending Adjustments</h2></summary>
+        <div id="ta-adjustments-list"></div>
+      </details>
+      <details class="table-section" open>
+        <summary><h2>Watch <span class="badge-muted">close to breaking out, no signal yet</span></h2></summary>
+        <div class="table-wrap">
+          <table id="ta-watch-table">
+            <thead><tr><th>Symbol</th><th class="num">Last Close</th><th class="num">20-day High</th><th class="num">Distance</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+      <div id="ta-no-action" class="scan-now-result"></div>
+    </div>
+
+    <div class="view" id="view-trade-queue" hidden>
+      <div class="tab-row">
+        <button class="tab-btn active" data-tq-tab="ready">Ready</button>
+        <button class="tab-btn" data-tq-tab="waiting">Waiting</button>
+        <button class="tab-btn" data-tq-tab="rejected">Rejected</button>
+        <button class="tab-btn" data-tq-tab="executed">Executed</button>
+      </div>
+      <div class="tq-panel" data-tq-panel="ready">
+        <div class="table-wrap">
+          <table id="tq-ready-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th>
+                <th class="num">Stop</th><th class="num">Target</th><th>Trailing</th><th>Status</th><th>Mode</th><th>Created</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="tq-panel" data-tq-panel="waiting" hidden>
+        <h3>Draft Tickets</h3>
+        <div class="table-wrap">
+          <table id="tq-waiting-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th>
+                <th class="num">Stop</th><th class="num">Target</th><th>Trailing</th><th>Status</th><th>Mode</th><th>Created</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <h3>Watch List <span class="badge-muted">not yet a ticket</span></h3>
+        <div class="table-wrap">
+          <table id="tq-watch-ref-table">
+            <thead><tr><th>Symbol</th><th class="num">Last Close</th><th class="num">20-day High</th><th class="num">Distance</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="tq-panel" data-tq-panel="rejected" hidden>
+        <div class="filter-row">
+          <div class="field">
+            <label for="tq-rejected-filter">Show</label>
+            <select id="tq-rejected-filter">
+              <option value="">Both</option>
+              <option value="rejected">Rejected</option>
+              <option value="risk_rejected">Risk Rejected</option>
+            </select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="tq-rejected-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th>
+                <th class="num">Stop</th><th class="num">Target</th><th>Trailing</th><th>Status</th><th>Mode</th><th>Created</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="tq-panel" data-tq-panel="executed" hidden>
+        <div class="table-wrap">
+          <table id="tq-executed-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th>
+                <th class="num">Stop</th><th class="num">Target</th><th>Trailing</th><th>Status</th><th>Mode</th><th>Created</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <details class="table-section" open>
+        <summary><h2>Reconciliation <span class="badge-muted">broker state vs. app state</span></h2></summary>
+        <div id="reconciliation-list"></div>
+      </details>
+    </div>
+
+    </main>
+  </div>
+
+  <dialog id="ticket-confirm-dialog" class="ticket-dialog">
+    <h2 id="ticket-confirm-title">Confirm Trade Ticket</h2>
+    <div id="ticket-confirm-body" class="ticket-confirm-body"></div>
+    <div id="ticket-risk-check-body" class="risk-check-section"></div>
+    <div class="dialog-actions">
+      <button id="ticket-reject-btn" class="btn" autofocus>Reject</button>
+      <button id="ticket-confirm-btn" class="btn btn-primary">Confirm &amp; Execute</button>
+      <button id="ticket-modify-btn" class="btn btn-primary" hidden>Modify Ticket</button>
+      <button id="ticket-archive-btn" class="btn btn-danger" hidden>Archive</button>
+    </div>
+  </dialog>
+
+  <dialog id="live-mode-confirm-dialog" class="ticket-dialog">
+    <h2>⚠ Switching to LIVE Trading</h2>
+    <p>You are about to switch execution mode to <strong>LIVE</strong>. Every confirmed ticket from
+       this point on will place a real order and a real GTT with your broker, using real money.</p>
+    <div class="dialog-actions">
+      <button id="live-mode-cancel-btn" class="btn" autofocus>Cancel</button>
+      <button id="live-mode-confirm-btn" class="btn btn-danger">Yes, I understand — enable LIVE trading</button>
+    </div>
+  </dialog>
+
+  <dialog id="ticket-detail-dialog" class="ticket-dialog">
+    <h2>Ticket Detail</h2>
+    <div id="ticket-detail-body" class="ticket-confirm-body"></div>
+    <form id="ticket-edit-form" class="ticket-form" hidden>
+      <div class="field">
+        <label for="te-symbol">Symbol</label>
+        <input id="te-symbol" name="symbol" list="symbol-options" autocomplete="off" required />
+      </div>
+      <div class="field">
+        <label for="te-direction">Direction</label>
+        <select id="te-direction" name="transaction_type" required>
+          <option value="BUY">BUY</option>
+          <option value="SELL">SELL</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="te-quantity">Quantity</label>
+        <input id="te-quantity" name="quantity" type="number" min="1" step="1" required />
+      </div>
+      <div class="field">
+        <label for="te-entry-type">Entry Order Type</label>
+        <select id="te-entry-type" name="entry_order_type" required>
+          <option value="MARKET">MARKET</option>
+          <option value="LIMIT">LIMIT</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="te-entry-price">Entry Price</label>
+        <input id="te-entry-price" name="entry_price" type="number" step="any" min="0.01" required />
+      </div>
+      <div class="field">
+        <label for="te-product-type">Product</label>
+        <select id="te-product-type" name="product_type" required>
+          <option value="CNC">CNC</option>
+          <option value="MIS">MIS</option>
+          <option value="NRML">NRML</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="te-stop-loss">Stop-loss</label>
+        <input id="te-stop-loss" name="stop_loss" type="number" step="any" min="0.01" required />
+      </div>
+      <div class="field">
+        <label for="te-target-1">Target 1</label>
+        <input id="te-target-1" name="target_1" type="number" step="any" min="0.01" required />
+      </div>
+      <div class="field">
+        <label for="te-target-2">Target 2 (optional)</label>
+        <input id="te-target-2" name="target_2" type="number" step="any" min="0.01" />
+      </div>
+      <div class="field checkbox-field">
+        <label><input id="te-trailing-enabled" name="trailing_enabled" type="checkbox" /> Enable trailing</label>
+      </div>
+      <div class="field">
+        <label for="te-trailing-trigger">Trailing trigger</label>
+        <select id="te-trailing-trigger" name="trailing_trigger" disabled>
+          <option value="after_target_1">After target 1</option>
+          <option value="manual">Manual</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="te-trailing-distance">Trailing distance (₹)</label>
+        <input id="te-trailing-distance" name="trailing_distance" type="number" step="any" min="0.01" disabled />
+      </div>
+      <div class="field field-wide">
+        <label for="te-rationale">Rationale (required)</label>
+        <textarea id="te-rationale" name="rationale" rows="2" required></textarea>
+      </div>
+      <div class="field field-wide">
+        <button type="submit" class="btn btn-primary">Save Changes</button>
+        <span id="ticket-edit-error" class="form-error"></span>
+      </div>
+    </form>
+    <div id="ticket-detail-events" class="risk-check-section"></div>
+    <div class="dialog-actions">
+      <button id="ticket-detail-close-btn" class="btn" autofocus>Close</button>
+      <button id="ticket-detail-edit-btn" class="btn btn-primary" hidden>Edit</button>
+      <button id="ticket-detail-delete-btn" class="btn btn-danger" hidden>Delete</button>
+      <button id="ticket-detail-archive-btn" class="btn btn-danger" hidden>Archive</button>
+    </div>
+  </dialog>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.2/Sortable.min.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
