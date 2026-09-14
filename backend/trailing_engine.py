@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from kiteconnect.exceptions import GeneralException, InputException, OrderException
 
-from backend import config, execution, journal, kite_client
+from backend import config, execution, instruments, journal, kite_client, market, reconciliation
 from backend.accounts import get_default_account
 from backend.db import get_connection
 from backend.ticker import ticker_manager
@@ -44,11 +44,13 @@ async def _tick_once() -> None:
             _last_active_count = 0
             return
 
+        # An entry still waiting for its fill has no position to trail yet.
         tickets = conn.execute(
             """
             SELECT * FROM trade_tickets
             WHERE account_id = ? AND mode = 'live' AND status = 'executed'
               AND trailing_enabled = 1 AND closed_at IS NULL
+              AND COALESCE(entry_fill_status, 'filled') != 'pending'
             """,
             (account["id"],),
         ).fetchall()
@@ -62,25 +64,37 @@ async def _tick_once() -> None:
             return  # heartbeat still fires — UI can tell "ran but skipped" from "not running"
 
         gtts = kite.get_gtts()
-        active_gtt_ids = {g["id"] for g in gtts}
+        gtt_status = {g["id"]: g.get("status", "active") for g in gtts}
         keys = [f"{t['exchange']}:{t['symbol']}" for t in tickets]
         ltp_data = kite.ltp(keys)
 
         for ticket in tickets:
-            _process_ticket(kite, conn, ticket, ltp_data, active_gtt_ids)
+            _process_ticket(kite, conn, ticket, ltp_data, gtt_status)
         conn.commit()
     finally:
         conn.close()
 
 
-def _process_ticket(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, ltp_data: dict, active_gtt_ids: set) -> None:
+def _process_ticket(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, ltp_data: dict, gtt_status: dict) -> None:
     if ticket["kite_gtt_id"] is None:
         # No GTT exists to manage (e.g. protection_failed at execution time) —
         # nothing for the trailing engine to do until a human intervenes.
         return
 
-    if ticket["kite_gtt_id"] not in active_gtt_ids:
-        _handle_gtt_closure(kite, conn, ticket)
+    status = gtt_status.get(ticket["kite_gtt_id"])
+    if status != "active":
+        # Gone from the book, or 'triggered': the stop/target fired. Any other
+        # state (deleted/cancelled/disabled/rejected/expired) only counts as a
+        # close when a matching exit fill exists — otherwise the position is
+        # still open and has merely lost its protection. (get_gtts() lists
+        # non-active GTTs too; treating every listed id as active meant a
+        # triggered stop was never noticed.)
+        exit_side = execution.resolve_exit_side(ticket["transaction_type"])
+        fill = _find_matching_fill(kite, ticket, exit_side)
+        if status in (None, "triggered") or fill is not None:
+            _handle_gtt_closure(kite, conn, ticket, fill)
+        else:
+            _handle_protection_lost(conn, ticket, status)
         return
 
     key = f"{ticket['exchange']}:{ticket['symbol']}"
@@ -124,18 +138,14 @@ def _find_matching_fill(kite, ticket: sqlite3.Row, exit_side: str) -> dict | Non
     return candidates[0]
 
 
-def _handle_gtt_closure(kite, conn: sqlite3.Connection, ticket: sqlite3.Row) -> None:
-    """A GTT that was being monitored has disappeared from Kite (triggered
-    or deleted externally). Historically this only set closed_at on the
-    original ticket, with no record anywhere of what price the position
-    actually exited at. Phase 6 needs that price to compute realized P&L,
-    so this now synthesizes a proper executed SELL ticket (closes_ticket_id
-    set) before marking the original closed, and runs it through the exact
-    same closed_trades computation exit tickets use — one code path for
-    "how did this position's P&L get computed," regardless of whether a
-    human/strategy explicitly exited or Kite auto-triggered the stop/target."""
+def _handle_gtt_closure(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, fill: dict | None) -> None:
+    """A GTT that was being monitored has fired (or disappeared from Kite).
+    Synthesizes a proper executed SELL ticket (closes_ticket_id set) before
+    marking the original closed, and runs it through the exact same
+    closed_trades computation exit tickets use — one code path for "how did
+    this position's P&L get computed," regardless of whether a human/strategy
+    explicitly exited or Kite auto-triggered the stop/target."""
     exit_side = execution.resolve_exit_side(ticket["transaction_type"])
-    fill = _find_matching_fill(kite, ticket, exit_side)
 
     if fill is not None:
         fill_price = fill["average_price"]
@@ -175,16 +185,17 @@ def _handle_gtt_closure(kite, conn: sqlite3.Connection, ticket: sqlite3.Row) -> 
             transaction_type, quantity, entry_price, entry_order_type,
             stop_loss, target_1, target_2,
             trailing_enabled, product_type, use_gtt, risk_amount, risk_reward_ratio,
-            rationale, status, mode, executed_at, closes_ticket_id, rule_checklist
+            rationale, status, mode, executed_at, closes_ticket_id, rule_checklist,
+            entry_fill_status, filled_price, filled_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'MARKET', ?, ?, NULL,
-                  0, ?, 1, ?, ?, ?, 'executed', ?, datetime('now'), ?, ?)
+                  0, ?, 1, ?, ?, ?, 'executed', ?, datetime('now'), ?, ?, ?, ?, datetime('now'))
         """,
         (
             ticket["account_id"], ticket["source"], ticket["strategy_name"], ticket["symbol"],
             ticket["exchange"], ticket["instrument_token"], exit_side, ticket["quantity"], fill_price,
             ticket["stop_loss"], ticket["target_1"], ticket["product_type"],
             metrics["risk_amount"], metrics["risk_reward_ratio"], rationale, ticket["mode"],
-            ticket["id"], rule_checklist,
+            ticket["id"], rule_checklist, "filled" if fill is not None else "estimated", fill_price,
         ),
     )
     sell_ticket_id = cursor.lastrowid
@@ -200,6 +211,19 @@ def _handle_gtt_closure(kite, conn: sqlite3.Connection, ticket: sqlite3.Row) -> 
         journal.record_closed_trade(conn, sell_ticket_id)
     except ValueError:
         logger.exception("Failed to record closed_trades row for synthesized exit ticket %d", sell_ticket_id)
+    ticker_manager.broadcast({"type": "tickets_changed", "reason": "gtt_closed", "ticket_id": ticket["id"]})
+
+
+def _handle_protection_lost(conn: sqlite3.Connection, ticket: sqlite3.Row, gtt_status: str) -> None:
+    detail = (
+        f"{ticket['symbol']}: protective GTT {ticket['kite_gtt_id']} is '{gtt_status}' on Kite and no exit fill "
+        f"was found — the position is still OPEN but UNPROTECTED. Place a stop-loss in Kite."
+    )
+    conn.execute("UPDATE trade_tickets SET kite_gtt_id = NULL WHERE id = ?", (ticket["id"],))
+    _log_event(conn, ticket["id"], "modified", detail)
+    reconciliation.log_mismatch(conn, ticket["id"], "order_status", expected=f"GTT {ticket['kite_gtt_id']} active",
+                                actual=f"GTT {gtt_status}", detail=detail)
+    ticker_manager.broadcast({"type": "trailing_error", "ticket_id": ticket["id"], "message": detail})
 
 
 def _try_activate(conn: sqlite3.Connection, ticket: sqlite3.Row, ltp: float) -> None:
@@ -217,12 +241,15 @@ def _try_activate(conn: sqlite3.Connection, ticket: sqlite3.Row, ltp: float) -> 
 def _try_ratchet(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, ltp: float) -> None:
     current_stop = ticket["current_stop_loss"]
     distance = ticket["trailing_distance"]
+    tick = instruments.get_tick_size(ticket["symbol"], ticket["exchange"])
 
+    # Snapped onto the tick grid (Kite rejects off-grid trigger prices), in
+    # the direction that keeps the trail distance at least as wide as asked.
     if ticket["transaction_type"] == "BUY":
-        candidate = ltp - distance
+        candidate = market.round_to_tick(ltp - distance, tick, "down")
         should_update = candidate > current_stop
     else:
-        candidate = ltp + distance
+        candidate = market.round_to_tick(ltp + distance, tick, "up")
         should_update = candidate < current_stop
 
     if not should_update:
@@ -242,7 +269,7 @@ def _try_ratchet(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, ltp: float
                 "quantity": ticket["quantity"],
                 "order_type": "LIMIT",
                 "product": ticket["product_type"],
-                "price": execution.buffered_stop_price(candidate, ticket["transaction_type"]),
+                "price": execution.buffered_stop_price(candidate, ticket["transaction_type"], tick),
             }],
         )
     except (OrderException, InputException, GeneralException) as e:

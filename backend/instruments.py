@@ -2,7 +2,7 @@ import logging
 
 from kiteconnect import KiteConnect
 
-from backend import config
+from backend import config, market
 from backend.db import get_connection
 
 logger = logging.getLogger(__name__)
@@ -24,8 +24,8 @@ def refresh_instrument_cache(kite: KiteConnect) -> int:
         conn.executemany(
             """
             INSERT INTO instrument_cache
-                (instrument_token, tradingsymbol, name, exchange, segment, instrument_type, last_price)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (instrument_token, tradingsymbol, name, exchange, segment, instrument_type, last_price, tick_size)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -36,6 +36,7 @@ def refresh_instrument_cache(kite: KiteConnect) -> int:
                     row.get("segment"),
                     row.get("instrument_type"),
                     row.get("last_price"),
+                    row.get("tick_size"),
                 )
                 for row in rows
             ],
@@ -91,6 +92,19 @@ def search_instruments(query: str, limit: int = 20) -> list[dict]:
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+def get_tick_size(symbol: str, exchange: str = "NSE") -> float:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT tick_size FROM instrument_cache WHERE tradingsymbol = ? AND exchange = ?",
+            (symbol.strip().upper(), exchange),
+        ).fetchone()
+    finally:
+        conn.close()
+    tick = row["tick_size"] if row is not None else None
+    return tick if tick and tick > 0 else market.DEFAULT_TICK_SIZE
 
 
 def get_instrument_by_symbol(symbol: str, exchange: str = "NSE"):

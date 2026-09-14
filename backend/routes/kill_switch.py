@@ -24,6 +24,7 @@ def _build_exit_preview(conn, account) -> list[dict]:
             "ticket_id": p["id"], "symbol": p["symbol"], "quantity": p["quantity"],
             "entry_price": p["entry_price"], "stop_loss": p["stop_loss"], "target_1": p["target_1"],
             "current_stop_loss": p["current_stop_loss"], "strategy_name": p["strategy_name"], "mode": p["mode"],
+            "entry_fill_status": p["entry_fill_status"],
         }
         for p in positions
     ]
@@ -49,6 +50,23 @@ def _fetch_ltps(kite: KiteConnect, positions: list) -> dict:
         return {}
 
 
+def _cancel_unfilled_entry(kite: KiteConnect, conn, position) -> dict | None:
+    """An entry that hasn't filled yet has nothing to sell — cancel the order
+    instead (order_monitor.py then removes its GTT and closes the ticket).
+    Returns None if the cancel fails — most likely the order filled a moment
+    ago — so the caller falls back to a normal market exit."""
+    try:
+        kite.cancel_order(variety=position["order_variety"] or kite.VARIETY_REGULAR, order_id=position["kite_order_id"])
+    except Exception:
+        return None
+    detail = f"Emergency exit: unfilled entry order {position['kite_order_id']} cancelled"
+    conn.execute(
+        "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'modified', ?)", (position["id"], detail)
+    )
+    conn.commit()
+    return {"ticket_id": position["id"], "symbol": position["symbol"], "status": "entry_cancelled", "message": detail}
+
+
 @router.post("/api/kill-switch/emergency-exit-confirm")
 def emergency_exit_confirm(req: EmergencyExitConfirmRequest, kite: KiteConnect = Depends(require_trading_account)):
     if req.confirmation_phrase.strip() != _REQUIRED_PHRASE:
@@ -60,11 +78,18 @@ def emergency_exit_confirm(req: EmergencyExitConfirmRequest, kite: KiteConnect =
     account = get_trading_account()
     conn = get_connection()
     try:
+        mode = execution.get_execution_mode()
         positions = risk_engine.list_open_positions(conn, account["id"])
         ltp_data = _fetch_ltps(kite, positions)
 
         results = []
         for pos in positions:
+            if mode == "live" and pos["entry_fill_status"] == "pending" and pos["kite_order_id"]:
+                cancelled = _cancel_unfilled_entry(kite, conn, pos)
+                if cancelled is not None:
+                    results.append(cancelled)
+                    continue
+
             ticket_id = _create_emergency_exit_ticket(conn, account, pos, ltp_data)
             try:
                 risk_engine.run_risk_checks_and_transition(conn, account, ticket_id, kite)
@@ -88,7 +113,6 @@ def emergency_exit_confirm(req: EmergencyExitConfirmRequest, kite: KiteConnect =
                 "status": data["status"], "message": data["execution_message"],
             })
 
-        mode = conn.execute("SELECT mode FROM execution_settings WHERE id = 1").fetchone()["mode"]
         system_events.log_event(
             conn, account["id"], "emergency_exit_all",
             f"{len(positions)} position(s) exited in {mode} mode: {', '.join(p['symbol'] for p in positions) or '(none)'}",

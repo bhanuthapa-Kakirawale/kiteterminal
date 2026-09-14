@@ -65,6 +65,7 @@ const API = {
   deleteTicket: (id) => fetchJsonMutate(`/api/tickets/${id}`, "DELETE"),
   confirmTicket: (id) => fetchJsonMutate(`/api/tickets/${id}/confirm`, "POST"),
   rejectTicket: (id, reason) => fetchJsonMutate(`/api/tickets/${id}/reject`, "POST", { reason }),
+  revertRejection: (id) => fetchJsonMutate(`/api/tickets/${id}/revert-rejection`, "POST"),
   startTrailing: (id) => fetchJsonMutate(`/api/tickets/${id}/start_trailing`, "POST"),
 
   getExecutionMode: () => fetchJson("/api/execution/mode"),
@@ -124,6 +125,10 @@ const API = {
 
   // Phase 8: strategy versioning
   getStrategyVersions: (strategyName) => fetchJson(`/api/strategies/${encodeURIComponent(strategyName)}/versions`),
+
+  // Autopilot
+  automationStatus: () => fetchJson("/api/automation/status"),
+  automationRunNow: () => fetchJsonMutate("/api/automation/run-now", "POST"),
 };
 
 const el = {
@@ -210,6 +215,7 @@ const el = {
   ticketDetailEditBtn: document.getElementById("ticket-detail-edit-btn"),
   ticketDetailDeleteBtn: document.getElementById("ticket-detail-delete-btn"),
   ticketDetailArchiveBtn: document.getElementById("ticket-detail-archive-btn"),
+  ticketDetailRevertBtn: document.getElementById("ticket-detail-revert-btn"),
   ticketEditForm: document.getElementById("ticket-edit-form"),
   ticketEditError: document.getElementById("ticket-edit-error"),
   teTrailingEnabled: document.getElementById("te-trailing-enabled"),
@@ -306,6 +312,35 @@ const el = {
   btMonteCarloSummary: document.getElementById("bt-monte-carlo-summary"),
   btWalkForwardSection: document.getElementById("bt-walk-forward-section"),
   btWalkForwardBody: document.querySelector("#bt-walk-forward-table tbody"),
+
+  // Approvals inbox, autopilot, toasts, theme
+  apEntries: document.getElementById("ap-entries"),
+  apExits: document.getElementById("ap-exits"),
+  apAdjustments: document.getElementById("ap-adjustments"),
+  apBlocked: document.getElementById("ap-blocked"),
+  apRuns: document.getElementById("ap-runs"),
+  apEmpty: document.getElementById("ap-empty"),
+  apRefreshBtn: document.getElementById("ap-refresh-btn"),
+  viewApprovals: document.getElementById("view-approvals"),
+  autopilotCard: document.getElementById("autopilot-card"),
+  autopilotPill: document.getElementById("autopilot-pill"),
+  autopilotPillText: document.getElementById("autopilot-pill-text"),
+  modePill: document.getElementById("mode-pill"),
+  navBadgeApprovals: document.getElementById("nav-badge-approvals"),
+  navBadgeTradeQueue: document.getElementById("nav-badge-trade-queue"),
+  dashApprovalsCallout: document.getElementById("dash-approvals-callout"),
+  dashApprovalsText: document.getElementById("dash-approvals-text"),
+  dashApprovalsOpen: document.getElementById("dash-approvals-open"),
+  toastStack: document.getElementById("toast-stack"),
+  appConfirmDialog: document.getElementById("app-confirm-dialog"),
+  appConfirmTitle: document.getElementById("app-confirm-title"),
+  appConfirmBody: document.getElementById("app-confirm-body"),
+  appConfirmOk: document.getElementById("app-confirm-ok"),
+  appConfirmCancel: document.getElementById("app-confirm-cancel"),
+  themeToggleBtn: document.getElementById("theme-toggle-btn"),
+  ticketConfirmExecNote: document.getElementById("ticket-confirm-exec-note"),
+  ticketPreview: document.getElementById("ticket-preview"),
+  strategyInfo: document.getElementById("strategy-info"),
 };
 
 // Populated from GET /api/config at startup — see backend/config.py to tune.
@@ -371,6 +406,12 @@ const state = {
 
   // Phase 8: reconciliation
   reconciliationMismatches: [],
+
+  // Approvals inbox / autopilot
+  automationStatus: null,
+  approvals: null,
+  activeConfirmTicket: null,
+  activeDetailTicket: null,
 };
 
 const TRAILING_CHECK_INTERVAL_SECONDS = 45; // mirrors backend/config.py
@@ -425,6 +466,108 @@ function fmt(n, decimals = 2) {
   return n.toLocaleString("en-IN", {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
+  });
+}
+
+const _ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+function esc(value) {
+  return value == null ? "" : String(value).replace(/[&<>"']/g, (c) => _ESC[c]);
+}
+
+function inr(n, decimals = 2) {
+  return n == null || Number.isNaN(n) ? "—" : `₹${fmt(n, decimals)}`;
+}
+
+// SQLite's datetime('now') is UTC without a zone marker.
+function parseUtc(ts) {
+  if (!ts) return null;
+  return new Date(/[zZ]$|[+-]\d\d:\d\d$/.test(ts) ? ts : `${ts.replace(" ", "T")}Z`);
+}
+
+function fmtDateTime(ts) {
+  const d = parseUtc(ts);
+  if (!d || Number.isNaN(d.getTime())) return esc(ts ?? "—");
+  return d.toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+function fmtDate(isoDate) {
+  if (!isoDate) return "—";
+  return new Date(`${isoDate}T00:00:00`).toLocaleDateString("en-IN", { weekday: "short", day: "2-digit", month: "short" });
+}
+
+function istDateOf(d) {
+  return new Date(d.getTime() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+function sideHtml(side) {
+  return `<span class="side-pill ${side === "SELL" ? "sell" : "buy"}">${esc(side)}</span>`;
+}
+
+function strategyChipHtml(name) {
+  return name
+    ? `<span class="chip strategy">${esc(strategyLabel(name.replace(/_exit$/, "")))}</span>`
+    : `<span class="chip">Manual</span>`;
+}
+
+function modeChipHtml(mode) {
+  if (!mode) return "—";
+  return mode === "live" ? `<span class="chip live">LIVE</span>` : `<span class="chip dry">DRY RUN</span>`;
+}
+
+function setBadge(node, n) {
+  node.hidden = !n;
+  node.textContent = n > 99 ? "99+" : String(n);
+}
+
+function setCount(id, n) {
+  const node = document.getElementById(id);
+  node.textContent = n;
+  node.classList.toggle("zero", !n);
+}
+
+// ---- Toasts & confirm dialog (replace window.alert/confirm/prompt) ----
+
+const TOAST_ICONS = { success: "✓", error: "!", warning: "!", info: "i" };
+
+function toast(message, { type = "info", title = null, timeout = null } = {}) {
+  const node = document.createElement("div");
+  node.className = `toast ${type}`;
+  node.setAttribute("role", type === "error" ? "alert" : "status");
+  node.innerHTML = `
+    <span class="toast-icon">${TOAST_ICONS[type] || "i"}</span>
+    <div>${title ? `<div class="toast-title">${esc(title)}</div>` : ""}<div class="toast-msg">${esc(message)}</div></div>
+    <button class="toast-close" aria-label="Dismiss">×</button>`;
+  const dismiss = () => {
+    node.classList.add("leaving");
+    setTimeout(() => node.remove(), 180);
+  };
+  node.querySelector(".toast-close").addEventListener("click", dismiss);
+  el.toastStack.appendChild(node);
+  const ms = timeout ?? (type === "error" || type === "warning" ? 9000 : 5000);
+  if (ms > 0) setTimeout(dismiss, ms);
+  while (el.toastStack.children.length > 5) el.toastStack.firstElementChild.remove();
+}
+
+function confirmAction({ title, message = "", html = "", okLabel = "Confirm", danger = false, okClass = null }) {
+  return new Promise((resolve) => {
+    el.appConfirmTitle.textContent = title;
+    el.appConfirmBody.innerHTML = html || `<p>${esc(message)}</p>`;
+    el.appConfirmOk.textContent = okLabel;
+    el.appConfirmOk.className = `btn ${okClass || (danger ? "btn-danger" : "btn-primary")}`;
+    const finish = (value) => {
+      el.appConfirmOk.removeEventListener("click", onOk);
+      el.appConfirmCancel.removeEventListener("click", onCancel);
+      el.appConfirmDialog.removeEventListener("close", onClose);
+      if (el.appConfirmDialog.open) el.appConfirmDialog.close();
+      resolve(value);
+    };
+    const onOk = () => finish(true);
+    const onCancel = () => finish(false);
+    const onClose = () => finish(false);
+    el.appConfirmOk.addEventListener("click", onOk);
+    el.appConfirmCancel.addEventListener("click", onCancel);
+    el.appConfirmDialog.addEventListener("close", onClose);
+    el.appConfirmDialog.showModal();
   });
 }
 
@@ -553,7 +696,9 @@ function evaluateAlerts(view, totalValue, dayPnl, margins, sessionStatus) {
   }
 
   for (const t of state.tickets) {
-    if (t.status === "protection_failed") {
+    const unprotected = t.status === "executed" && t.mode === "live" && !t.kite_gtt_id && !t.closed_at
+      && t.closes_ticket_id == null && t.use_gtt;
+    if (unprotected) {
       alerts.push({
         id: `protection-failed-${t.id}`,
         severity: "urgent",
@@ -586,9 +731,9 @@ function renderAlertBanner(alerts) {
   el.alertBanner.innerHTML = alerts
     .map(
       (a) => `
-      <div class="alert-chip ${a.severity}" data-scroll-target="${a.scrollTargetSelector}">
+      <div class="alert-chip ${a.severity}" data-scroll-target="${esc(a.scrollTargetSelector)}">
         <span class="icon">${a.severity === "urgent" ? "⛔" : "⚠"}</span>
-        <span>${a.message}</span>
+        <span>${esc(a.message)}</span>
       </div>`
     )
     .join("");
@@ -755,7 +900,7 @@ function renderWatchlistTable() {
       <td>${trend ?? "—"}</td>
       <td class="num">${w.rsi_14 != null ? w.rsi_14.toFixed(1) : "—"}</td>
       <td>${distanceLabel(distancePct)}</td>
-      <td>${w.notes ?? ""}</td>
+      <td>${esc(w.notes ?? "")}</td>
       <td><button class="row-action-btn danger" data-action="remove-watchlist" data-id="${w.id}">Remove</button></td>
     `;
     el.watchlistBody.appendChild(tr);
@@ -790,8 +935,9 @@ el.watchlistBody?.addEventListener("click", async (event) => {
   try {
     await API.removeWatchlistSymbol(btn.dataset.id);
     await loadWatchlist();
+    toast("Removed from watchlist.", { type: "success" });
   } catch (e) {
-    alert(e.message);
+    toast(e.message, { type: "error" });
   }
 });
 
@@ -861,7 +1007,14 @@ const STRATEGY_PARAM_SCHEMAS = {
   ],
 };
 
+const STRATEGY_INFO = {
+  momentum_breakout: "Buys a close above the recent N-day high on above-average volume, only while the stock trades above its long-term SMA. Stop = ATR multiple below entry, target = R multiple; a trailing stop takes over after target 1. Exits if price closes back below the thesis EMA or the trade times out.",
+  trend_pullback: "Buys an established uptrend that recently dipped to its pullback EMA and has closed back above it on an up day. Tighter ATR stop than the breakout, R-multiple target with a trailing stop after target 1.",
+  rsi_mean_reversion: "Buys a short-term oversold dip (RSI below the threshold, optionally turning up) only while the long-term uptrend is intact. Stop at the recent swing low or ATR (whichever is tighter), fixed R target, and takes profit early once RSI recovers to the exit level.",
+};
+
 function strategyLabel(name) {
+  if (!name) return "";
   return name
     .split("_")
     .map((w) => w[0].toUpperCase() + w.slice(1))
@@ -921,6 +1074,7 @@ function renderStrategyConfig() {
   document.getElementById("strategy-status-banner").classList.toggle("strategy-on", cfg.enabled);
   document.getElementById("strategy-status-banner").classList.toggle("strategy-off", !cfg.enabled);
   document.getElementById("strategy-params-title").textContent = `${strategyLabel(strategyName)} — Parameters`;
+  el.strategyInfo.textContent = STRATEGY_INFO[strategyName] || "";
 
   if (cfg.last_disabled_at) {
     el.strategyLastDisabled.hidden = false;
@@ -990,11 +1144,12 @@ el.strategySelect.addEventListener("change", async () => {
 el.strategyEnabledToggle.addEventListener("change", async () => {
   const strategyName = el.strategySelect.value;
   const turningOn = el.strategyEnabledToggle.checked;
-  if (turningOn && !confirm(
-    `Turn ON ${strategyLabel(strategyName)}? It will scan your watchlist once a day after market close and `
-    + "propose entry/exit tickets — nothing executes without your explicit confirmation, but this starts "
-    + "automated signal generation."
-  )) {
+  if (turningOn && !(await confirmAction({
+    title: `Turn on ${strategyLabel(strategyName)}?`,
+    message: "The autopilot will scan your watchlist after every close and queue entry/exit signals in Approvals. "
+      + "Nothing is sent to the broker until you approve it.",
+    okLabel: "Turn on",
+  }))) {
     el.strategyEnabledToggle.checked = false;
     return;
   }
@@ -1002,9 +1157,11 @@ el.strategyEnabledToggle.addEventListener("change", async () => {
     const cfg = await API.saveStrategyConfig(strategyName, { enabled: turningOn, params: readStrategyParamsForm(strategyName) });
     state.strategyConfigs[strategyName] = { strategy_name: strategyName, ...cfg };
     renderStrategyConfig();
+    toast(`${strategyLabel(strategyName)} ${turningOn ? "enabled" : "disabled"}.`, { type: "success" });
+    loadAutomationStatus();
   } catch (e) {
     el.strategyEnabledToggle.checked = !turningOn;
-    alert(e.message);
+    toast(e.message, { type: "error" });
   }
 });
 
@@ -1019,28 +1176,45 @@ el.strategyParamsForm.addEventListener("submit", async (event) => {
     state.strategyConfigs[strategyName] = { strategy_name: strategyName, ...cfg };
     await loadStrategyVersionHistory(strategyName);
     renderStrategyConfig();
+    toast(`Parameters saved (version ${cfg.current_version}).`, { type: "success" });
   } catch (e) {
     el.strategyParamsError.textContent = e.message;
   }
 });
 
+function scanSummaryHtml(result) {
+  const lines = Object.entries(result.by_strategy).map(([name, r]) => {
+    const d = r.diagnostics || {};
+    const notes = [];
+    if (d.insufficient_history?.length) notes.push(`not enough history: ${d.insufficient_history.map(esc).join(", ")}`);
+    if (d.stale_data?.length) notes.push(`stale data: ${d.stale_data.map(esc).join(", ")}`);
+    if (d.already_signalled?.length) notes.push(`already signalled: ${d.already_signalled.map(esc).join(", ")}`);
+    return `<div><strong>${esc(strategyLabel(name))}</strong> — ${r.entry_tickets.length} entry, ${r.exit_tickets.length} exit`
+      + (d.evaluated != null ? ` · ${d.evaluated} evaluated` : "")
+      + (notes.length ? ` <span class="badge-muted">${notes.join(" · ")}</span>` : "") + "</div>";
+  });
+  return lines.join("") + `<div>${result.breakeven_proposals.length} breakeven proposal(s)</div>`;
+}
+
 el.scanNowBtn.addEventListener("click", async () => {
+  el.scanNowBtn.disabled = true;
   el.scanNowResult.textContent = "Scanning…";
   try {
     const result = await API.scanNow();
     if (!result.enabled) {
       el.scanNowResult.textContent = "No strategies are enabled — nothing scanned.";
     } else {
-      const parts = Object.entries(result.by_strategy).map(
-        ([name, r]) => `${strategyLabel(name)}: ${r.entry_tickets.length} entry, ${r.exit_tickets.length} exit`
-      );
-      el.scanNowResult.textContent =
-        `Scan complete — ${parts.join("; ")}; ${result.breakeven_proposals.length} breakeven proposal(s).`;
+      el.scanNowResult.innerHTML = scanSummaryHtml(result);
+      const created = Object.values(result.by_strategy)
+        .reduce((n, r) => n + r.entry_tickets.length + r.exit_tickets.length, 0);
+      toast(created ? `${created} new signal(s) queued in Approvals.` : "Scan complete — no new signals.",
+        { type: created ? "success" : "info" });
     }
-    await loadSignalQueue();
-    await loadStopAdjustments();
+    await refreshTicketViews();
   } catch (e) {
     el.scanNowResult.textContent = `Scan failed: ${e.message}`;
+  } finally {
+    el.scanNowBtn.disabled = false;
   }
 });
 
@@ -1065,8 +1239,8 @@ function renderStopAdjustments() {
     div.className = "stop-adjustment-card";
     div.innerHTML = `
       <div>
-        <strong>${p.symbol}</strong> — move stop ₹${fmt(p.current_stop)} → ₹${fmt(p.proposed_stop)}
-        <div class="rationale">${p.reason}</div>
+        <strong>${esc(p.symbol)}</strong> — move stop ₹${fmt(p.current_stop)} → ₹${fmt(p.proposed_stop)}
+        <div class="rationale">${esc(p.reason)}</div>
       </div>
       <div>
         <button class="btn btn-reject" data-action="reject-stop-adj" data-id="${p.id}">Reject</button>
@@ -1094,9 +1268,10 @@ el.stopAdjustmentsList.addEventListener("click", async (event) => {
   try {
     if (confirmBtn) await API.confirmStopAdjustment(btn.dataset.id);
     else await API.rejectStopAdjustment(btn.dataset.id);
-    await loadStopAdjustments();
+    toast(confirmBtn ? "Stop moved to breakeven." : "Stop adjustment rejected.", { type: confirmBtn ? "success" : "info" });
+    await refreshTicketViews();
   } catch (e) {
-    alert(e.message);
+    toast(e.message, { type: "error", title: "Stop adjustment failed" });
   }
 });
 
@@ -1215,9 +1390,12 @@ function renderEquityCurveSvg(container, curve) {
     })
     .join(" ");
   const color = values[values.length - 1] >= values[0] ? "var(--pnl-positive)" : "var(--pnl-negative)";
+  const xs = points.split(" ").map((p) => p.split(",")[0]);
+  const baseline = height - pad;
   container.innerHTML = `
     <svg viewBox="0 0 ${width} ${height}" class="equity-curve-svg" preserveAspectRatio="none">
-      <polyline points="${points}" fill="none" stroke="${color}" stroke-width="2" />
+      <polygon points="${xs[0]},${baseline} ${points} ${xs[xs.length - 1]},${baseline}" fill="${color}" stroke="none" opacity="0.13" />
+      <polyline points="${points}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke" />
     </svg>
   `;
 }
@@ -1257,7 +1435,7 @@ function renderJournalStats(stats) {
   } else {
     for (const s of stats.by_strategy) {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${s.strategy_name}</td>${statsRowHtml(s)}`;
+      tr.innerHTML = `<td>${esc(strategyLabel(s.strategy_name))}</td>${statsRowHtml(s)}`;
       el.journalStrategyBody.appendChild(tr);
     }
   }
@@ -1327,8 +1505,8 @@ function renderTodaysActionsView(data) {
       tr.classList.add("row-clickable");
       tr.addEventListener("click", () => openConfirmDialog(t));
       tr.innerHTML = `
-        <td>${t.symbol}</td><td class="num">${fmt(t.entry_price)}</td>
-        <td class="num">${fmt(t.stop_loss)}</td><td class="num">${fmt(t.target_1)}</td><td>${t.rationale}</td>
+        <td>${esc(t.symbol)}</td><td class="num">${fmt(t.entry_price)}</td>
+        <td class="num">${fmt(t.stop_loss)}</td><td class="num">${fmt(t.target_1)}</td><td>${esc(t.rationale)}</td>
       `;
       el.taBuyBody.appendChild(tr);
     }
@@ -1342,7 +1520,7 @@ function renderTodaysActionsView(data) {
       const tr = document.createElement("tr");
       tr.classList.add("row-clickable");
       tr.addEventListener("click", () => openConfirmDialog(t));
-      tr.innerHTML = `<td>${t.symbol}</td><td class="num">${fmt(t.quantity, 0)}</td><td>${t.rationale}</td>`;
+      tr.innerHTML = `<td>${esc(t.symbol)}</td><td class="num">${fmt(t.quantity, 0)}</td><td>${esc(t.rationale)}</td>`;
       el.taExitBody.appendChild(tr);
     }
   }
@@ -1354,7 +1532,7 @@ function renderTodaysActionsView(data) {
     for (const p of data.pending_adjustments) {
       const div = document.createElement("div");
       div.className = "stop-adjustment-card";
-      div.innerHTML = `<div><strong>${p.symbol}</strong> — ₹${fmt(p.current_stop)} → ₹${fmt(p.proposed_stop)}<div class="rationale">${p.reason}</div></div>`;
+      div.innerHTML = `<div><strong>${esc(p.symbol)}</strong> — ₹${fmt(p.current_stop)} → ₹${fmt(p.proposed_stop)}<div class="rationale">${esc(p.reason)}</div></div>`;
       el.taAdjustmentsList.appendChild(div);
     }
   }
@@ -1401,6 +1579,11 @@ function renderTradeQueue() {
   renderTicketsTable(waiting, el.tqWaitingBody);
   renderTicketsTable(rejected, el.tqRejectedBody);
   renderTicketsTable(executed, el.tqExecutedBody);
+  document.getElementById("tq-count-ready").textContent = ready.length || "";
+  document.getElementById("tq-count-waiting").textContent = waiting.length || "";
+  document.getElementById("tq-count-rejected").textContent = rejected.length || "";
+  document.getElementById("tq-count-executed").textContent = executed.length || "";
+  setBadge(el.navBadgeTradeQueue, ready.length);
   renderWatchTable(el.tqWatchRefBody, (state.todaysActions && state.todaysActions.watch_list) || []);
 }
 
@@ -1458,22 +1641,35 @@ async function loadWatchlist() {
 
 // ---- Phase 3: tickets, orders/trades/GTTs, mode & trailing status ----
 
-function statusBadgeHtml(status) {
-  return `<span class="status-badge ${status}">${status.replace(/_/g, " ")}</span>`;
+const STATUS_LABELS = { pending_confirmation: "awaiting approval", risk_rejected: "risk rejected" };
+
+function statusBadgeHtml(status, ticket = null) {
+  if (ticket && status === "executed" && ticket.entry_fill_status === "pending") {
+    return `<span class="status-badge awaiting_fill" title="Order placed with the broker — waiting for the fill">placed · awaiting fill</span>`;
+  }
+  const label = STATUS_LABELS[status] || status.replace(/_/g, " ");
+  return `<span class="status-badge ${esc(status)}">${esc(label)}</span>`;
+}
+
+function trailingChipHtml(t) {
+  if (!t.trailing_enabled) return `<span class="chip">off</span>`;
+  return t.trailing_active ? `<span class="chip ok">active</span>` : `<span class="chip warn">armed</span>`;
 }
 
 function ticketRowHtml(t) {
+  const strategyTag = t.source === "strategy" && t.strategy_name
+    ? ` <span class="badge-muted">${esc(strategyLabel(t.strategy_name.replace(/_exit$/, "")))}</span>` : "";
   return `
-    <td>${t.symbol}</td>
-    <td>${t.transaction_type}</td>
+    <td>${esc(t.symbol)}${strategyTag}</td>
+    <td>${sideHtml(t.transaction_type)}</td>
     <td class="num">${fmt(t.quantity, 0)}</td>
     <td class="num">${fmt(t.entry_price)}</td>
     <td class="num">${fmt(t.current_stop_loss ?? t.stop_loss)}</td>
     <td class="num">${fmt(t.target_1)}</td>
-    <td>${t.trailing_enabled ? (t.trailing_active ? "active" : "armed") : "off"}</td>
-    <td>${statusBadgeHtml(t.status)}</td>
-    <td>${t.mode ?? "—"}</td>
-    <td>${t.created_at}</td>
+    <td>${trailingChipHtml(t)}</td>
+    <td>${statusBadgeHtml(t.status, t)}</td>
+    <td>${modeChipHtml(t.mode)}</td>
+    <td>${fmtDateTime(t.created_at)}</td>
   `;
 }
 
@@ -1501,7 +1697,8 @@ function renderTicketsTable(tickets = state.tickets, bodyEl = el.ticketsBody) {
       tr.title = "Click to view details";
       tr.addEventListener("click", () => openDetailDialog(t));
     }
-    if (t.status === "protection_failed" || (t.status === "executed" && !t.kite_gtt_id && t.mode === "live")) {
+    if (t.status === "executed" && t.mode === "live" && !t.kite_gtt_id && !t.closed_at
+        && t.closes_ticket_id == null && t.use_gtt) {
       tr.classList.add("row-flagged");
     }
     if (t.archived) {
@@ -1513,15 +1710,21 @@ function renderTicketsTable(tickets = state.tickets, bodyEl = el.ticketsBody) {
 }
 
 const _ORDER_TERMINAL_STATUSES = new Set(["COMPLETE", "CANCELLED", "REJECTED"]);
+const _ORDER_STATUS_CLASS = { COMPLETE: "executed", REJECTED: "failed", CANCELLED: "cancelled" };
+
+function orderStatusHtml(status) {
+  if (!status) return "";
+  return `<span class="status-badge ${_ORDER_STATUS_CLASS[status] || "pending_confirmation"}">${esc(status.toLowerCase())}</span>`;
+}
 
 function orderRowHtml(o) {
   const cancellable = !_ORDER_TERMINAL_STATUSES.has(o.status);
   return `
-    <td>${o.tradingsymbol ?? ""}</td>
-    <td>${o.transaction_type ?? ""}</td>
+    <td>${esc(o.tradingsymbol ?? "")}</td>
+    <td>${o.transaction_type ? sideHtml(o.transaction_type) : ""}</td>
     <td class="num">${fmt(o.quantity, 0)}</td>
     <td class="num">${fmt(o.price)}</td>
-    <td>${o.status ?? ""}</td>
+    <td title="${esc(o.status_message ?? "")}">${orderStatusHtml(o.status)}</td>
     <td>${o.order_type ?? ""}</td>
     <td>${o.linked_ticket_id ? `#${o.linked_ticket_id}` : "—"}</td>
     <td>${cancellable ? `<button class="row-action-btn danger" data-action="cancel-order" data-order-id="${o.order_id}" data-variety="${o.variety ?? "regular"}">Cancel</button>` : ""}</td>
@@ -1545,13 +1748,17 @@ function renderOrdersTable() {
 el.ordersBody.addEventListener("click", async (event) => {
   const btn = event.target.closest('button[data-action="cancel-order"]');
   if (!btn) return;
-  if (!confirm(`Cancel order ${btn.dataset.orderId}?`)) return;
+  if (!(await confirmAction({
+    title: "Cancel order?", message: `Cancel broker order ${btn.dataset.orderId}? This cannot be undone.`,
+    okLabel: "Cancel order", danger: true,
+  }))) return;
   try {
     await API.cancelOrder(btn.dataset.orderId, btn.dataset.variety);
+    toast(`Order ${btn.dataset.orderId} cancelled.`, { type: "success" });
     state.orders = await API.orders();
     renderOrdersTable();
   } catch (e) {
-    alert(e.message);
+    toast(e.message, { type: "error", title: "Cancel failed" });
   }
 });
 
@@ -1566,7 +1773,7 @@ function renderTradesTable() {
     if (t.linked_ticket_id) tr.classList.add("row-linked");
     tr.innerHTML = `
       <td>${t.tradingsymbol ?? ""}</td>
-      <td>${t.transaction_type ?? ""}</td>
+      <td>${t.transaction_type ? sideHtml(t.transaction_type) : ""}</td>
       <td class="num">${fmt(t.quantity, 0)}</td>
       <td class="num">${fmt(t.average_price)}</td>
       <td>${t.linked_ticket_id ? `#${t.linked_ticket_id}` : "—"}</td>
@@ -1601,25 +1808,34 @@ function renderGttsTable() {
 el.gttsBody.addEventListener("click", async (event) => {
   const btn = event.target.closest('button[data-action="cancel-gtt"]');
   if (!btn) return;
-  if (!confirm(`Cancel GTT ${btn.dataset.gttId}? The position will remain open but unprotected.`)) return;
+  if (!(await confirmAction({
+    title: "Cancel protective GTT?",
+    message: `GTT ${btn.dataset.gttId} will be removed. The position stays OPEN but becomes UNPROTECTED.`,
+    okLabel: "Cancel GTT", danger: true,
+  }))) return;
   try {
     await API.cancelGtt(btn.dataset.gttId);
+    toast(`GTT ${btn.dataset.gttId} cancelled — the position is now unprotected.`, { type: "warning" });
     state.gtts = await API.gtts();
     renderGttsTable();
   } catch (e) {
-    alert(e.message);
+    toast(e.message, { type: "error", title: "Cancel failed" });
   }
 });
 
 function renderModeBanner() {
+  const live = state.executionMode === "live";
   el.modeBanner.hidden = false;
-  el.modeToggleCheckbox.checked = state.executionMode === "live";
-  if (state.executionMode === "live") {
+  el.modeToggleCheckbox.checked = live;
+  el.modePill.hidden = false;
+  el.modePill.className = `pill mode-pill ${live ? "live" : "dry"}`;
+  el.modePill.textContent = live ? "LIVE" : "DRY RUN";
+  if (live) {
     el.modeBanner.className = "mode-banner mode-live";
-    el.modeBannerText.textContent = "LIVE — real orders will be placed with real money";
+    el.modeBannerText.textContent = "LIVE TRADING — approving a ticket places a real order with real money";
   } else {
     el.modeBanner.className = "mode-banner mode-dry-run";
-    el.modeBannerText.textContent = "DRY RUN — no real orders will be placed";
+    el.modeBannerText.textContent = "DRY RUN — approvals are simulated; no real orders are placed";
   }
 }
 
@@ -1636,7 +1852,7 @@ el.cancelAllPendingBtn.addEventListener("click", async () => {
     el.cancelAllPendingConfirmBtn.disabled = pending.length === 0;
     el.cancelAllPendingDialog.showModal();
   } catch (e) {
-    alert(e.message);
+    toast(e.message, { type: "error" });
   }
 });
 
@@ -1646,10 +1862,10 @@ el.cancelAllPendingConfirmBtn.addEventListener("click", async () => {
   try {
     const result = await API.cancelAllPending();
     el.cancelAllPendingDialog.close();
-    await Promise.all([loadSignalQueue(), loadTradeQueue()]);
-    alert(`Cancelled ${result.count} ticket(s).`);
+    await refreshTicketViews();
+    toast(`Cancelled ${result.count} ticket(s).`, { type: "success" });
   } catch (e) {
-    alert(e.message);
+    toast(e.message, { type: "error" });
   }
 });
 
@@ -1660,9 +1876,10 @@ el.emergencyExitAllBtn.addEventListener("click", async () => {
     el.emergencyExitPreviewBody.innerHTML = positions.length
       ? positions.map((p) => `
           <tr>
-            <td>${p.symbol}</td><td class="num">${fmt(p.quantity, 0)}</td>
+            <td>${esc(p.symbol)}${p.entry_fill_status === "pending" ? ' <span class="badge-muted">unfilled — order will be cancelled</span>' : ""}</td>
+            <td class="num">${fmt(p.quantity, 0)}</td>
             <td class="num">${fmt(p.entry_price)}</td><td class="num">${fmt(p.current_stop_loss ?? p.stop_loss)}</td>
-            <td>${p.strategy_name ?? "manual"}</td>
+            <td>${esc(strategyLabel(p.strategy_name) || "Manual")}</td>
           </tr>
         `).join("")
       : `<tr class="empty-row"><td colspan="5">No open positions</td></tr>`;
@@ -1671,7 +1888,7 @@ el.emergencyExitAllBtn.addEventListener("click", async () => {
     el.emergencyExitConfirmBtn.disabled = true;
     el.emergencyExitDialog.showModal();
   } catch (e) {
-    alert(e.message);
+    toast(e.message, { type: "error" });
   }
 });
 
@@ -1686,8 +1903,10 @@ el.emergencyExitConfirmBtn.addEventListener("click", async () => {
   try {
     const result = await API.emergencyExitConfirm(el.emergencyExitPhrase.value.trim());
     el.emergencyExitDialog.close();
-    await Promise.all([loadSignalQueue(), loadTradeQueue(), loadTodaysActions()]);
-    alert(`Emergency exit complete: ${result.count} position(s) processed.`);
+    await refreshTicketViews();
+    refreshOrderBooks();
+    toast(`${result.count} position(s) processed — check Orders & Trades for fills.`,
+      { type: "warning", title: "Emergency exit complete" });
   } catch (e) {
     el.emergencyExitError.textContent = e.message;
   }
@@ -1698,7 +1917,7 @@ el.emergencyExitConfirmBtn.addEventListener("click", async () => {
 function reconciliationItemHtml(m) {
   return `
     <div class="reconciliation-item">
-      <div>${m.detail}</div>
+      <div>${esc(m.detail)}</div>
       <button class="btn btn-small" data-action="mark-reviewed" data-id="${m.id}">Mark Reviewed</button>
     </div>
   `;
@@ -1727,7 +1946,7 @@ el.reconciliationList.addEventListener("click", async (event) => {
     await API.markMismatchReviewed(btn.dataset.id);
     await loadReconciliationMismatches();
   } catch (e) {
-    alert(e.message);
+    toast(e.message, { type: "error" });
   }
 });
 
@@ -1885,6 +2104,8 @@ function applyTick(tick) {
 }
 
 function connectTickWs() {
+  // Refresh re-runs loadDashboard(); never stack a second socket on top of a live one.
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   wsIntentionallyClosed = false;
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   ws = new WebSocket(`${protocol}//${location.host}/ws/ticks`);
@@ -1916,6 +2137,24 @@ function connectTickWs() {
     if (msg.type === "trailing_heartbeat") {
       state.trailingHeartbeat = { last_run_at: msg.last_run_at, active_ticket_count: msg.active_ticket_count };
       renderTrailingIndicator();
+    }
+    if (msg.type === "tickets_changed") {
+      scheduleRefresh();
+    }
+    if (msg.type === "order_update") {
+      const type = { success: "success", urgent: "error", warning: "warning" }[msg.severity] || "info";
+      toast(msg.message, {
+        type, title: msg.severity === "urgent" ? "Action needed" : "Order update",
+        timeout: msg.severity === "urgent" ? 0 : null,
+      });
+      refreshOrderBooks();
+    }
+    if (msg.type === "automation_run") {
+      if (msg.phase === "finished") {
+        const type = { success: "success", skipped: "info", failed: "error" }[msg.status] || "info";
+        toast(msg.error || runSummaryText(msg) || "Autopilot run finished.", { type, title: `Autopilot run ${msg.status}` });
+      }
+      loadAutomationStatus();
     }
     if (msg.type === "trailing_error") {
       state.trailingErrorAlerts.push({
@@ -1961,21 +2200,35 @@ function ticketConfirmHtml(t) {
   const risk = Math.abs(t.entry_price - t.stop_loss) * t.quantity;
   const rr = t.risk_reward_ratio != null ? t.risk_reward_ratio.toFixed(2) : "—";
   const trailingText = t.trailing_enabled
-    ? `Enabled — trigger: ${t.trailing_trigger}, distance ₹${fmt(t.trailing_distance)}`
+    ? `On — ${t.trailing_trigger === "manual" ? "started manually" : "after target 1"}, ${inr(t.trailing_distance)} behind price`
     : "Off";
+  const isExit = t.closes_ticket_id != null;
+  const origin = t.source === "strategy" ? strategyChipHtml(t.strategy_name) : `<span class="chip">Manual</span>`;
   return `
-    <div class="row"><span>${t.symbol}</span><strong>${t.transaction_type}</strong></div>
-    ${metricsRow("Entry", `₹${fmt(t.entry_price)} (${t.entry_order_type}) × ${fmt(t.quantity, 0)}`)}
-    ${metricsRow("Capital", `₹${fmt(capital)}`)}
-    ${metricsRow("Stop-loss", `₹${fmt(t.stop_loss)} (Risk ₹${fmt(risk)})`)}
-    ${metricsRow("Target 1", `₹${fmt(t.target_1)}`)}
-    ${t.target_2 ? metricsRow("Target 2", `₹${fmt(t.target_2)}`) : ""}
-    ${metricsRow("Trailing", trailingText)}
-    ${metricsRow("Product", t.product_type)}
-    ${metricsRow("GTT", t.use_gtt ? "Yes" : "No")}
-    ${metricsRow("Risk:Reward", `1:${rr}`)}
-    <div class="rationale">${t.rationale}</div>
+    <div class="ticket-head">${sideHtml(t.transaction_type)}<span class="ac-symbol">${esc(t.symbol)}</span>${origin}${isExit ? `<span class="chip warn">closes #${t.closes_ticket_id}</span>` : ""}</div>
+    ${metricsRow("Order", `${esc(t.entry_order_type)} × ${fmt(t.quantity, 0)} @ ${inr(t.entry_price)}${t.entry_order_type === "MARKET" ? " (reference)" : ""}`)}
+    ${metricsRow("Capital", inr(capital))}
+    ${isExit ? "" : metricsRow("Stop-loss", `${inr(t.stop_loss)} · risk ${inr(risk)}`)}
+    ${isExit ? "" : metricsRow("Target 1", inr(t.target_1))}
+    ${t.target_2 && !isExit ? metricsRow("Target 2", inr(t.target_2)) : ""}
+    ${isExit ? "" : metricsRow("Trailing", trailingText)}
+    ${metricsRow("Product", esc(t.product_type))}
+    ${isExit ? "" : metricsRow("Protective GTT", t.use_gtt ? "Placed automatically with the entry" : "No")}
+    ${isExit ? "" : metricsRow("Risk : Reward", `1 : ${rr}`)}
+    ${t.filled_price ? metricsRow("Filled at", inr(t.filled_price)) : ""}
+    <div class="rationale">${esc(t.rationale)}</div>
   `;
+}
+
+// How an approval will be executed — shown before the user commits.
+function executionNote(t) {
+  const live = state.executionMode === "live";
+  if (!live) return { live, text: "DRY RUN — approving simulates the trade; nothing is sent to the broker." };
+  const how = computeMarketStatus() === "open"
+    ? "a regular order"
+    : "an After-Market Order (market closed — it queues for the next session)";
+  const gtt = t.closes_ticket_id == null && t.use_gtt ? ", followed by a protective GTT" : "";
+  return { live, text: `LIVE — approving sends ${how}${gtt}. This uses real money.` };
 }
 
 function riskCheckRowHtml(c) {
@@ -1994,7 +2247,7 @@ function riskCheckRowHtml(c) {
   } else {
     value = `${c.actual_value.toFixed(1)}% (max ${c.limit_value}%)`;
   }
-  return `<div class="risk-check-row ${cls}"><span class="icon">${icon}</span><span>${c.label}</span><strong>${value}</strong></div>`;
+  return `<div class="risk-check-row ${cls}"><span class="icon">${icon}</span><span>${esc(c.label)}</span><strong>${esc(value)}</strong></div>`;
 }
 
 function renderRiskCheckSection(checks) {
@@ -2002,15 +2255,24 @@ function renderRiskCheckSection(checks) {
     el.ticketRiskCheckBody.innerHTML = "";
     return;
   }
-  el.ticketRiskCheckBody.innerHTML = `<h3>Risk Check</h3>` + checks.map(riskCheckRowHtml).join("");
+  const passed = checks.filter((c) => c.passed).length;
+  el.ticketRiskCheckBody.innerHTML = `<h3>Risk checks · ${passed}/${checks.length} passed</h3>`
+    + checks.map(riskCheckRowHtml).join("");
 }
 
 function openConfirmDialog(ticket) {
   activeConfirmTicketId = ticket.id;
+  state.activeConfirmTicket = ticket;
   const rejectedMode = ticket.status === "risk_rejected";
   el.ticketConfirmDialog.classList.toggle("risk-rejected-mode", rejectedMode);
-  el.ticketConfirmTitle.textContent = rejectedMode ? "Ticket Rejected — Risk Checks Failed" : "Confirm Trade Ticket";
+  el.ticketConfirmTitle.textContent = rejectedMode
+    ? "Blocked by risk checks"
+    : (ticket.closes_ticket_id != null ? "Approve exit" : "Approve trade");
   el.ticketConfirmBody.innerHTML = ticketConfirmHtml(ticket);
+  const note = executionNote(ticket);
+  el.ticketConfirmExecNote.hidden = rejectedMode;
+  el.ticketConfirmExecNote.className = `exec-note${note.live ? " live" : ""}`;
+  el.ticketConfirmExecNote.textContent = note.text;
   renderRiskCheckSection(ticket.risk_check_results);
   el.ticketRejectBtn.hidden = rejectedMode;
   el.ticketConfirmBtn.hidden = rejectedMode;
@@ -2019,48 +2281,79 @@ function openConfirmDialog(ticket) {
   el.ticketConfirmDialog.showModal();
 }
 
+// Shared by the confirm dialog and the Approvals inbox. Execution failures
+// come back as data on the ticket (not thrown); a thrown error means the
+// request itself failed (network/auth/state).
+async function approveTicket(id) {
+  try {
+    reportExecution(await API.confirmTicket(id));
+  } catch (e) {
+    toast(e.message, { type: "error", title: "Approval failed" });
+  }
+  await refreshTicketViews();
+  refreshOrderBooks();
+}
+
+function reportExecution(t) {
+  const what = `${t.transaction_type} ${fmt(t.quantity, 0)} ${t.symbol}`;
+  if (!t.success) {
+    toast(t.execution_message, { type: "error", title: `${what} — not executed` });
+  } else if (/UNPROTECTED|FAILED/.test(t.execution_message || "")) {
+    toast(t.execution_message, { type: "warning", title: `${what} — placed, check protection`, timeout: 0 });
+  } else if (t.mode === "dry_run") {
+    toast("Simulated — no real order was sent.", { type: "success", title: `${what} (dry run)` });
+  } else {
+    toast(t.order_variety === "amo"
+      ? "Sent as AMO — it executes when the market opens. The fill is tracked automatically."
+      : "Order placed. The fill and protective GTT are tracked automatically.",
+    { type: "success", title: `${what} placed` });
+  }
+}
+
+async function rejectTicketById(id, reason = null) {
+  try {
+    await API.rejectTicket(id, reason);
+    toast("Ticket rejected.", { type: "info" });
+  } catch (e) {
+    toast(e.message, { type: "error", title: "Reject failed" });
+  }
+  await refreshTicketViews();
+}
+
 el.ticketArchiveBtn.addEventListener("click", async () => {
   if (activeConfirmTicketId == null) return;
+  el.ticketConfirmDialog.close();
   try {
     await API.deleteTicket(activeConfirmTicketId);
+    toast("Ticket archived.", { type: "info" });
   } catch (e) {
-    // fall through — history refresh will show real state either way
+    toast(e.message, { type: "error" });
   }
-  el.ticketConfirmDialog.close();
-  await refreshTickets();
+  await refreshTicketViews();
 });
 
 el.ticketRejectBtn.addEventListener("click", async () => {
   if (activeConfirmTicketId == null) return;
-  try {
-    await API.rejectTicket(activeConfirmTicketId);
-  } catch (e) {
-    // fall through — history refresh will show real state either way
-  }
   el.ticketConfirmDialog.close();
-  await refreshTickets();
+  await rejectTicketById(activeConfirmTicketId);
 });
 
 el.ticketConfirmBtn.addEventListener("click", async () => {
   if (activeConfirmTicketId == null) return;
   el.ticketConfirmBtn.disabled = true;
   try {
-    await API.confirmTicket(activeConfirmTicketId);
-  } catch (e) {
-    // execution failures come back as data on the ticket, not thrown errors;
-    // a thrown error here means the request itself failed (network/auth).
+    await approveTicket(activeConfirmTicketId);
   } finally {
     el.ticketConfirmBtn.disabled = false;
   }
   el.ticketConfirmDialog.close();
-  await refreshTickets();
-  await refreshOrderBooks();
 });
 
 el.ticketModifyBtn.addEventListener("click", async () => {
-  const t = state.tickets.find((x) => x.id === activeConfirmTicketId);
+  const t = state.activeConfirmTicket;
   el.ticketConfirmDialog.close();
   if (!t) return;
+  showSection("new-ticket");
 
   el.ticketSymbolInput.value = t.symbol;
   el.ticketForm.querySelector('[name="transaction_type"]').value = t.transaction_type;
@@ -2095,6 +2388,7 @@ el.ticketModifyBtn.addEventListener("click", async () => {
     // user can retype the symbol to re-trigger search if this fails
   }
 
+  renderTicketPreview();
   el.ticketForm.scrollIntoView({ behavior: "smooth", block: "start" });
 });
 
@@ -2136,9 +2430,9 @@ el.tfClearBtn.addEventListener("click", (e) => {
 
 function eventRowHtml(e) {
   return `<div class="event-row">
-    <span class="event-time">${e.created_at}</span>
-    <span class="event-type">${e.event_type.replace(/_/g, " ")}</span>
-    <span class="event-detail">${e.detail ?? ""}</span>
+    <span class="event-time">${fmtDateTime(e.created_at)}</span>
+    <span class="event-type">${esc(e.event_type.replace(/_/g, " "))}</span>
+    <span class="event-detail">${esc(e.detail ?? "")}</span>
   </div>`;
 }
 
@@ -2150,12 +2444,13 @@ function renderTicketDetailEvents(events) {
 
 async function openDetailDialog(ticket) {
   state.activeDetailTicketId = ticket.id;
+  state.activeDetailTicket = ticket;
   el.ticketEditForm.hidden = true;
   el.ticketDetailBody.hidden = false;
   el.ticketEditError.textContent = "";
 
-  const statusRow = `<div class="row"><span>Status</span><strong>${ticket.status.replace(/_/g, " ")}</strong></div>`;
-  const modeRow = `<div class="row"><span>Mode</span><strong>${ticket.mode ?? "—"}</strong></div>`;
+  const statusRow = `<div class="row"><span>Status</span><strong>${statusBadgeHtml(ticket.status, ticket)}</strong></div>`;
+  const modeRow = `<div class="row"><span>Mode</span><strong>${modeChipHtml(ticket.mode)}${ticket.order_variety === "amo" ? ' <span class="chip">AMO</span>' : ""}</strong></div>`;
   const orderRow = ticket.kite_order_id
     ? `<div class="row"><span>Kite Order ID</span><strong>${ticket.kite_order_id}</strong></div>` : "";
   const gttRow = ticket.kite_gtt_id
@@ -2168,6 +2463,7 @@ async function openDetailDialog(ticket) {
   el.ticketDetailEditBtn.hidden = !isDraft;
   el.ticketDetailDeleteBtn.hidden = !isDraft;
   el.ticketDetailArchiveBtn.hidden = !isSoftDeletable;
+  el.ticketDetailRevertBtn.hidden = ticket.status !== "rejected";
 
   el.ticketDetailDialog.showModal();
 
@@ -2185,29 +2481,51 @@ el.ticketDetailCloseBtn.addEventListener("click", () => {
 
 el.ticketDetailDeleteBtn.addEventListener("click", async () => {
   if (state.activeDetailTicketId == null) return;
-  if (!confirm("Permanently delete this draft ticket? This cannot be undone.")) return;
+  if (!(await confirmAction({
+    title: "Delete draft ticket?", message: "This permanently deletes the draft. It cannot be undone.",
+    okLabel: "Delete", danger: true,
+  }))) return;
   try {
     await API.deleteTicket(state.activeDetailTicketId);
+    toast("Draft deleted.", { type: "info" });
   } catch (e) {
-    // fall through — refresh shows real state either way
+    toast(e.message, { type: "error" });
   }
   el.ticketDetailDialog.close();
-  await refreshTickets();
+  await refreshTicketViews();
 });
 
 el.ticketDetailArchiveBtn.addEventListener("click", async () => {
   if (state.activeDetailTicketId == null) return;
   try {
     await API.deleteTicket(state.activeDetailTicketId);
+    toast("Ticket archived.", { type: "info" });
   } catch (e) {
-    // fall through
+    toast(e.message, { type: "error" });
   }
   el.ticketDetailDialog.close();
-  await refreshTickets();
+  await refreshTicketViews();
+});
+
+el.ticketDetailRevertBtn.addEventListener("click", async () => {
+  if (state.activeDetailTicketId == null) return;
+  try {
+    const reverted = await API.revertRejection(state.activeDetailTicketId);
+    toast(
+      reverted.status === "risk_rejected"
+        ? "Reverted — but it's currently blocked by risk checks again."
+        : "Reverted — back in the Signal Queue for review.",
+      { type: reverted.status === "risk_rejected" ? "warning" : "success" },
+    );
+  } catch (e) {
+    toast(e.message, { type: "error" });
+  }
+  el.ticketDetailDialog.close();
+  await refreshTicketViews();
 });
 
 el.ticketDetailEditBtn.addEventListener("click", () => {
-  const t = state.tickets.find((x) => x.id === state.activeDetailTicketId);
+  const t = state.activeDetailTicket;
   if (!t) return;
   el.ticketDetailBody.hidden = true;
   el.ticketEditForm.hidden = false;
@@ -2264,7 +2582,7 @@ el.ticketEditForm.addEventListener("submit", async (event) => {
   try {
     const updated = await API.editTicket(state.activeDetailTicketId, body);
     el.ticketDetailDialog.close();
-    await refreshTickets();
+    await refreshTicketViews();
     // Re-open on the ticket's new state so the risk-check outcome is visible immediately.
     openConfirmDialog(updated);
   } catch (e) {
@@ -2330,6 +2648,7 @@ function maybeAutoPopulateQuantity() {
       const r = await API.getPositionSize(entryPrice, stopLoss);
       if (!state.quantityManuallyEdited && r.suggested_qty > 0) {
         el.ticketQuantityInput.value = r.suggested_qty;
+        renderTicketPreview();
       }
     } catch (e) {
       // leave quantity as-is on a transient failure
@@ -2338,6 +2657,29 @@ function maybeAutoPopulateQuantity() {
 }
 el.ticketEntryPriceInput.addEventListener("input", maybeAutoPopulateQuantity);
 el.ticketStopLossInput.addEventListener("input", maybeAutoPopulateQuantity);
+
+// Live capital / risk / reward preview while filling in a manual ticket.
+function renderTicketPreview() {
+  const f = new FormData(el.ticketForm);
+  const qty = Number(f.get("quantity"));
+  const entry = Number(f.get("entry_price"));
+  const stop = Number(f.get("stop_loss"));
+  const target = Number(f.get("target_1"));
+  if (!(qty > 0 && entry > 0 && stop > 0)) {
+    el.ticketPreview.hidden = true;
+    return;
+  }
+  const perShare = Math.abs(entry - stop);
+  const rr = target > 0 && perShare > 0 ? Math.abs(target - entry) / perShare : null;
+  el.ticketPreview.hidden = false;
+  el.ticketPreview.innerHTML = [
+    ["Capital", inr(entry * qty)],
+    ["Risk if stopped", inr(perShare * qty)],
+    ["Risk : Reward", rr != null ? `1 : ${rr.toFixed(2)}` : "—"],
+    ["On approval", state.executionMode === "live" ? "LIVE — real order" : "Dry run — simulated"],
+  ].map(([label, value]) => `<div class="ac-metric"><label>${label}</label><strong>${value}</strong></div>`).join("");
+}
+el.ticketForm.addEventListener("input", renderTicketPreview);
 
 for (const field of el.ticketForm.querySelectorAll("input, select, textarea")) {
   field.addEventListener("input", () => { state.ticketDraftDirty = true; });
@@ -2382,6 +2724,8 @@ el.ticketForm.addEventListener("submit", async (event) => {
     el.ticketTrailingDistance.disabled = true;
     state.ticketDraftDirty = false;
     state.quantityManuallyEdited = false;
+    renderTicketPreview();
+    refreshTicketViews();
     openConfirmDialog(ticket);
   } catch (e) {
     el.ticketFormError.textContent = e.message;
@@ -2396,6 +2740,10 @@ el.modeToggleCheckbox.addEventListener("change", () => {
     API.setExecutionMode("dry_run", false).then((r) => {
       state.executionMode = r.mode;
       renderModeBanner();
+      toast("Switched to DRY RUN — approvals are simulated.", { type: "info" });
+    }).catch((e) => {
+      el.modeToggleCheckbox.checked = true;
+      toast(e.message, { type: "error" });
     });
   }
 });
@@ -2409,8 +2757,10 @@ el.liveModeConfirmBtn.addEventListener("click", async () => {
   try {
     const r = await API.setExecutionMode("live", true);
     state.executionMode = r.mode;
+    toast("LIVE trading enabled — approvals now place real orders.", { type: "warning" });
   } catch (e) {
     el.modeToggleCheckbox.checked = false;
+    toast(e.message, { type: "error" });
   }
   renderModeBanner();
   el.liveModeConfirmDialog.close();
@@ -2419,8 +2769,9 @@ el.liveModeConfirmBtn.addEventListener("click", async () => {
 // Logout — confirm only if there's unsaved ticket-form/dialog state.
 el.logoutBtn.addEventListener("click", async () => {
   const hasOpenConfirm = el.ticketConfirmDialog.open;
-  if ((state.ticketDraftDirty || hasOpenConfirm) &&
-      !confirm("You have an unsaved ticket draft or an open confirmation. Log out anyway?")) {
+  if ((state.ticketDraftDirty || hasOpenConfirm) && !(await confirmAction({
+    title: "Log out?", message: "You have an unsaved ticket draft or an open confirmation.", okLabel: "Log out",
+  }))) {
     return;
   }
   try {
@@ -2499,23 +2850,26 @@ el.sectorMappingsBody.addEventListener("click", async (event) => {
   const symbol = btn.dataset.symbol;
 
   if (btn.dataset.action === "delete-sector") {
-    if (!confirm(`Remove the sector mapping for ${symbol}?`)) return;
+    if (!(await confirmAction({
+      title: `Remove ${symbol}'s sector?`, message: "It will no longer count toward any sector exposure limit.",
+      okLabel: "Remove", danger: true,
+    }))) return;
     try {
       await API.deleteSectorMapping(symbol);
       await Promise.all([refreshSectorMappings(), refreshUnmappedSymbols()]);
+      toast(`Removed the sector mapping for ${symbol}.`, { type: "success" });
     } catch (e) {
-      alert(e.message);
+      toast(e.message, { type: "error" });
     }
   } else if (btn.dataset.action === "edit-sector") {
+    // Edit in place via the (upserting) mapping form rather than a browser prompt().
     const current = state.sectorMappings.find((m) => m.symbol === symbol);
-    const next = prompt(`New sector for ${symbol}:`, current?.sector ?? "");
-    if (next == null || next.trim() === "") return;
-    try {
-      await API.saveSectorMapping({ symbol, sector: next.trim() });
-      await refreshSectorMappings();
-    } catch (e) {
-      alert(e.message);
-    }
+    document.getElementById("sm-symbol").value = symbol;
+    const sectorInput = document.getElementById("sm-sector");
+    sectorInput.value = current?.sector ?? "";
+    el.sectorMappingForm.scrollIntoView({ behavior: "smooth", block: "center" });
+    sectorInput.focus();
+    sectorInput.select();
   }
 });
 
@@ -2607,10 +2961,13 @@ el.riskSettingsForm.addEventListener("submit", async (event) => {
     max_sector_exposure_pct: Number(formData.get("max_sector_exposure_pct")),
     max_total_portfolio_risk_pct: Number(formData.get("max_total_portfolio_risk_pct")),
     min_risk_reward: Number(formData.get("min_risk_reward")),
+    // Not editable here — resend the stored value so saving never wipes it.
+    starting_capital: state.riskSettings?.starting_capital ?? null,
   };
   try {
     state.riskSettings = await API.saveRiskSettings(body);
     renderRiskSettingsForm();
+    toast("Risk settings saved — every new ticket is checked against them.", { type: "success" });
     el.riskSettingsSaved.hidden = false;
     setTimeout(() => { el.riskSettingsSaved.hidden = true; }, 2000);
   } catch (e) {
@@ -2642,6 +2999,7 @@ el.sectorMappingForm.addEventListener("submit", async (event) => {
 
 const SECTIONS = [
   { id: "dashboard", el: document.getElementById("view-dashboard") },
+  { id: "approvals", el: document.getElementById("view-approvals") },
   { id: "new-ticket", el: document.getElementById("view-new-ticket") },
   { id: "trade-queue", el: document.getElementById("view-trade-queue") },
   { id: "ticket-history", el: document.getElementById("view-ticket-history") },
@@ -2654,6 +3012,7 @@ const SECTIONS = [
 ];
 
 function showSection(id) {
+  if (!SECTIONS.some((s) => s.id === id)) id = "dashboard";
   state.activeSection = id;
   for (const s of SECTIONS) {
     s.el.hidden = s.id !== id;
@@ -2661,20 +3020,32 @@ function showSection(id) {
   document.querySelectorAll(".nav-item").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.sectionId === id);
   });
+  if (location.hash !== `#${id}`) history.replaceState(null, "", `#${id}`);
+  if (id === "approvals") loadApprovals();
+  if (id === "orders-trades") refreshOrderBooks();
+  window.scrollTo({ top: 0 });
 }
 
 document.querySelectorAll(".nav-item").forEach((btn) => {
   btn.addEventListener("click", () => showSection(btn.dataset.sectionId));
 });
 
+// Typing/pasting a #section URL (or a bookmark) switches view without a reload.
+window.addEventListener("hashchange", () => {
+  const id = location.hash.slice(1);
+  const btn = document.querySelector(`.nav-item[data-section-id="${CSS.escape(id)}"]`);
+  if (btn && !btn.hidden) showSection(id);
+});
+
 function revealTradingNavItems() {
   for (const id of [
-    "new-ticket", "ticket-history", "orders-trades", "settings", "watchlist", "strategies",
+    "approvals", "new-ticket", "ticket-history", "orders-trades", "settings", "watchlist", "strategies",
     "trade-queue", "todays-actions", "journal",
   ]) {
     const btn = document.querySelector(`.nav-item[data-section-id="${id}"]`);
     if (btn) btn.hidden = false;
   }
+  document.querySelectorAll("[data-trading-only]").forEach((node) => { node.hidden = false; });
 }
 
 el.sidebarToggleBtn.addEventListener("click", async () => {
@@ -2831,6 +3202,405 @@ async function loadDashboardPanels() {
   }
 }
 
+// ---- Approvals inbox, autopilot status, live refresh, theme ----
+
+let _refreshInFlight = null;
+let _refreshQueued = false;
+let _refreshTimer = null;
+
+// Reloads every ticket-derived view together so a decision made anywhere
+// (a dialog, the inbox, another tab via the WebSocket) shows up everywhere.
+function refreshTicketViews() {
+  if (state.accountType !== "trading") return Promise.resolve();
+  if (_refreshInFlight) {
+    _refreshQueued = true;
+    return _refreshInFlight;
+  }
+  _refreshInFlight = Promise.all([
+    refreshTickets(), loadSignalQueue(), loadTradeQueue(), loadTodaysActions(), loadStopAdjustments(),
+    loadApprovals(), loadAutomationStatus(),
+  ]).finally(() => {
+    _refreshInFlight = null;
+    if (_refreshQueued) {
+      _refreshQueued = false;
+      refreshTicketViews();
+    }
+  });
+  return _refreshInFlight;
+}
+
+function scheduleRefresh(delay = 400) {
+  clearTimeout(_refreshTimer);
+  _refreshTimer = setTimeout(refreshTicketViews, delay);
+}
+
+async function loadApprovals() {
+  if (state.accountType !== "trading") return;
+  try {
+    const [pending, blocked, adjustments] = await Promise.all([
+      API.listTickets({ status: "pending_confirmation" }),
+      API.listTickets({ status: "risk_rejected" }),
+      API.getStopAdjustments(),
+    ]);
+    const today = istDateOf(new Date());
+    state.approvals = {
+      entries: pending.filter((t) => t.closes_ticket_id == null),
+      exits: pending.filter((t) => t.closes_ticket_id != null),
+      adjustments,
+      blocked: blocked.filter((t) => {
+        const created = parseUtc(t.created_at);
+        return created && istDateOf(created) === today;
+      }),
+    };
+    renderApprovals();
+  } catch (e) {
+    // keep the last rendered inbox on a transient failure
+  }
+}
+
+function emptyLine(text) {
+  return `<div class="empty-row">${esc(text)}</div>`;
+}
+
+function renderApprovals() {
+  const a = state.approvals;
+  if (!a) return;
+  const total = a.entries.length + a.exits.length + a.adjustments.length;
+  el.apEntries.innerHTML = a.entries.length
+    ? a.entries.map((t) => approvalCardHtml(t, "entry")).join("") : emptyLine("No entry signals waiting.");
+  el.apExits.innerHTML = a.exits.length
+    ? a.exits.map((t) => approvalCardHtml(t, "exit")).join("") : emptyLine("No exit signals waiting.");
+  el.apAdjustments.innerHTML = a.adjustments.length
+    ? a.adjustments.map(adjustmentCardHtml).join("") : emptyLine("No stop adjustments proposed.");
+  el.apBlocked.innerHTML = a.blocked.length
+    ? a.blocked.map((t) => approvalCardHtml(t, "blocked")).join("") : emptyLine("Nothing was blocked today.");
+  setCount("ap-entries-count", a.entries.length);
+  setCount("ap-exits-count", a.exits.length);
+  setCount("ap-adjustments-count", a.adjustments.length);
+  setCount("ap-blocked-count", a.blocked.length);
+  el.apEmpty.hidden = total > 0;
+  for (const id of ["ap-entries-group", "ap-exits-group", "ap-adjustments-group"]) {
+    document.getElementById(id).hidden = total === 0;
+  }
+  setBadge(el.navBadgeApprovals, total);
+  el.dashApprovalsCallout.hidden = total === 0;
+  el.dashApprovalsText.textContent = total === 1
+    ? "1 decision is waiting for your approval."
+    : `${total} decisions are waiting for your approval.`;
+  document.title = total ? `(${total}) Kite Terminal` : "Kite Terminal";
+}
+
+function metricHtml(label, value, cls = "") {
+  return `<div class="ac-metric"><label>${label}</label><strong class="${cls}">${value}</strong></div>`;
+}
+
+function approvalCardHtml(t, kind) {
+  const isExit = t.closes_ticket_id != null;
+  const checks = t.risk_check_results || [];
+  const failed = checks.filter((c) => !c.passed);
+  const metrics = isExit
+    ? [
+        metricHtml("Quantity", fmt(t.quantity, 0)),
+        metricHtml("Order", esc(t.entry_order_type)),
+        metricHtml("Ref. price", inr(t.entry_price)),
+        metricHtml("Value", inr(t.entry_price * t.quantity, 0)),
+      ]
+    : [
+        metricHtml("Quantity", fmt(t.quantity, 0)),
+        metricHtml(`Entry · ${esc(t.entry_order_type)}`, inr(t.entry_price)),
+        metricHtml("Stop", inr(t.stop_loss), "pnl-negative"),
+        metricHtml("Target", inr(t.target_1), "pnl-positive"),
+        metricHtml("Capital", inr(t.entry_price * t.quantity, 0)),
+        metricHtml("Risk", inr(Math.abs(t.entry_price - t.stop_loss) * t.quantity, 0)),
+        metricHtml("R : R", t.risk_reward_ratio != null ? `1 : ${t.risk_reward_ratio.toFixed(2)}` : "—"),
+        metricHtml("Trailing", t.trailing_enabled ? `${inr(t.trailing_distance)} after T1` : "Off"),
+      ];
+  const actions = kind === "blocked"
+    ? `<button class="btn btn-ghost btn-small" data-action="details">Why blocked?</button>
+       <button class="btn btn-ghost btn-small" data-action="archive">Archive</button>`
+    : `<button class="btn btn-ghost btn-small" data-action="details">Details</button>
+       <button class="btn btn-outline-danger btn-small" data-action="reject">Reject</button>
+       <button class="btn btn-success btn-small" data-action="approve">${isExit ? "Approve exit" : "Approve &amp; place"}</button>`;
+  let checkLine = "";
+  if (kind === "blocked") {
+    checkLine = `<span class="chip live">✗ ${failed.length ? failed.map((c) => esc(c.label)).join(", ") : "risk check failed"}</span>`;
+  } else if (checks.length) {
+    checkLine = `<span class="chip ok">✓ ${checks.length - failed.length}/${checks.length} risk checks passed</span>`;
+  }
+  const origin = t.source === "strategy" ? strategyChipHtml(t.strategy_name) : `<span class="chip">Manual</span>`;
+  return `
+    <article class="approval-card ${kind}" data-ticket-id="${t.id}">
+      <div class="ac-top">
+        <div class="ac-title">
+          ${sideHtml(t.transaction_type)}<span class="ac-symbol">${esc(t.symbol)}</span>${origin}
+          ${t.signal_date ? `<span class="badge-muted">signal ${esc(fmtDate(t.signal_date))}</span>` : ""}
+        </div>
+        <div class="ac-actions">${actions}</div>
+      </div>
+      <div class="ac-metrics">${metrics.join("")}</div>
+      <p class="ac-rationale">${esc(t.rationale)}</p>
+      <div class="ac-foot">${checkLine}<span>created ${fmtDateTime(t.created_at)}</span></div>
+    </article>`;
+}
+
+function adjustmentCardHtml(p) {
+  return `
+    <article class="approval-card adjust" data-proposal-id="${p.id}">
+      <div class="ac-top">
+        <div class="ac-title">
+          <span class="chip warn">STOP</span><span class="ac-symbol">${esc(p.symbol)}</span>
+          <span class="badge-muted">${fmt(p.quantity, 0)} shares</span>
+        </div>
+        <div class="ac-actions">
+          <button class="btn btn-outline-danger btn-small" data-action="reject-adj">Reject</button>
+          <button class="btn btn-success btn-small" data-action="approve-adj">Move stop</button>
+        </div>
+      </div>
+      <div class="ac-metrics">
+        ${metricHtml("Current stop", inr(p.current_stop))}
+        ${metricHtml("Proposed stop", inr(p.proposed_stop), "pnl-positive")}
+        ${metricHtml("Entry", inr(p.entry_price))}
+      </div>
+      <p class="ac-rationale">${esc(p.reason)}</p>
+    </article>`;
+}
+
+function approvalConfirmHtml(t) {
+  const note = executionNote(t);
+  const price = t.entry_order_type === "LIMIT" ? ` @ ${inr(t.entry_price)}` : "";
+  return `<p>${t.closes_ticket_id != null ? "Close" : "Open"} <strong>${esc(t.transaction_type)} ${fmt(t.quantity, 0)} ${esc(t.symbol)}</strong>
+      — ${esc(t.entry_order_type)}${price}.</p>
+    <div class="exec-note${note.live ? " live" : ""}">${esc(note.text)}</div>`;
+}
+
+el.viewApprovals.addEventListener("click", async (event) => {
+  const btn = event.target.closest("button[data-action]");
+  const card = btn?.closest(".approval-card");
+  if (!btn || !card || card.classList.contains("busy")) return;
+  const action = btn.dataset.action;
+
+  if (action === "approve-adj" || action === "reject-adj") {
+    const approve = action === "approve-adj";
+    const proposal = state.approvals.adjustments.find((p) => p.id === Number(card.dataset.proposalId));
+    if (approve && !(await confirmAction({
+      title: `Move ${proposal?.symbol ?? ""} stop to breakeven?`,
+      html: `<p>Stop ${inr(proposal?.current_stop)} → <strong>${inr(proposal?.proposed_stop)}</strong>.</p>
+        <div class="exec-note${state.executionMode === "live" ? " live" : ""}">${state.executionMode === "live"
+          ? "LIVE — the protective GTT at the broker is modified." : "DRY RUN — only the app's record is updated."}</div>`,
+      okLabel: "Move stop", okClass: "btn-success",
+    }))) return;
+    card.classList.add("busy");
+    try {
+      if (approve) await API.confirmStopAdjustment(card.dataset.proposalId);
+      else await API.rejectStopAdjustment(card.dataset.proposalId);
+      toast(approve ? "Stop moved to breakeven." : "Stop adjustment rejected.", { type: approve ? "success" : "info" });
+    } catch (e) {
+      card.classList.remove("busy");
+      toast(e.message, { type: "error", title: "Stop adjustment failed" });
+    }
+    await refreshTicketViews();
+    return;
+  }
+
+  const id = Number(card.dataset.ticketId);
+  const a = state.approvals;
+  const ticket = [...a.entries, ...a.exits, ...a.blocked].find((t) => t.id === id);
+  if (!ticket) return;
+  if (action === "details") {
+    openConfirmDialog(ticket);
+  } else if (action === "approve") {
+    const live = state.executionMode === "live";
+    const ok = await confirmAction({
+      title: live ? `Place a real ${ticket.transaction_type} order?` : "Approve this trade (dry run)?",
+      html: approvalConfirmHtml(ticket),
+      okLabel: live ? "Place order" : "Approve",
+      okClass: live ? "btn-danger" : "btn-success",
+    });
+    if (!ok) return;
+    card.classList.add("busy");
+    await approveTicket(id);
+  } else if (action === "reject") {
+    card.classList.add("busy");
+    await rejectTicketById(id, "Rejected from Approvals");
+  } else if (action === "archive") {
+    card.classList.add("busy");
+    try {
+      await API.deleteTicket(id);
+      toast("Archived.", { type: "info" });
+    } catch (e) {
+      toast(e.message, { type: "error" });
+    }
+    await refreshTicketViews();
+  }
+});
+
+el.apRefreshBtn.addEventListener("click", () => refreshTicketViews());
+el.dashApprovalsOpen.addEventListener("click", () => showSection("approvals"));
+el.autopilotPill.addEventListener("click", () => showSection("approvals"));
+
+async function loadAutomationStatus() {
+  if (state.accountType !== "trading") return;
+  try {
+    state.automationStatus = await API.automationStatus();
+    renderAutomation();
+  } catch (e) {
+    // keep the last known status on a transient failure
+  }
+}
+
+function fmtNextRun(iso) {
+  const d = new Date(iso);
+  const tz = { timeZone: "Asia/Kolkata" };
+  const dayKey = (x) => x.toLocaleDateString("en-IN", { ...tz, year: "numeric", month: "numeric", day: "numeric" });
+  const time = d.toLocaleTimeString("en-IN", { ...tz, hour: "2-digit", minute: "2-digit", hour12: false });
+  if (dayKey(d) === dayKey(new Date())) return `today ${time}`;
+  return `${d.toLocaleDateString("en-IN", { ...tz, weekday: "short", day: "numeric", month: "short" })} ${time}`;
+}
+
+function runStatusChip(status) {
+  const cls = { success: "ok", skipped: "", failed: "live", running: "dry" }[status] ?? "";
+  return `<span class="chip ${cls}">${esc(status)}</span>`;
+}
+
+function runSummaryText(run) {
+  if (run.error) return run.error;
+  const s = run.summary || {};
+  if (run.status === "skipped") return s.reason || "skipped";
+  if (!s.scan) return run.status === "running" ? "in progress" : "";
+  if (!s.scan.enabled) return "no strategies enabled";
+  let entries = 0;
+  let exits = 0;
+  for (const r of Object.values(s.scan.by_strategy || {})) {
+    entries += r.entry_tickets.length;
+    exits += r.exit_tickets.length;
+  }
+  const expired = (s.expired_signals || []).length;
+  return `${entries} entry, ${exits} exit signal(s)${expired ? `, ${expired} expired` : ""}`;
+}
+
+function runRowHtml(run) {
+  const summary = runSummaryText(run);
+  return `<div class="run-row">
+    <span>${fmtDateTime(run.started_at)}</span>
+    <span>${esc(run.trigger.replace("_", " "))}</span>
+    <span>${runStatusChip(run.status)}</span>
+    <span class="run-detail" title="${esc(summary)}">session ${esc(fmtDate(run.run_date))} · ${esc(summary)}</span>
+  </div>`;
+}
+
+function pipelineStepHtml(kind, marker, title, sub) {
+  return `<div class="pipeline-step ${kind}"><span class="pipeline-dot">${marker}</span>
+    <div class="step-text"><strong>${title}</strong><span>${sub}</span></div></div>`;
+}
+
+function autopilotCardHtml(s) {
+  const last = s.runs[0] || null;
+  const strategies = s.enabled_strategies.length
+    ? s.enabled_strategies.map(strategyChipHtml).join(" ")
+    : `<span class="chip warn">none enabled</span>`;
+  const lastText = last
+    ? `${fmtDateTime(last.started_at)} · ${runStatusChip(last.status)} ${esc(runSummaryText(last))}`
+    : "No runs yet";
+  let nextText = fmtNextRun(s.next_run_at);
+  if (s.running) nextText = "running now";
+  else if (s.due_now) nextText = s.session_connected ? "due — starting shortly" : "due — log in to Kite to run";
+  const state_ = s.running ? '<span class="chip dry">running</span>'
+    : s.enabled_strategies.length ? '<span class="chip ok">on</span>' : '<span class="chip warn">idle</span>';
+  return `
+    <div>
+      <div class="ap-headline"><h2>Autopilot</h2>${state_}${modeChipHtml(s.execution_mode)}</div>
+      <div class="ap-facts">
+        <div class="ap-fact"><label>Strategies</label><span>${strategies}</span></div>
+        <div class="ap-fact"><label>Next run</label><span>${esc(nextText)} <span class="badge-muted">daily ${esc(s.schedule_time_ist)} IST</span></span></div>
+        <div class="ap-fact"><label>Last run</label><span>${lastText}</span></div>
+        <div class="ap-fact"><label>Tracking</label><span>${s.pending.awaiting_fill} order(s) awaiting fill · ${s.pending_data_jobs} data job(s) queued</span></div>
+      </div>
+      <div class="ap-actions">
+        <button class="btn btn-primary btn-small" data-ap-action="run-now" ${s.running ? "disabled" : ""}>Run autopilot now</button>
+        <button class="btn btn-ghost btn-small" data-ap-action="strategies">Strategy settings</button>
+      </div>
+    </div>
+    <div class="pipeline">
+      <div class="pipeline-title">Every trading day after the close</div>
+      ${pipelineStepHtml("auto", "1", "Sync market data", "~3 years of daily candles; mid-session candles corrected")}
+      ${pipelineStepHtml("auto", "2", "Scan strategies", "Expire stale signals, size positions, run risk checks")}
+      ${pipelineStepHtml("manual", "✓", "You approve or reject", "The only manual step")}
+      ${pipelineStepHtml("auto", "3", "Place order + protective GTT", s.settings.amo_when_market_closed ? "Sent as AMO when the market is closed" : "Regular order")}
+      ${pipelineStepHtml("auto", "4", "Track fill, trail stop, reconcile", "Runs continuously while the app is open")}
+    </div>`;
+}
+
+function renderAutomation() {
+  const s = state.automationStatus;
+  if (!s) return;
+  const last = s.runs[0] || null;
+  let pillClass = "ok";
+  let pillText = `Autopilot · next ${fmtNextRun(s.next_run_at)}`;
+  if (s.running) {
+    pillClass = "running";
+    pillText = "Autopilot running…";
+  } else if (!s.enabled_strategies.length) {
+    pillClass = "warn";
+    pillText = "Autopilot · no strategies on";
+  } else if (s.due_now && !s.session_connected) {
+    pillClass = "warn";
+    pillText = "Autopilot · waiting for login";
+  } else if (last && last.status === "failed" && !s.last_session_done) {
+    pillClass = "err";
+    pillText = "Autopilot · last run failed";
+  } else if (s.due_now) {
+    pillClass = "warn";
+    pillText = "Autopilot · run due";
+  }
+  el.autopilotPill.hidden = false;
+  el.autopilotPill.className = `pill autopilot-pill ${pillClass}`;
+  el.autopilotPillText.textContent = pillText;
+  el.autopilotCard.innerHTML = autopilotCardHtml(s);
+  el.apRuns.innerHTML = s.runs.length ? s.runs.map(runRowHtml).join("") : emptyLine("No autopilot runs yet.");
+}
+
+el.autopilotCard.addEventListener("click", async (event) => {
+  const btn = event.target.closest("[data-ap-action]");
+  if (!btn) return;
+  if (btn.dataset.apAction === "strategies") {
+    showSection("strategies");
+    return;
+  }
+  btn.disabled = true;
+  try {
+    await API.automationRunNow();
+    toast("Syncing market data and scanning every enabled strategy — this can take a minute.",
+      { type: "info", title: "Autopilot started" });
+  } catch (e) {
+    toast(e.message, { type: "error" });
+  }
+  setTimeout(loadAutomationStatus, 800);
+});
+
+const THEME_ICONS = {
+  dark: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
+  light: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>',
+};
+
+function applyTheme(theme) {
+  const t = theme === "light" ? "light" : "dark";
+  document.documentElement.dataset.theme = t;
+  el.themeToggleBtn.innerHTML = THEME_ICONS[t];
+  el.themeToggleBtn.title = t === "dark" ? "Switch to light theme" : "Switch to dark theme";
+  try {
+    localStorage.setItem("kt-theme", t);
+  } catch (e) {
+    // private mode / blocked storage — the server-side pref still applies
+  }
+}
+applyTheme(document.documentElement.dataset.theme);
+
+el.themeToggleBtn.addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+  applyTheme(next);
+  API.saveUiPrefs({ theme: next }).catch(() => {});
+});
+
 async function init() {
   const params = new URLSearchParams(location.search);
   if (params.has("login_error")) {
@@ -2847,8 +3617,9 @@ async function init() {
   try {
     const prefs = await API.getUiPrefs();
     el.sidebar.classList.toggle("collapsed", !!prefs.sidebar_collapsed);
+    if (prefs.theme) applyTheme(prefs.theme);
   } catch (e) {
-    // default expanded
+    // default expanded; theme stays as restored from localStorage
   }
 
   const status = await API.status();
@@ -2861,22 +3632,28 @@ async function init() {
   }
   await loadDashboard();
   await loadDashboardPanels();
+  const requestedSection = location.hash.slice(1);
   showSection("dashboard");
 
   if (state.accountType === "trading") {
     revealTradingNavItems();
     await loadTicketingData();
-    await loadRiskData();
-    await loadWatchlist();
-    await loadStrategyData();
-    await loadPhase6Data();
-    await loadReconciliationMismatches();
+    await Promise.all([
+      loadRiskData(), loadWatchlist(), loadStrategyData(), loadPhase6Data(),
+      loadReconciliationMismatches(), loadApprovals(), loadAutomationStatus(),
+    ]);
+    if (requestedSection) showSection(requestedSection);
     setInterval(loadReconciliationMismatches, 60000);
+    // Safety net behind the WebSocket push: queues/badges never go stale.
+    setInterval(refreshTicketViews, 60000);
   }
 }
 
 el.connectBtn.addEventListener("click", () => { location.href = "/login"; });
 el.reconnectBtn.addEventListener("click", () => { location.href = "/login"; });
-el.refreshBtn.addEventListener("click", loadDashboard);
+el.refreshBtn.addEventListener("click", () => {
+  loadDashboard();
+  refreshTicketViews();
+});
 
 init();

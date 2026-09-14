@@ -11,9 +11,8 @@ logger = logging.getLogger(__name__)
 
 async def run_reconciliation_loop() -> None:
     """Same infinite-loop-+-sleep shape as trailing_engine.run_trailing_loop
-    (Phase 3) / data_jobs.run_daily_refresh_loop (Phase 4.5). Only checks
-    the trading account (Part B.4 — investment accounts have no tickets to
-    reconcile against)."""
+    (Phase 3). Only checks the trading account (Part B.4 — investment
+    accounts have no tickets to reconcile against)."""
     while True:
         try:
             await asyncio.to_thread(_run_cycle)
@@ -58,7 +57,7 @@ def _already_logged(conn: sqlite3.Connection, ticket_id: int | None, check_type:
     return row is not None
 
 
-def _log_mismatch(conn: sqlite3.Connection, ticket_id: int | None, check_type: str, expected: str, actual: str, detail: str) -> None:
+def log_mismatch(conn: sqlite3.Connection, ticket_id: int | None, check_type: str, expected: str, actual: str, detail: str) -> None:
     if _already_logged(conn, ticket_id, check_type, actual):
         return
     conn.execute(
@@ -72,10 +71,14 @@ def _log_mismatch(conn: sqlite3.Connection, ticket_id: int | None, check_type: s
 
 
 def _check_order_status(conn: sqlite3.Connection, kite, account) -> None:
+    # Only today's orders can be looked up (the broker's order book covers
+    # the current session — older ids just error every cycle), and orders
+    # still awaiting a fill are followed by order_monitor.py, not flagged.
     tickets = conn.execute(
         "SELECT id, symbol, quantity, kite_order_id FROM trade_tickets "
-        "WHERE account_id = ? AND status = 'executed' AND kite_order_id IS NOT NULL",
-        (account["id"],),
+        "WHERE account_id = ? AND status = 'executed' AND kite_order_id IS NOT NULL "
+        "AND executed_at >= ? AND COALESCE(entry_fill_status, 'filled') = 'filled'",
+        (account["id"], risk_engine._same_day_ist_cutoff_utc()),
     ).fetchall()
     for t in tickets:
         try:
@@ -90,7 +93,7 @@ def _check_order_status(conn: sqlite3.Connection, kite, account) -> None:
         filled_qty = latest.get("filled_quantity")
 
         if status != "COMPLETE" or (filled_qty is not None and filled_qty != t["quantity"]):
-            _log_mismatch(
+            log_mismatch(
                 conn, t["id"], "order_status",
                 expected=f"COMPLETE, filled_quantity={t['quantity']}",
                 actual=f"{status}, filled_quantity={filled_qty}",
@@ -117,15 +120,17 @@ def _check_gtt_state(conn: sqlite3.Connection, kite, account) -> None:
     except Exception:
         logger.exception("Could not fetch get_gtts()")
         return
-    active_gtt_ids = {g["id"] for g in gtts}
+    # get_gtts() also lists triggered/cancelled/expired GTTs — only 'active'
+    # ones are still protecting anything.
+    active_gtt_ids = {g["id"] for g in gtts if g.get("status", "active") == "active"}
 
     for t in tickets:
         if t["kite_gtt_id"] not in active_gtt_ids:
-            _log_mismatch(
+            log_mismatch(
                 conn, t["id"], "order_status",
                 expected=f"GTT {t['kite_gtt_id']} active",
-                actual="GTT not found in kite.get_gtts()",
-                detail=f"{t['symbol']}: GTT disappeared — trailing_engine should detect this on its own next "
+                actual="GTT not active in kite.get_gtts()",
+                detail=f"{t['symbol']}: GTT is no longer active — trailing_engine should detect this on its own next "
                        f"tick and close the position; this is an independent, earlier flag of the same event.",
             )
 
@@ -133,6 +138,8 @@ def _check_gtt_state(conn: sqlite3.Connection, kite, account) -> None:
 def _check_position_state(conn: sqlite3.Connection, kite, account) -> None:
     expected_by_symbol: dict[str, int] = {}
     for pos in risk_engine.list_open_positions(conn, account["id"]):
+        if pos["entry_fill_status"] == "pending":
+            continue  # not bought yet — order_monitor.py follows it
         expected_by_symbol[pos["symbol"]] = expected_by_symbol.get(pos["symbol"], 0) + pos["quantity"]
     if not expected_by_symbol:
         return
@@ -144,18 +151,23 @@ def _check_position_state(conn: sqlite3.Connection, kite, account) -> None:
         logger.exception("Could not fetch holdings()/positions() for position-state check")
         return
 
+    # Unsettled (T+1) delivery quantity sits in t1_quantity, not quantity —
+    # ignoring it flagged every position the day after it was bought.
     actual_by_symbol: dict[str, int] = {}
     for h in holdings:
-        actual_by_symbol[h["tradingsymbol"]] = actual_by_symbol.get(h["tradingsymbol"], 0) + h["quantity"]
+        qty = (h.get("quantity") or 0) + (h.get("t1_quantity") or 0)
+        actual_by_symbol[h["tradingsymbol"]] = actual_by_symbol.get(h["tradingsymbol"], 0) + qty
     for p in positions:
-        actual_by_symbol[p["tradingsymbol"]] = actual_by_symbol.get(p["tradingsymbol"], 0) + p["quantity"]
+        actual_by_symbol[p["tradingsymbol"]] = actual_by_symbol.get(p["tradingsymbol"], 0) + (p.get("quantity") or 0)
 
+    # Only a SHORTFALL is a problem: holding more than the app's tickets
+    # account for is normal when the stock is also held outside the app.
     for symbol, expected_qty in expected_by_symbol.items():
         actual_qty = actual_by_symbol.get(symbol, 0)
-        if actual_qty != expected_qty:
-            _log_mismatch(
+        if actual_qty < expected_qty:
+            log_mismatch(
                 conn, None, "position_state",
                 expected=f"{expected_qty} shares", actual=f"{actual_qty} shares",
-                detail=f"Portfolio state differs from trade ticket — {symbol} expected {expected_qty} shares, "
-                       f"broker shows {actual_qty}.",
+                detail=f"{symbol}: the app's open tickets hold {expected_qty} shares but the broker shows only "
+                       f"{actual_qty} — sold outside the app, or an order didn't fill.",
             )

@@ -1,5 +1,6 @@
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
 
 from kiteconnect import KiteConnect
 from kiteconnect.exceptions import (
@@ -11,7 +12,7 @@ from kiteconnect.exceptions import (
     TokenException,
 )
 
-from backend import config
+from backend import config, instruments, market
 from backend.db import get_connection
 
 
@@ -76,6 +77,10 @@ class ExecutionResult:
     status: str  # 'executed' | 'failed'
     event_type: str  # 'executed' | 'execution_failed' | 'protection_failed'
     message: str
+    order_variety: str | None = None  # 'regular' | 'amo'
+    # 'pending' for a live order until backend/order_monitor.py sees the
+    # broker's terminal state; 'filled' for a simulated (dry-run) execution.
+    entry_fill_status: str | None = None
 
 
 def execute_ticket(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
@@ -94,6 +99,7 @@ def _simulate(ticket: sqlite3.Row) -> ExecutionResult:
         status="executed",
         event_type="executed",
         message="Simulated (dry run) — no real order placed.",
+        entry_fill_status="filled",
     )
 
 
@@ -101,29 +107,44 @@ def resolve_exit_side(transaction_type: str) -> str:
     return "SELL" if transaction_type == "BUY" else "BUY"
 
 
-def buffered_stop_price(stop_loss: float, transaction_type: str) -> float:
+def resolve_order_variety(kite: KiteConnect, at: datetime | None = None) -> str:
+    if config.USE_AMO_WHEN_MARKET_CLOSED and not market.is_market_open(at):
+        return kite.VARIETY_AMO
+    return kite.VARIETY_REGULAR
+
+
+def buffered_stop_price(stop_loss: float, transaction_type: str, tick_size: float = market.DEFAULT_TICK_SIZE) -> float:
     """Applied only to the protective/stop leg of a GTT, never to a target
     leg. A GTT leg executes as a LIMIT order once triggered, so a stop placed
     at the exact trigger price can fail to fill on a gap — buffer the limit
-    price slightly in the direction that makes it more likely to fill.
+    price slightly in the direction that makes it more likely to fill, then
+    snap it onto the tick grid in that same direction.
     Long position (exit=SELL): buffer below the trigger. Short position
     (exit=BUY): buffer above."""
     buf = config.GTT_SLIPPAGE_BUFFER_PCT / 100
     if transaction_type == "BUY":  # long position, exit leg is SELL
-        return stop_loss * (1 - buf)
-    return stop_loss * (1 + buf)  # short position, exit leg is BUY
+        return market.round_to_tick(stop_loss * (1 - buf), tick_size, "down")
+    return market.round_to_tick(stop_loss * (1 + buf), tick_size, "up")  # short position, exit leg is BUY
+
+
+def _variety_note(kite: KiteConnect, variety: str) -> str:
+    return " as AMO (market closed — queued for the next session)" if variety == kite.VARIETY_AMO else ""
 
 
 def _execute_live(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
     exchange, symbol = ticket["exchange"], ticket["symbol"]
     transaction_type, quantity, product = ticket["transaction_type"], ticket["quantity"], ticket["product_type"]
     exit_side = resolve_exit_side(transaction_type)
+    tick = instruments.get_tick_size(symbol, exchange)
+    stop = market.round_to_tick(ticket["stop_loss"], tick)
+    target = market.round_to_tick(ticket["target_1"], tick)
+    variety = resolve_order_variety(kite)
 
     # 1. Entry order — common to both trailing and non-trailing branches. A
     # GTT alone cannot open a position, so both branches place a real order first.
     try:
         order_kwargs = dict(
-            variety=kite.VARIETY_REGULAR,
+            variety=variety,
             exchange=exchange,
             tradingsymbol=symbol,
             transaction_type=transaction_type,
@@ -132,13 +153,13 @@ def _execute_live(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
             order_type=ticket["entry_order_type"],
         )
         if ticket["entry_order_type"] == "LIMIT":
-            order_kwargs["price"] = ticket["entry_price"]
+            order_kwargs["price"] = market.round_to_tick(ticket["entry_price"], tick)
         kite_order_id = kite.place_order(**order_kwargs)
     except (OrderException, InputException, GeneralException, PermissionException) as e:
         return ExecutionResult(
             success=False, kite_order_id=None, kite_gtt_id=None,
             status="failed", event_type="execution_failed",
-            message=f"Entry order rejected by Kite: {e}",
+            message=f"Entry order rejected by Kite: {e}", order_variety=variety,
         )
     except (NetworkException, TokenException) as e:
         # Ambiguous: we cannot tell if Kite actually received the order before
@@ -151,10 +172,13 @@ def _execute_live(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
                 f"Entry order outcome UNKNOWN (network/auth error): {e}. "
                 f"Verify manually in Kite before retrying — do not resubmit blindly."
             ),
+            order_variety=variety,
         )
 
     # 2. Protective exit-side GTT — placed immediately after a successful
-    # entry so the position is never left naked, even briefly.
+    # entry so the position is never left naked, even briefly (and even if
+    # this app is not running when the entry fills). If the entry order later
+    # turns out REJECTED/CANCELLED, order_monitor.py removes this GTT again.
     try:
         last_price = kite.ltp(f"{exchange}:{symbol}")[f"{exchange}:{symbol}"]["last_price"]
         if ticket["trailing_enabled"]:
@@ -162,18 +186,18 @@ def _execute_live(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
                 trigger_type=kite.GTT_TYPE_SINGLE,
                 tradingsymbol=symbol,
                 exchange=exchange,
-                trigger_values=[ticket["stop_loss"]],
+                trigger_values=[stop],
                 last_price=last_price,
                 orders=[{
                     "transaction_type": exit_side,
                     "quantity": quantity,
                     "order_type": "LIMIT",
                     "product": product,
-                    "price": buffered_stop_price(ticket["stop_loss"], transaction_type),
+                    "price": buffered_stop_price(stop, transaction_type, tick),
                 }],
             )
         else:
-            lo, hi = sorted([ticket["stop_loss"], ticket["target_1"]])
+            lo, hi = sorted([stop, target])
             gtt_response = kite.place_gtt(
                 trigger_type=kite.GTT_TYPE_OCO,
                 tradingsymbol=symbol,
@@ -186,14 +210,14 @@ def _execute_live(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
                         "quantity": quantity,
                         "order_type": "LIMIT",
                         "product": product,
-                        "price": buffered_stop_price(lo, transaction_type) if lo == ticket["stop_loss"] else lo,
+                        "price": buffered_stop_price(lo, transaction_type, tick) if lo == stop else lo,
                     },
                     {
                         "transaction_type": exit_side,
                         "quantity": quantity,
                         "order_type": "LIMIT",
                         "product": product,
-                        "price": buffered_stop_price(hi, transaction_type) if hi == ticket["stop_loss"] else hi,
+                        "price": buffered_stop_price(hi, transaction_type, tick) if hi == stop else hi,
                     },
                 ],
             )
@@ -207,9 +231,10 @@ def _execute_live(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
             success=True, kite_order_id=kite_order_id, kite_gtt_id=None,
             status="executed", event_type="protection_failed",
             message=(
-                f"Entry order {kite_order_id} placed, but the protective GTT FAILED: {e}. "
+                f"Entry order {kite_order_id} placed{_variety_note(kite, variety)}, but the protective GTT FAILED: {e}. "
                 f"UNPROTECTED POSITION — place a stop-loss in Kite manually now."
             ),
+            order_variety=variety, entry_fill_status="pending",
         )
 
     return ExecutionResult(
@@ -217,8 +242,9 @@ def _execute_live(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
         status="executed", event_type="executed",
         message=(
             f"order_id={kite_order_id}, gtt_id={kite_gtt_id}, "
-            f"{transaction_type} {quantity} {symbol} @ {ticket['entry_order_type']}"
+            f"{transaction_type} {quantity} {symbol} @ {ticket['entry_order_type']}{_variety_note(kite, variety)}"
         ),
+        order_variety=variety, entry_fill_status="pending",
     )
 
 
@@ -228,18 +254,19 @@ def _execute_exit(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
     ordinary manual tickets never set this field) reduces or closes an
     existing position. It must NOT get a protective GTT of its own —
     there's nothing new to protect — and the ORIGINAL position's GTT must
-    be cancelled here, synchronously, once this exit fills, so a now-flat
-    position doesn't keep a dangling stop-loss GTT that could later trigger
-    against nothing. The original ticket's closed_at is stamped by the
-    caller (routes/tickets.py's confirm_and_execute_ticket), immediately,
-    in the same transaction as this exit's own execution — not left to
-    trailing_engine's next scheduled tick, which would otherwise leave the
-    position looking "still open" for up to TRAILING_CHECK_INTERVAL_SECONDS
-    after a human just confirmed it was closed."""
+    be cancelled here, synchronously, once this exit is accepted, so a
+    now-flat position doesn't keep a dangling stop-loss GTT that could later
+    trigger against nothing. The original ticket's closed_at is stamped by the
+    caller (routes/tickets.py's confirm_and_execute_ticket), immediately, in
+    the same transaction as this exit's own execution. If the broker later
+    rejects this exit, order_monitor.py re-opens the position and raises an
+    urgent alert."""
     exchange, symbol = ticket["exchange"], ticket["symbol"]
+    tick = instruments.get_tick_size(symbol, exchange)
+    variety = resolve_order_variety(kite)
     try:
         order_kwargs = dict(
-            variety=kite.VARIETY_REGULAR,
+            variety=variety,
             exchange=exchange,
             tradingsymbol=symbol,
             transaction_type=ticket["transaction_type"],
@@ -248,13 +275,13 @@ def _execute_exit(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
             order_type=ticket["entry_order_type"],
         )
         if ticket["entry_order_type"] == "LIMIT":
-            order_kwargs["price"] = ticket["entry_price"]
+            order_kwargs["price"] = market.round_to_tick(ticket["entry_price"], tick)
         kite_order_id = kite.place_order(**order_kwargs)
     except (OrderException, InputException, GeneralException, PermissionException) as e:
         return ExecutionResult(
             success=False, kite_order_id=None, kite_gtt_id=None,
             status="failed", event_type="execution_failed",
-            message=f"Exit order rejected by Kite: {e}",
+            message=f"Exit order rejected by Kite: {e}", order_variety=variety,
         )
     except (NetworkException, TokenException) as e:
         return ExecutionResult(
@@ -264,6 +291,7 @@ def _execute_exit(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
                 f"Exit order outcome UNKNOWN (network/auth error): {e}. "
                 f"Verify manually in Kite before retrying — do not resubmit blindly."
             ),
+            order_variety=variety,
         )
 
     conn = get_connection()
@@ -280,7 +308,7 @@ def _execute_exit(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
             kite.delete_gtt(original["kite_gtt_id"])
         except Exception as e:
             gtt_note = (
-                f" WARNING: exit order filled, but deleting the original position's GTT "
+                f" WARNING: exit order placed, but deleting the original position's GTT "
                 f"({original['kite_gtt_id']}) FAILED: {e}. Remove it manually in Kite — "
                 f"it is now orphaned against a closed/reduced position."
             )
@@ -290,6 +318,7 @@ def _execute_exit(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
         status="executed", event_type="executed",
         message=(
             f"order_id={kite_order_id}, {ticket['transaction_type']} {ticket['quantity']} {symbol} "
-            f"@ {ticket['entry_order_type']} (closes ticket {ticket['closes_ticket_id']})"
+            f"@ {ticket['entry_order_type']}{_variety_note(kite, variety)} (closes ticket {ticket['closes_ticket_id']})"
         ) + gtt_note,
+        order_variety=variety, entry_fill_status="pending",
     )

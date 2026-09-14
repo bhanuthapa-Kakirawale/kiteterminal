@@ -383,6 +383,29 @@ CREATE TABLE IF NOT EXISTS reconciliation_log (
     checked_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_reconciliation_log_resolved ON reconciliation_log(resolved);
+
+-- Autopilot run log (backend/automation.py): one row per pipeline attempt
+-- for a given trading session (run_date, IST).
+CREATE TABLE IF NOT EXISTS automation_runs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id   INTEGER NOT NULL REFERENCES accounts(id),
+    run_date     TEXT NOT NULL,
+    trigger      TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('running', 'success', 'skipped', 'failed')),
+    summary      TEXT,
+    error        TEXT,
+    started_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_automation_runs_account_date ON automation_runs(account_id, run_date);
+
+-- Earliest date historical data has ever been requested from, per
+-- instrument — lets the refresh job deepen history exactly once instead of
+-- re-requesting pre-listing ranges a broker will never return.
+CREATE TABLE IF NOT EXISTS ohlc_meta (
+    instrument_token        INTEGER PRIMARY KEY,
+    history_requested_from  TEXT NOT NULL
+);
 """
 
 # account_id indexes are created after _run_column_migrations, since the
@@ -936,6 +959,30 @@ def _ensure_todays_actions_panel(conn: sqlite3.Connection) -> None:
         )
 
 
+_TRADE_TICKET_EXECUTION_COLUMNS = [
+    # regular | amo — how the order was sent to the broker.
+    ("order_variety", "TEXT"),
+    # pending | filled | partial | rejected | cancelled — tracked by
+    # backend/order_monitor.py until the broker reports a terminal state.
+    ("entry_fill_status", "TEXT"),
+    ("filled_price", "REAL"),
+    ("filled_at", "TEXT"),
+    # Date of the candle a strategy signal was computed from.
+    ("signal_date", "TEXT"),
+]
+
+
+def _ensure_execution_tracking_columns(conn: sqlite3.Connection) -> None:
+    for column, sql_type in _TRADE_TICKET_EXECUTION_COLUMNS:
+        if not _column_exists(conn, "trade_tickets", column):
+            conn.execute(f"ALTER TABLE trade_tickets ADD COLUMN {column} {sql_type}")
+
+
+def _ensure_instrument_tick_size_column(conn: sqlite3.Connection) -> None:
+    if not _column_exists(conn, "instrument_cache", "tick_size"):
+        conn.execute("ALTER TABLE instrument_cache ADD COLUMN tick_size REAL")
+
+
 def init_db() -> None:
     crypto.ensure_encryption_key()
     conn = get_connection()
@@ -954,6 +1001,8 @@ def init_db() -> None:
         _ensure_closed_trades_strategy_version_column(conn)
         _ensure_strategy_configs_versioning_columns(conn)
         _ensure_backtest_runs_rigor_columns(conn)
+        _ensure_execution_tracking_columns(conn)
+        _ensure_instrument_tick_size_column(conn)
         conn.executescript(_ACCOUNT_ID_INDEXES)
         _seed_default_account(conn)
         _ensure_trading_account_type(conn)

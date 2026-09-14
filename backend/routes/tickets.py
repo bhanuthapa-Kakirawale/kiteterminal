@@ -10,6 +10,7 @@ from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
 from backend.models import TicketCreateRequest, TicketEditRequest, TicketRejectRequest
+from backend.ticker import ticker_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -22,6 +23,11 @@ def _log_event(conn: sqlite3.Connection, ticket_id: int, event_type: str, detail
         "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, ?, ?)",
         (ticket_id, event_type, detail),
     )
+
+
+def _notify(reason: str, **extra) -> None:
+    # Lets every open browser tab refresh its queues/badges immediately.
+    ticker_manager.broadcast({"type": "tickets_changed", "reason": reason, **extra})
 
 
 def _get_ticket_or_404(conn: sqlite3.Connection, ticket_id: int, account_id: int) -> sqlite3.Row:
@@ -127,6 +133,7 @@ def create_ticket(req: TicketCreateRequest, kite: KiteConnect = Depends(require_
         conn.commit()
 
         _run_risk_checks_and_transition(conn, account, ticket_id, kite)
+        _notify("created", ticket_id=ticket_id)
 
         ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
         return {"data": _serialize(ticket)}
@@ -206,6 +213,38 @@ def reject_ticket(ticket_id: int, req: TicketRejectRequest, kite: KiteConnect = 
         conn.execute("UPDATE trade_tickets SET status = 'rejected' WHERE id = ?", (ticket_id,))
         _log_event(conn, ticket_id, "rejected", req.reason)
         conn.commit()
+        _notify("rejected", ticket_id=ticket_id)
+        ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
+        return {"data": _serialize(ticket)}
+    finally:
+        conn.close()
+
+
+@router.post("/api/tickets/{ticket_id}/revert-rejection")
+def revert_rejection(ticket_id: int, kite: KiteConnect = Depends(require_trading_account)):
+    """Undo a mistaken reject: puts the ticket back through risk checks so it
+    lands back wherever a fresh ticket would (pending_confirmation or
+    risk_rejected) — for a strategy-sourced ticket this makes it reappear in
+    the Signal Queue, exactly as if it had never been rejected."""
+    account = get_trading_account()
+    conn = get_connection()
+    try:
+        ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
+        if ticket["status"] != "rejected":
+            raise HTTPException(409, {
+                "error_code": "CONFLICT_INVALID_STATE",
+                "message": f"Only a rejected ticket can be reverted (current status: '{ticket['status']}')",
+            })
+        conn.execute(
+            "UPDATE trade_tickets SET status = 'draft', archived = 0, risk_check_results = NULL WHERE id = ?",
+            (ticket_id,),
+        )
+        _log_event(conn, ticket_id, "modified", "Rejection reverted by user; risk checks re-run")
+        conn.commit()
+
+        _run_risk_checks_and_transition(conn, account, ticket_id, kite)
+        _notify("reverted", ticket_id=ticket_id)
+
         ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
         return {"data": _serialize(ticket)}
     finally:
@@ -234,28 +273,28 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
     ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
     result = execution.execute_ticket(kite, ticket)
 
-    if result.event_type == "executed":
+    if result.event_type in ("executed", "protection_failed"):
+        # A live order is 'pending' until order_monitor.py sees the broker's
+        # fill; a dry-run simulation is filled at its reference price.
+        filled_now = result.entry_fill_status == "filled"
         conn.execute(
             """
             UPDATE trade_tickets
             SET status = ?, kite_order_id = ?, kite_gtt_id = ?,
-                current_stop_loss = stop_loss, executed_at = datetime('now')
+                current_stop_loss = stop_loss, executed_at = datetime('now'),
+                order_variety = ?, entry_fill_status = ?,
+                filled_price = CASE WHEN ? THEN entry_price ELSE NULL END,
+                filled_at = CASE WHEN ? THEN datetime('now') ELSE NULL END
             WHERE id = ?
             """,
-            (result.status, result.kite_order_id, result.kite_gtt_id, ticket_id),
-        )
-    elif result.event_type == "protection_failed":
-        conn.execute(
-            """
-            UPDATE trade_tickets
-            SET status = ?, kite_order_id = ?, kite_gtt_id = NULL,
-                current_stop_loss = stop_loss, executed_at = datetime('now')
-            WHERE id = ?
-            """,
-            (result.status, result.kite_order_id, ticket_id),
+            (result.status, result.kite_order_id, result.kite_gtt_id, result.order_variety,
+             result.entry_fill_status, filled_now, filled_now, ticket_id),
         )
     else:  # execution_failed
-        conn.execute("UPDATE trade_tickets SET status = ? WHERE id = ?", (result.status, ticket_id))
+        conn.execute(
+            "UPDATE trade_tickets SET status = ?, order_variety = ? WHERE id = ?",
+            (result.status, result.order_variety, ticket_id),
+        )
 
     _log_event(conn, ticket_id, result.event_type, result.message)
     conn.commit()
@@ -290,6 +329,7 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
         except ValueError:
             logger.exception("Failed to record closed_trades for ticket %d", ticket_id)
 
+    _notify("executed", ticket_id=ticket_id, status=ticket["status"], success=result.success)
     data = _serialize(ticket)
     data["execution_message"] = result.message
     data["success"] = result.success
@@ -333,6 +373,7 @@ def cancel_all_pending(kite: KiteConnect = Depends(require_trading_account)):
         )
         conn.commit()
 
+        _notify("cancelled_all")
         return {"data": {"cancelled_ticket_ids": cancelled_ids, "count": len(cancelled_ids), "symbols": symbols}}
     finally:
         conn.close()
@@ -443,6 +484,7 @@ def edit_ticket(ticket_id: int, req: TicketEditRequest, kite: KiteConnect = Depe
         conn.commit()
 
         _run_risk_checks_and_transition(conn, account, ticket_id, kite)
+        _notify("modified", ticket_id=ticket_id)
 
         ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
         return {"data": _serialize(ticket)}
@@ -462,12 +504,14 @@ def delete_ticket(ticket_id: int, kite: KiteConnect = Depends(require_trading_ac
             conn.execute("DELETE FROM ticket_events WHERE ticket_id = ?", (ticket_id,))
             conn.execute("DELETE FROM trade_tickets WHERE id = ?", (ticket_id,))
             conn.commit()
+            _notify("deleted", ticket_id=ticket_id)
             return {"data": {"deleted": True, "archived": False}}
 
         if status in _SOFT_DELETE_STATUSES:
             _log_event(conn, ticket_id, "archived", f"Archived by user (was '{status}')")
             conn.execute("UPDATE trade_tickets SET archived = 1 WHERE id = ?", (ticket_id,))
             conn.commit()
+            _notify("archived", ticket_id=ticket_id)
             return {"data": {"deleted": False, "archived": True}}
 
         if status in _PERMANENT_STATUSES:

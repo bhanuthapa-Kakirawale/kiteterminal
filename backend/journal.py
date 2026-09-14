@@ -19,6 +19,10 @@ def _exit_reason_from_checklist(checklist: dict | None) -> str:
         # Synthesized by trailing_engine.py when a GTT disappears — the
         # engine already determined which level was closer to the fill.
         return checklist["gtt_auto_trigger"].get("closer_to", "stop_loss")
+    if checklist.get("emergency_exit_all"):
+        return "emergency_exit"
+    if checklist.get("rsi_recovery", {}).get("pass"):
+        return "rsi_recovery"
     if "thesis_invalidation" in checklist or "time_exit" in checklist:
         # Phase 5's evaluate_exit checks thesis_invalidation first, so it
         # wins if both conditions happened to be true simultaneously.
@@ -65,8 +69,11 @@ def record_closed_trade(conn: sqlite3.Connection, sell_ticket_id: int) -> int | 
             f"— refusing to silently pick one."
         )
 
-    entry_price = buy["entry_price"]
-    exit_price = sell["entry_price"]
+    # The broker's actual fills once order_monitor.py has recorded them; the
+    # tickets' reference prices otherwise (dry run, or fill not seen yet —
+    # apply_exit_fill() re-prices the row when the exit fill arrives).
+    entry_price = buy["filled_price"] or buy["entry_price"]
+    exit_price = sell["filled_price"] or sell["entry_price"]
     quantity = buy["quantity"]
     # Long-only today: every closes_ticket_id currently links a SELL exit to
     # a BUY entry (Phase 5's exit scanner only ever closes BUY positions).
@@ -113,6 +120,28 @@ def record_closed_trade(conn: sqlite3.Connection, sell_ticket_id: int) -> int | 
         sell["symbol"], quantity, entry_price, exit_price, realized_pnl, sell["mode"], exit_reason,
     )
     return cursor.lastrowid
+
+
+def apply_exit_fill(conn: sqlite3.Connection, sell_ticket_id: int, fill_price: float) -> None:
+    """Re-prices a closed_trades row with the broker's actual exit fill. The
+    row is first written when the exit is placed, using the reference price,
+    because a MARKET exit's fill isn't known yet. Caller commits."""
+    row = conn.execute("SELECT * FROM closed_trades WHERE sell_ticket_id = ?", (sell_ticket_id,)).fetchone()
+    if row is None or not fill_price:
+        return
+    buy = conn.execute("SELECT transaction_type FROM trade_tickets WHERE id = ?", (row["buy_ticket_id"],)).fetchone()
+    quantity, entry_price = row["quantity"], row["entry_price"]
+    if buy is None or buy["transaction_type"] == "BUY":
+        realized_pnl = (fill_price - entry_price) * quantity
+    else:
+        realized_pnl = (entry_price - fill_price) * quantity
+    realized_pnl_pct = (realized_pnl / (entry_price * quantity) * 100) if entry_price and quantity else 0.0
+    r_multiple = (realized_pnl / row["risk_amount"]) if row["risk_amount"] else None
+    conn.execute(
+        "UPDATE closed_trades SET exit_price = ?, realized_pnl = ?, realized_pnl_pct = ?, r_multiple_realized = ? "
+        "WHERE id = ?",
+        (fill_price, realized_pnl, realized_pnl_pct, r_multiple, row["id"]),
+    )
 
 
 def backfill_closed_trades(conn: sqlite3.Connection) -> int:

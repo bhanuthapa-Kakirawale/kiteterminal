@@ -1,0 +1,141 @@
+import sys
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from cryptography.fernet import Fernet
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from fake_kite import FakeKite, make_candles  # noqa: E402
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# Every test runs against a throwaway SQLite file and a FakeKite. These
+# symbols are seeded into instrument_cache so ticket/watchlist validation
+# (which resolves symbols server-side) behaves exactly like production.
+SEED_INSTRUMENTS = [
+    (2953217, "TCS", "TATA CONSULTANCY SERV LT"),
+    (408065, "INFY", "INFOSYS"),
+    (738561, "RELIANCE", "RELIANCE INDUSTRIES"),
+    (857857, "SUNPHARMA", "SUN PHARMACEUTICAL IND L"),
+    (3930881, "RECLTD", "REC"),
+]
+
+
+def last_weekday(d: date) -> date:
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def seed_ohlc(db, instrument_token: int, symbol: str, candles: list[dict]) -> None:
+    conn = db.get_connection()
+    try:
+        conn.executemany(
+            "INSERT OR REPLACE INTO ohlc_daily (instrument_token, symbol, date, open, high, low, close, volume) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [(instrument_token, symbol, c["date"].strftime("%Y-%m-%d"), c["open"], c["high"], c["low"], c["close"],
+              c["volume"]) for c in candles],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def add_watch(db, symbol: str, instrument_token: int) -> None:
+    conn = db.get_connection()
+    try:
+        account_id = conn.execute("SELECT id FROM accounts WHERE is_default = 1").fetchone()["id"]
+        conn.execute(
+            "INSERT OR IGNORE INTO watchlist (account_id, symbol, instrument_token) VALUES (?, ?, ?)",
+            (account_id, symbol, instrument_token),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    monkeypatch.setenv("KITE_TERMINAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("KITE_API_KEY", "test_api_key")
+    monkeypatch.setenv("KITE_API_SECRET", "test_api_secret")
+
+    from backend import crypto, db, ui_prefs
+    monkeypatch.setattr(crypto, "ENV_PATH", tmp_path / ".env")
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(ui_prefs, "PREFS_PATH", tmp_path / "ui_prefs.json")
+    db.init_db()
+
+    conn = db.get_connection()
+    try:
+        conn.executemany(
+            "INSERT INTO instrument_cache (instrument_token, tradingsymbol, name, exchange, segment, instrument_type) "
+            "VALUES (?, ?, ?, 'NSE', 'NSE', 'EQ')",
+            SEED_INSTRUMENTS,
+        )
+        account_id = conn.execute("SELECT id FROM accounts WHERE is_default = 1").fetchone()["id"]
+        conn.execute(
+            "INSERT INTO sessions (access_token, user_id, user_name, login_time, account_id) VALUES (?, ?, ?, ?, ?)",
+            ("fake-access-token", "DT0001", "Demo Trader", datetime.now(IST).isoformat(), account_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    fake = FakeKite(
+        holdings=[{
+            "tradingsymbol": "RELIANCE", "exchange": "NSE", "instrument_token": 738561, "quantity": 10,
+            "t1_quantity": 0, "average_price": 1200.0, "last_price": 1300.0, "pnl": 1000.0,
+            "day_change": 5.0, "day_change_percentage": 0.4,
+        }],
+        margins_net=1_000_000.0,
+        ltp={"NSE:TCS": 3000.0, "NSE:INFY": 1500.0, "NSE:RELIANCE": 1300.0, "NSE:SUNPHARMA": 1700.0},
+    )
+
+    from backend import kite_client
+    monkeypatch.setattr(kite_client, "get_kite", lambda account_id=None: fake)
+
+    from backend.ticker import ticker_manager
+    monkeypatch.setattr(ticker_manager, "start", lambda *a, **k: None)
+    broadcasts: list[dict] = []
+    monkeypatch.setattr(ticker_manager, "broadcast", lambda message: broadcasts.append(message))
+
+    from fastapi.testclient import TestClient
+    from backend.main import app
+    client = TestClient(app)  # startup hooks intentionally NOT run: no background loops in tests
+
+    return SimpleNamespace(client=client, kite=fake, db=db, broadcasts=broadcasts, tmp_path=tmp_path)
+
+
+def account_id(db) -> int:
+    conn = db.get_connection()
+    try:
+        return conn.execute("SELECT id FROM accounts WHERE is_default = 1").fetchone()["id"]
+    finally:
+        conn.close()
+
+
+def set_mode(db, mode: str) -> None:
+    conn = db.get_connection()
+    try:
+        conn.execute("UPDATE execution_settings SET mode = ? WHERE id = 1", (mode,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def ticket_row(db, ticket_id: int) -> dict:
+    conn = db.get_connection()
+    try:
+        return dict(conn.execute("SELECT * FROM trade_tickets WHERE id = ?", (ticket_id,)).fetchone())
+    finally:
+        conn.close()
+
+
+__all__ = ["FakeKite", "make_candles", "seed_ohlc", "add_watch", "account_id", "set_mode", "ticket_row",
+           "last_weekday", "IST"]

@@ -8,6 +8,7 @@ from backend.db import get_connection
 from backend.kite_client import require_trading_account
 from backend.models import STRATEGY_PARAMS_MODELS, BacktestRequest, StrategyConfigUpdateRequest
 from backend.strategies import STRATEGIES
+from backend.ticker import ticker_manager
 from backend.watchlist import list_watchlist
 
 router = APIRouter()
@@ -52,7 +53,11 @@ def scan_now(kite: KiteConnect = Depends(require_trading_account)):
     # job runs — now covers every strategy_configs row with enabled=True in
     # one call, matching the nightly job's own loop (Phase 7 Part A.3).
     account = get_trading_account()
-    result = strategy_engine.run_daily_scans(account, kite)
+    try:
+        result = strategy_engine.run_daily_scans(account, kite)
+    except risk_engine.RiskCheckUnavailableError as e:
+        raise HTTPException(status_code=e.status_code, detail={"error_code": e.error_code, "message": e.message})
+    ticker_manager.broadcast({"type": "tickets_changed", "reason": "scan"})
     return {"data": result}
 
 
@@ -81,6 +86,7 @@ def confirm_stop_adjustment(proposal_id: int, kite: KiteConnect = Depends(requir
     conn = get_connection()
     try:
         result = strategy_engine.resolve_stop_adjustment(conn, kite, proposal_id, confirm=True)
+        ticker_manager.broadcast({"type": "tickets_changed", "reason": "stop_adjustment"})
         return {"data": result}
     except ValueError as e:
         raise HTTPException(status_code=409, detail={"error_code": "CONFLICT_INVALID_STATE", "message": str(e)})
@@ -93,6 +99,7 @@ def reject_stop_adjustment(proposal_id: int, kite: KiteConnect = Depends(require
     conn = get_connection()
     try:
         result = strategy_engine.resolve_stop_adjustment(conn, kite, proposal_id, confirm=False)
+        ticker_manager.broadcast({"type": "tickets_changed", "reason": "stop_adjustment"})
         return {"data": result}
     except ValueError as e:
         raise HTTPException(status_code=409, detail={"error_code": "CONFLICT_INVALID_STATE", "message": str(e)})

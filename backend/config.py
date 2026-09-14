@@ -13,6 +13,13 @@ MARGIN_ALERT_THRESHOLD_INR = 10000.0
 GTT_SLIPPAGE_BUFFER_PCT = 0.5
 TRAILING_CHECK_INTERVAL_SECONDS = 45
 INSTRUMENT_CACHE_MAX_AGE_HOURS = 24
+# Regular orders are only accepted while NSE is open (9:15-15:30 IST). An
+# approval outside those hours is sent as an After-Market Order instead, so
+# it queues for the next session rather than being rejected by the broker.
+USE_AMO_WHEN_MARKET_CLOSED = True
+# How often the order monitor polls the broker's order book while any live
+# order the app placed is still waiting for a fill.
+ORDER_MONITOR_INTERVAL_SECONDS = 20
 
 # Historical OHLC backfill / indicators.
 # Kite's documented historical-data rate limit is 3 requests/second — the job
@@ -20,12 +27,18 @@ INSTRUMENT_CACHE_MAX_AGE_HOURS = 24
 # regardless of what triggered it (watchlist-add or the daily refresh), so
 # concurrent triggers can never combine to exceed the limit.
 HISTORICAL_RATE_LIMIT_DELAY_SECONDS = 0.4
-# Kite's current docs didn't expose a clear per-request day-range limit for
-# the "day" interval to us, so this is a conservative default chosen to be
-# safe under any plausible limit, not a confirmed server-side maximum.
-MAX_DAYS_PER_HISTORICAL_REQUEST = 100
-# ~300 daily candles comfortably covers a 200-day SMA with room to spare.
-BACKFILL_TARGET_DAYS = 300
+# Kite documents a 2000-day cap per request for the "day" interval; 400 keeps
+# a wide safety margin while needing only ~3 requests for a full backfill.
+MAX_DAYS_PER_HISTORICAL_REQUEST = 400
+# Calendar days of history to keep. ~1100 calendar days is ~750 trading
+# candles, so the 200-day SMA trend filter every strategy relies on is valid
+# across roughly two years of backtest range. (300 calendar days only yields
+# ~205 candles — SMA-200 then exists for just the last few sessions, so the
+# strategies can almost never fire and backtests find no trades.)
+BACKFILL_TARGET_DAYS = 1100
+# The daily refresh re-downloads this many recent days and overwrites them,
+# so a candle captured mid-session is always corrected after the close.
+REFRESH_OVERLAP_DAYS = 7
 DAILY_REFRESH_HOUR_IST = 16  # 4:00 PM IST, after NSE market close
 
 # Today's Actions (Phase 6). A watchlist symbol is "close to a breakout"
@@ -41,6 +54,19 @@ WATCH_PROXIMITY_PCT = 3.0
 # the order a realistic chance of filling on the small gap-up that commonly
 # follows a genuine breakout, without chasing far past the trigger level.
 ENTRY_PRICE_BUFFER_PCT = 0.1
+# A symbol whose newest candle is more than this many calendar days older
+# than the last completed session is skipped by the scanners — signals
+# computed from stale data would be misleading.
+MAX_DATA_STALENESS_DAYS = 5
+
+# Autopilot (backend/automation.py). Polls this often for a due run.
+AUTOMATION_POLL_SECONDS = 60
+# Pending entry signals from an older candle are cancelled when a scan of a
+# newer candle runs — their limit price and stop came from a close that is
+# no longer current.
+SIGNAL_EXPIRY_ENABLED = True
+AUTOMATION_MAX_ATTEMPTS_PER_DAY = 3
+AUTOMATION_RETRY_MINUTES = 15
 
 # Order reconciliation engine (Phase 8, Part B). Checks broker state
 # against what the app expects — order status, GTT state, position

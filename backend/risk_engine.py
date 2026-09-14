@@ -154,12 +154,14 @@ def _symbol_exposure(conn: sqlite3.Connection, account_id: int, symbol: str, ctx
     holding = ctx.holdings_by_symbol.get(symbol)
     holdings_value = holding["cost_value"] if holding else 0.0
     cutoff = _same_day_ist_cutoff_utc()
+    # closes_ticket_id IS NULL: an executed exit ticket reduces exposure, so
+    # its own notional must never be added on top of the position it closed.
     row = conn.execute(
         """
         SELECT COALESCE(SUM(entry_price * quantity), 0) AS total
         FROM trade_tickets
         WHERE account_id = ? AND symbol = ? AND status = 'executed' AND mode = 'live'
-          AND closed_at IS NULL AND executed_at >= ?
+          AND closed_at IS NULL AND closes_ticket_id IS NULL AND executed_at >= ?
         """,
         (account_id, symbol, cutoff),
     ).fetchone()
@@ -169,10 +171,16 @@ def _symbol_exposure(conn: sqlite3.Connection, account_id: int, symbol: str, ctx
 # Single source of truth for "what counts as an open position" — used by
 # both the max_open_positions check below and Phase 5's exit scanner
 # (list_open_positions), so the two can never define "open" differently.
-_OPEN_POSITION_WHERE = """
+# Only an EXECUTED exit closes a position: a pending, rejected, failed or
+# cancelled exit ticket leaves it open (it used to hide the position from
+# every scanner, the kill switch and the position-count limit forever).
+_CLOSED_BY_EXECUTED_EXIT = (
+    "SELECT closes_ticket_id FROM trade_tickets WHERE closes_ticket_id IS NOT NULL AND status = 'executed'"
+)
+_OPEN_POSITION_WHERE = f"""
     account_id = ? AND status = 'executed' AND mode = 'live' AND transaction_type = 'BUY'
       AND closed_at IS NULL
-      AND id NOT IN (SELECT closes_ticket_id FROM trade_tickets WHERE closes_ticket_id IS NOT NULL)
+      AND id NOT IN ({_CLOSED_BY_EXECUTED_EXIT})
 """
 
 
@@ -193,11 +201,14 @@ def list_open_positions(conn: sqlite3.Connection, account_id: int) -> list:
 
 
 def _open_risk_sum(conn: sqlite3.Connection, account_id: int) -> float:
+    # Exit tickets carry a risk_amount only to satisfy the schema; counting
+    # them made every executed exit add phantom risk forever.
     row = conn.execute(
-        """
+        f"""
         SELECT COALESCE(SUM(risk_amount), 0) AS total FROM trade_tickets
         WHERE account_id = ? AND status = 'executed' AND mode = 'live' AND closed_at IS NULL
-          AND id NOT IN (SELECT closes_ticket_id FROM trade_tickets WHERE closes_ticket_id IS NOT NULL)
+          AND closes_ticket_id IS NULL
+          AND id NOT IN ({_CLOSED_BY_EXECUTED_EXIT})
         """,
         (account_id,),
     ).fetchone()
@@ -294,7 +305,10 @@ def _check_valid_exit_reference(conn: sqlite3.Connection, ticket_row: sqlite3.Ro
     return CheckResult("exit_validity", "Exit Ticket Validation", valid, False, None, None, "pct", message)
 
 
-def run_checks(conn: sqlite3.Connection, account: sqlite3.Row, ticket_row: sqlite3.Row, kite: KiteConnect) -> RiskCheckReport:
+def run_checks(
+    conn: sqlite3.Connection, account: sqlite3.Row, ticket_row: sqlite3.Row, kite: KiteConnect,
+    ctx: PortfolioContext | None = None,
+) -> RiskCheckReport:
     # A SELL ticket that closes an existing position is risk-REDUCING, not
     # risk-adding — the six position-opening checks below (capital,
     # single-stock/sector exposure, R:R, open-position count, total
@@ -306,7 +320,9 @@ def run_checks(conn: sqlite3.Connection, account: sqlite3.Row, ticket_row: sqlit
         return RiskCheckReport(checks=[_check_valid_exit_reference(conn, ticket_row)])
 
     settings = get_settings(conn, account["id"])
-    ctx = build_portfolio_context(kite)
+    # A batch caller (the strategy scan) passes one context for the whole
+    # batch — holdings/margins can't change mid-scan since nothing executes.
+    ctx = ctx or build_portfolio_context(kite)
     metrics = execution.compute_risk_metrics(dict(ticket_row))
 
     # All six checks always run and are always evaluated — never
@@ -324,7 +340,8 @@ def run_checks(conn: sqlite3.Connection, account: sqlite3.Row, ticket_row: sqlit
 
 
 def run_risk_checks_and_transition(
-    conn: sqlite3.Connection, account: sqlite3.Row, ticket_id: int, kite: KiteConnect
+    conn: sqlite3.Connection, account: sqlite3.Row, ticket_id: int, kite: KiteConnect,
+    ctx: PortfolioContext | None = None,
 ) -> None:
     """Runs run_checks() against the ticket currently in the DB and
     transitions it to pending_confirmation/risk_rejected accordingly. Shared
@@ -341,7 +358,7 @@ def run_risk_checks_and_transition(
         raise ValueError(f"Ticket {ticket_id} not found for account {account['id']}")
 
     try:
-        report = run_checks(conn, account, ticket, kite)
+        report = run_checks(conn, account, ticket, kite, ctx=ctx)
     except RiskCheckUnavailableError as e:
         # The risk check itself couldn't run (Kite API failure) — this is
         # not the same as the ticket failing a check. Don't leave it

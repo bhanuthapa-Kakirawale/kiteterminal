@@ -1,10 +1,12 @@
 import json
 import logging
 import sqlite3
+from datetime import date
 
 from kiteconnect import KiteConnect
+from kiteconnect.exceptions import KiteException
 
-from backend import execution, indicators, risk_engine
+from backend import config, execution, indicators, instruments, market, risk_engine
 from backend.db import get_connection
 from backend.strategies import STRATEGIES
 from backend.watchlist import list_watchlist
@@ -155,65 +157,111 @@ def list_all_configs(conn: sqlite3.Connection, account_id: int) -> list[dict]:
 # evaluate_entry/evaluate_exit/compute_entry_levels/rank_key differ.
 # --------------------------------------------------------------------------
 
-def _has_existing_strategy_signal(conn: sqlite3.Connection, account_id: int, symbol: str, strategy_name: str) -> bool:
-    # Avoid re-proposing the same symbol every day while an earlier signal is
-    # still pending review or already turned into an open position — not
-    # explicitly required by the spec, but a direct consequence of
-    # max_signals_per_day's own intent (don't flood the queue with repeats).
+def _has_existing_strategy_signal(
+    conn: sqlite3.Connection, account_id: int, symbol: str, strategy_name: str, signal_date: str | None = None,
+) -> bool:
+    # Don't re-propose a symbol while an earlier signal is still awaiting a
+    # decision or has become an open position, and never re-propose the
+    # same candle's signal twice (after the user rejected it, or on a second
+    # scan of an unchanged candle). A risk-rejected signal only blocks for
+    # the day it was produced — it used to block that symbol/strategy
+    # forever until archived.
     row = conn.execute(
         """
         SELECT COUNT(*) AS n FROM trade_tickets
         WHERE account_id = ? AND symbol = ? AND source = 'strategy' AND strategy_name = ?
-          AND ((status IN ('pending_confirmation', 'risk_rejected', 'confirmed'))
-               OR (status = 'executed' AND closed_at IS NULL))
+          AND (status IN ('draft', 'pending_confirmation', 'confirmed')
+               OR (status = 'executed' AND closed_at IS NULL)
+               OR (status = 'risk_rejected' AND created_at >= ?)
+               OR (? IS NOT NULL AND signal_date = ?))
         """,
-        (account_id, symbol, strategy_name),
+        (account_id, symbol, strategy_name, risk_engine._same_day_ist_cutoff_utc(), signal_date, signal_date),
     ).fetchone()
     return row["n"] > 0
 
 
-def run_entry_scan(module, conn: sqlite3.Connection, account: sqlite3.Row, kite: KiteConnect, params: dict) -> list[int]:
+def _is_stale(df, last_session: date) -> bool:
+    last = date.fromisoformat(str(df["date"].iloc[-1])[:10])
+    return (last_session - last).days > config.MAX_DATA_STALENESS_DAYS
+
+
+def run_entry_scan(
+    module, conn: sqlite3.Connection, account: sqlite3.Row, kite: KiteConnect, params: dict,
+    ctx: risk_engine.PortfolioContext | None = None, diagnostics: dict | None = None,
+) -> list[int]:
     """For every watchlist symbol: module.evaluate_entry(), rank passing
     candidates via module.rank_key, cap at max_signals_per_day, construct a
     ticket for each survivor, and push it through the unmodified Phase 4
-    risk engine. Returns the created ticket ids."""
+    risk engine. Returns the created ticket ids; `diagnostics` (if given) is
+    filled with why symbols were not evaluated."""
+    diag = diagnostics if diagnostics is not None else {}
+    diag.update({"evaluated": 0, "insufficient_history": [], "stale_data": [], "already_signalled": []})
+    last_session = market.last_complete_session_date()
+    min_history = max(params.get("trend_filter_period", 2), 2)
+
     candidates = []
     for w in list_watchlist(account["id"]):
-        if _has_existing_strategy_signal(conn, account["id"], w["symbol"], module.STRATEGY_NAME):
-            continue
         df = indicators.load_ohlc_frame(w["instrument_token"])
+        if len(df) < min_history:
+            diag["insufficient_history"].append(w["symbol"])
+            continue
+        if _is_stale(df, last_session):
+            diag["stale_data"].append(w["symbol"])
+            continue
+        diag["evaluated"] += 1
         result = module.evaluate_entry(df, params)
-        if result["passed"]:
-            candidates.append({"symbol": w["symbol"], "instrument_token": w["instrument_token"], **result})
+        if not result["passed"]:
+            continue
+        signal_date = str(result["date"])[:10]
+        if _has_existing_strategy_signal(conn, account["id"], w["symbol"], module.STRATEGY_NAME, signal_date):
+            diag["already_signalled"].append(w["symbol"])
+            continue
+        candidates.append({
+            "symbol": w["symbol"], "instrument_token": w["instrument_token"], "signal_date": signal_date, **result,
+        })
 
     candidates.sort(key=module.rank_key, reverse=True)
     candidates = candidates[: params["max_signals_per_day"]]
 
     created_ids = []
     for c in candidates:
-        ticket_id = _create_entry_ticket(module, conn, account, kite, c, params)
+        ticket_id = _create_entry_ticket(module, conn, account, kite, c, params, ctx)
         if ticket_id is not None:
             created_ids.append(ticket_id)
     return created_ids
 
 
 def _create_entry_ticket(
-    module, conn: sqlite3.Connection, account: sqlite3.Row, kite: KiteConnect, candidate: dict, params: dict
+    module, conn: sqlite3.Connection, account: sqlite3.Row, kite: KiteConnect, candidate: dict, params: dict,
+    ctx: risk_engine.PortfolioContext | None = None,
 ) -> int | None:
     levels = module.compute_entry_levels(candidate, params)
     if levels is None:
         logger.info("Skipping %s (%s): could not derive valid entry levels", candidate["symbol"], module.STRATEGY_NAME)
         return None
-    entry_price, stop_loss, target_1 = levels["entry_price"], levels["stop_loss"], levels["target_1"]
+
+    # Snap every level onto the exchange tick grid here, so the ticket the
+    # user approves shows exactly the prices that will be sent to Kite.
+    tick = instruments.get_tick_size(candidate["symbol"], "NSE")
+    entry_price = market.round_to_tick(levels["entry_price"], tick)
+    stop_loss = market.round_to_tick(levels["stop_loss"], tick)
+    target_1 = market.round_to_tick(levels["target_1"], tick)
+    if not (0 < stop_loss < entry_price < target_1):
+        logger.info("Skipping %s (%s): levels collapse on the %.2f tick grid", candidate["symbol"],
+                    module.STRATEGY_NAME, tick)
+        return None
     trailing_distance = levels.get("trailing_distance")
+    if trailing_distance is not None:
+        trailing_distance = max(market.round_to_tick(trailing_distance, tick), tick)
     trailing_enabled = trailing_distance is not None
 
     settings = risk_engine.get_settings(conn, account["id"])
-    try:
-        ctx = risk_engine.build_portfolio_context(kite)
-    except risk_engine.RiskCheckUnavailableError:
-        logger.info("Skipping entry scan for %s: portfolio context unavailable", candidate["symbol"])
-        return None
+    if ctx is None:
+        try:
+            ctx = risk_engine.build_portfolio_context(kite)
+        except risk_engine.RiskCheckUnavailableError:
+            logger.info("Skipping entry scan for %s: portfolio context unavailable", candidate["symbol"])
+            return None
     sizing = risk_engine.compute_position_size(entry_price, stop_loss, ctx.portfolio_value, settings)
     quantity = sizing["suggested_qty"]
     if quantity <= 0:
@@ -235,16 +283,16 @@ def _create_entry_ticket(
             stop_loss, target_1, target_2,
             trailing_enabled, trailing_trigger, trailing_distance,
             product_type, use_gtt, risk_amount, risk_reward_ratio,
-            rationale, status, rule_checklist
+            rationale, status, rule_checklist, signal_date
         ) VALUES (?, 'strategy', ?, ?, ?, 'NSE', ?, 'BUY', ?, ?, 'LIMIT', ?, ?, NULL,
-                  ?, ?, ?, 'CNC', 1, ?, ?, ?, 'draft', ?)
+                  ?, ?, ?, 'CNC', 1, ?, ?, ?, 'draft', ?, ?)
         """,
         (
             account["id"], module.STRATEGY_NAME, strategy_version, candidate["symbol"], candidate["instrument_token"],
             quantity, entry_price, stop_loss, target_1,
             int(trailing_enabled), "after_target_1" if trailing_enabled else None, trailing_distance,
             metrics["risk_amount"], metrics["risk_reward_ratio"], rationale,
-            json.dumps(candidate["checklist"]),
+            json.dumps(candidate["checklist"]), candidate.get("signal_date"),
         ),
     )
     ticket_id = cursor.lastrowid
@@ -254,7 +302,7 @@ def _create_entry_ticket(
     )
     conn.commit()
 
-    risk_engine.run_risk_checks_and_transition(conn, account, ticket_id, kite)
+    risk_engine.run_risk_checks_and_transition(conn, account, ticket_id, kite, ctx=ctx)
     return ticket_id
 
 
@@ -274,6 +322,8 @@ def run_exit_scan(module, conn: sqlite3.Connection, account: sqlite3.Row, kite: 
     for pos in risk_engine.list_open_positions(conn, account["id"]):
         if pos["strategy_name"] != module.STRATEGY_NAME:
             continue  # only this module manages exits for positions it opened
+        if pos["entry_fill_status"] == "pending":
+            continue  # entry hasn't filled — nothing to exit yet
         if _has_pending_exit(conn, pos["id"]):
             continue
         df = indicators.load_ohlc_frame(pos["instrument_token"])
@@ -296,7 +346,8 @@ def _create_exit_ticket(
     # order — entry_price is today's close (a reference/expected fill
     # price), stop_loss/target_1 are carried over informationally from the
     # position being closed, purely to satisfy the schema.
-    entry_price = round(result["close"], 2)
+    tick = instruments.get_tick_size(position["symbol"], position["exchange"])
+    entry_price = market.round_to_tick(result["close"], tick)
     metrics = execution.compute_risk_metrics({
         "entry_price": entry_price, "quantity": position["quantity"],
         "stop_loss": position["stop_loss"], "target_1": position["target_1"], "target_2": None,
@@ -335,6 +386,33 @@ def _create_exit_ticket(
     return ticket_id
 
 
+def expire_stale_signals(conn: sqlite3.Connection, account_id: int, current_signal_date: str) -> list[int]:
+    """Cancels strategy ENTRY signals still awaiting approval that were
+    computed from an older candle than the one about to be scanned — their
+    limit price and stop come from a close that is no longer current.
+    Signals from the same candle are left alone. Exit signals never expire
+    (they protect capital; the exit scanner won't duplicate them)."""
+    rows = conn.execute(
+        """
+        SELECT id, signal_date, created_at FROM trade_tickets
+        WHERE account_id = ? AND source = 'strategy' AND closes_ticket_id IS NULL
+          AND status IN ('draft', 'pending_confirmation')
+          AND COALESCE(signal_date, substr(created_at, 1, 10)) < ?
+        """,
+        (account_id, current_signal_date),
+    ).fetchall()
+    for r in rows:
+        from_date = r["signal_date"] or r["created_at"][:10]
+        conn.execute("UPDATE trade_tickets SET status = 'cancelled' WHERE id = ?", (r["id"],))
+        conn.execute(
+            "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'rejected', ?)",
+            (r["id"], f"Expired automatically: entry signal from the {from_date} candle was not approved before "
+                      f"the {current_signal_date} scan — its price levels are stale."),
+        )
+    conn.commit()
+    return [r["id"] for r in rows]
+
+
 # --------------------------------------------------------------------------
 # Breakeven stop-tightening proposals (not a trade_ticket) — fully
 # strategy-agnostic, unchanged from Phase 5: runs once across every open
@@ -357,7 +435,7 @@ def check_breakeven_candidates(
     created_ids = []
     positions = [
         p for p in risk_engine.list_open_positions(conn, account["id"])
-        if p["trailing_enabled"] and p["strategy_name"] in params_by_strategy
+        if p["trailing_enabled"] and p["strategy_name"] in params_by_strategy and p["entry_fill_status"] != "pending"
     ]
     if not positions:
         return created_ids
@@ -374,10 +452,13 @@ def check_breakeven_candidates(
         ltp = ltp_data.get(key, {}).get("last_price")
         if ltp is None:
             continue
-        original_risk_per_share = abs(pos["entry_price"] - pos["stop_loss"])
+        # Breakeven is the ACTUAL fill when the order monitor has recorded it.
+        entry = pos["filled_price"] or pos["entry_price"]
+        breakeven = market.round_to_tick(entry, instruments.get_tick_size(pos["symbol"], pos["exchange"]), "up")
+        original_risk_per_share = abs(entry - pos["stop_loss"])
         if original_risk_per_share <= 0:
             continue
-        gain_in_r = (ltp - pos["entry_price"]) / original_risk_per_share
+        gain_in_r = (ltp - entry) / original_risk_per_share
         trigger_r = params_by_strategy[pos["strategy_name"]]["breakeven_trigger_r"]
         if gain_in_r < trigger_r:
             continue
@@ -390,7 +471,7 @@ def check_breakeven_candidates(
             continue
 
         current_stop = pos["current_stop_loss"] or pos["stop_loss"]
-        if current_stop >= pos["entry_price"]:
+        if current_stop >= breakeven:
             continue  # already at/above breakeven, nothing to propose
 
         cursor = conn.execute(
@@ -398,7 +479,7 @@ def check_breakeven_candidates(
             INSERT INTO stop_adjustment_proposals (ticket_id, current_stop, proposed_stop, reason)
             VALUES (?, ?, ?, ?)
             """,
-            (pos["id"], current_stop, pos["entry_price"],
+            (pos["id"], current_stop, breakeven,
              f"Position up {gain_in_r:.2f}R (trigger {trigger_r}R), tightening stop to breakeven"),
         )
         created_ids.append(cursor.lastrowid)
@@ -411,9 +492,11 @@ def resolve_stop_adjustment(
 ) -> dict:
     """Confirm or reject a pending breakeven proposal. Confirm calls
     kite.modify_gtt with the SAME single-trigger/single-leg shape
-    trailing_engine._try_ratchet already uses (respecting dry_run/live mode
-    exactly like every other order action), then logs a
-    stop_adjusted_breakeven ticket_event on the original ticket."""
+    trailing_engine._try_ratchet uses (respecting dry_run/live mode exactly
+    like every other order action), then logs a stop_adjusted_breakeven
+    ticket_event on the original ticket. Any condition that would make the
+    broker reject the modification is raised as ValueError (-> HTTP 409 with
+    a readable message) instead of an unhandled 500."""
     proposal = conn.execute(
         "SELECT * FROM stop_adjustment_proposals WHERE id = ?", (proposal_id,)
     ).fetchone()
@@ -431,33 +514,52 @@ def resolve_stop_adjustment(
         return {"id": proposal_id, "status": "rejected"}
 
     ticket = conn.execute("SELECT * FROM trade_tickets WHERE id = ?", (proposal["ticket_id"],)).fetchone()
+    if ticket is None or ticket["status"] != "executed" or ticket["closed_at"] is not None:
+        raise ValueError("The position this proposal belongs to is no longer open — reject the proposal.")
     mode = execution.get_execution_mode()
+    tick = instruments.get_tick_size(ticket["symbol"], ticket["exchange"])
+    new_stop = market.round_to_tick(proposal["proposed_stop"], tick)
 
     if mode == "live":
+        if ticket["kite_gtt_id"] is None:
+            raise ValueError(f"{ticket['symbol']} has no active protective GTT to move — place the stop in Kite.")
+        key = f"{ticket['exchange']}:{ticket['symbol']}"
+        try:
+            ltp = kite.ltp(key)[key]["last_price"]
+        except Exception as e:
+            raise ValueError(f"Could not fetch the current price for {ticket['symbol']}: {e}")
         exit_side = execution.resolve_exit_side(ticket["transaction_type"])
-        kite.modify_gtt(
-            trigger_id=ticket["kite_gtt_id"],
-            trigger_type=kite.GTT_TYPE_SINGLE,
-            tradingsymbol=ticket["symbol"],
-            exchange=ticket["exchange"],
-            trigger_values=[proposal["proposed_stop"]],
-            last_price=proposal["proposed_stop"],
-            orders=[{
-                "transaction_type": exit_side,
-                "quantity": ticket["quantity"],
-                "order_type": "LIMIT",
-                "product": ticket["product_type"],
-                "price": execution.buffered_stop_price(proposal["proposed_stop"], ticket["transaction_type"]),
-            }],
-        )
+        if (exit_side == "SELL" and ltp <= new_stop) or (exit_side == "BUY" and ltp >= new_stop):
+            raise ValueError(
+                f"{ticket['symbol']} is at ₹{ltp:,.2f}, already through the proposed stop ₹{new_stop:,.2f} — "
+                f"exit the position instead of moving the stop."
+            )
+        try:
+            kite.modify_gtt(
+                trigger_id=ticket["kite_gtt_id"],
+                trigger_type=kite.GTT_TYPE_SINGLE,
+                tradingsymbol=ticket["symbol"],
+                exchange=ticket["exchange"],
+                trigger_values=[new_stop],
+                last_price=ltp,
+                orders=[{
+                    "transaction_type": exit_side,
+                    "quantity": ticket["quantity"],
+                    "order_type": "LIMIT",
+                    "product": ticket["product_type"],
+                    "price": execution.buffered_stop_price(new_stop, ticket["transaction_type"], tick),
+                }],
+            )
+        except KiteException as e:
+            raise ValueError(f"Kite rejected the stop update: {e}")
 
     conn.execute(
         "UPDATE trade_tickets SET current_stop_loss = ? WHERE id = ?",
-        (proposal["proposed_stop"], ticket["id"]),
+        (new_stop, ticket["id"]),
     )
     conn.execute(
         "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'stop_adjusted_breakeven', ?)",
-        (ticket["id"], f"Stop moved to breakeven {proposal['proposed_stop']} ({mode} mode): {proposal['reason']}"),
+        (ticket["id"], f"Stop moved to breakeven {new_stop} ({mode} mode): {proposal['reason']}"),
     )
     conn.execute(
         "UPDATE stop_adjustment_proposals SET status = 'confirmed', resolved_at = datetime('now') WHERE id = ?",
@@ -468,9 +570,8 @@ def resolve_stop_adjustment(
 
 
 # --------------------------------------------------------------------------
-# Daily orchestration (called from data_jobs.run_daily_refresh_loop) — now
-# loops every strategy_configs row with enabled=1 for this account, rather
-# than calling momentum_breakout-specific functions directly.
+# Daily orchestration (called by backend/automation.py's pipeline and the
+# Scan Now button) — loops every strategy_configs row with enabled=1.
 # --------------------------------------------------------------------------
 
 def run_daily_scans(account: sqlite3.Row, kite: KiteConnect) -> dict:
@@ -479,22 +580,32 @@ def run_daily_scans(account: sqlite3.Row, kite: KiteConnect) -> dict:
         rows = conn.execute(
             "SELECT * FROM strategy_configs WHERE account_id = ? AND enabled = 1", (account["id"],)
         ).fetchall()
-
-        per_strategy = {}
-        params_by_strategy = {}
+        enabled = []
         for row in rows:
             module = STRATEGIES.get(row["strategy_name"])
             if module is None:
                 logger.warning("strategy_configs row references unknown strategy_name %r; skipping", row["strategy_name"])
                 continue
-            params = json.loads(row["params"])
-            params_by_strategy[row["strategy_name"]] = params
-            entry_ids = run_entry_scan(module, conn, account, kite, params)
-            exit_ids = run_exit_scan(module, conn, account, kite, params)
-            per_strategy[row["strategy_name"]] = {"entry_tickets": entry_ids, "exit_tickets": exit_ids}
-
-        if not per_strategy:
+            enabled.append((module, json.loads(row["params"])))
+        if not enabled:
             return {"enabled": False}
+
+        # One portfolio snapshot for the whole scan — nothing executes
+        # mid-scan, so holdings/margins can't change, and fetching them per
+        # candidate (twice) risked hitting Kite's rate limit.
+        # RiskCheckUnavailableError propagates: nothing can be sized without it.
+        ctx = risk_engine.build_portfolio_context(kite)
+
+        per_strategy = {}
+        params_by_strategy = {}
+        for module, params in enabled:
+            params_by_strategy[module.STRATEGY_NAME] = params
+            diagnostics: dict = {}
+            entry_ids = run_entry_scan(module, conn, account, kite, params, ctx=ctx, diagnostics=diagnostics)
+            exit_ids = run_exit_scan(module, conn, account, kite, params)
+            per_strategy[module.STRATEGY_NAME] = {
+                "entry_tickets": entry_ids, "exit_tickets": exit_ids, "diagnostics": diagnostics,
+            }
 
         # Breakeven check runs once across every enabled strategy's open
         # positions together (it's a position-level, not signal-level,
