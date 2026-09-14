@@ -36,6 +36,21 @@ class TicketCreateRequest(BaseModel):
     rationale: str = Field(min_length=1)
 
 
+class AlertActionSellRequest(BaseModel):
+    # Quick Action popup's sell action (Dashboard per-stock alert -> Sell to
+    # cut loss / reduce exposure). No stop_loss/target_1/product_type/source
+    # fields on purpose: those are derived server-side from the broker's own
+    # holdings data, never trusted from the client (routes/tickets.py's
+    # alert-action sell endpoint). transaction_type is implicitly SELL.
+    symbol: str
+    exchange: str = "NSE"
+    quantity: int = Field(gt=0)
+    entry_order_type: Literal["MARKET", "LIMIT"]
+    entry_price: float = Field(gt=0)
+    rationale: str = Field(min_length=1)
+    alert_type: Literal["breach_loss", "breach_concentration"]
+
+
 class TicketRejectRequest(BaseModel):
     reason: str | None = None
 

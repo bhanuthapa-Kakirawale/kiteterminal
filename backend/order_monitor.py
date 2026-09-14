@@ -20,7 +20,7 @@ import asyncio
 import logging
 import sqlite3
 
-from backend import config, journal, kite_client, reconciliation, risk_engine
+from backend import config, execution, journal, kite_client, reconciliation, risk_engine
 from backend.accounts import get_default_account
 from backend.db import get_connection
 from backend.ticker import ticker_manager
@@ -94,10 +94,10 @@ def check_pending_orders(kite=None) -> dict:
                 continue
             if order.get("status") not in TERMINAL_STATUSES:
                 continue
-            if ticket["closes_ticket_id"] is None:
-                updates.append(_resolve_entry(conn, kite, ticket, order))
-            else:
+            if execution.is_closing_sell(ticket):
                 updates.append(_resolve_exit(conn, kite, ticket, order))
+            else:
+                updates.append(_resolve_entry(conn, kite, ticket, order))
             conn.commit()
     finally:
         conn.close()
@@ -241,7 +241,12 @@ def _resolve_exit(conn: sqlite3.Connection, kite, ticket: sqlite3.Row, order: di
                   else "it is UNPROTECTED — place a stop-loss or re-issue the exit")
     msg = f"{ticket['symbol']}: exit order {status.lower()} — {reason}. The position is still OPEN; {protection}."
     _log_event(conn, ticket["id"], "execution_failed", msg)
-    _log_event(conn, original_id, "modified", msg)
+    # original_id is None for an alert_action sell with no originating
+    # ticket (see execution.is_closing_sell) — there is no tracked position
+    # ticket to log an event against or reopen; ticket_events.ticket_id is
+    # NOT NULL, so skip that call rather than crash the whole monitor cycle.
+    if original_id is not None:
+        _log_event(conn, original_id, "modified", msg)
     reconciliation.log_mismatch(conn, original_id, "position_state", expected="position closed",
                                 actual=f"exit order {status}", detail=msg)
     return {**base, "severity": "urgent", "message": msg}

@@ -130,8 +130,13 @@ draft/pending ──risk checks──► pending_confirmation ──human confir
 
 - **Creation**: manual tickets are created via `POST /api/tickets`; strategy
   tickets are created by `strategy_engine.run_entry_scan` /
-  `run_exit_scan`. Both paths converge on the same risk-check and
-  ticket-construction logic.
+  `run_exit_scan`; the Dashboard's **Quick Action popup** (clicking a
+  per-stock alert chip — "down X% from avg cost" or "concentration exceeds
+  limit") creates a `source='alert_action'` ticket via
+  `POST /api/tickets/alert-action/sell` or `.../buy`. All paths converge on
+  the same risk-check and ticket-construction logic — Quick Action is a
+  faster, pre-filled front door onto the identical pipeline, not a separate
+  execution path.
 - **Risk gate**: `risk_engine.run_risk_checks_and_transition` moves the
   ticket to `pending_confirmation` (all checks pass) or `risk_rejected`
   (persisting the full check breakdown as JSON for the UI to display).
@@ -168,8 +173,13 @@ Safety is layered, not single-point:
    - maximum number of open positions
    - maximum total portfolio risk (%)
 
-   Exits run a single `exit_validity` check instead (that the ticket
-   references a valid, still-open, executed BUY).
+   Exits/reductions run a single `exit_or_reduction` check instead: either
+   the ticket references a valid, still-open, executed BUY
+   (`closes_ticket_id`), or — for the Dashboard Quick Action popup's sell
+   action (`source='alert_action'`), which reduces/exits holdings that may
+   have no originating ticket at all — the requested quantity does not
+   exceed the currently held quantity per the broker's own holdings/
+   positions data.
 3. **Protective GTT always-on** — no live entry is ever left unprotected by
    design; failure to place the protective GTT is surfaced loudly rather than
    silently retried.

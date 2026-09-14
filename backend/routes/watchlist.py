@@ -16,6 +16,11 @@ class WatchlistAddRequest(BaseModel):
     symbol: str
     exchange: str = "NSE"
     notes: str | None = Field(default=None)
+    tag: str | None = Field(default=None, max_length=50)
+
+
+class WatchlistTagRequest(BaseModel):
+    tag: str | None = Field(default=None, max_length=50)
 
 
 def _resubscribe_ticker(kite: KiteConnect, account_id: int) -> None:
@@ -26,7 +31,8 @@ def _resubscribe_ticker(kite: KiteConnect, account_id: int) -> None:
 @router.get("/api/watchlist")
 def get_watchlist(kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
-    return {"data": watchlist.list_watchlist(account["id"])}
+    rows = watchlist.list_watchlist(account["id"])
+    return {"data": watchlist.seed_live_quotes(kite, rows)}
 
 
 @router.post("/api/watchlist", status_code=201)
@@ -41,9 +47,10 @@ async def add_watchlist_symbol(req: WatchlistAddRequest, kite: KiteConnect = Dep
                        f"Check spelling or refresh the instrument list.",
         })
 
+    tag = req.tag.strip() or None if req.tag else None
     try:
         row = watchlist.add_to_watchlist(
-            account["id"], instrument["tradingsymbol"], instrument["instrument_token"], req.notes
+            account["id"], instrument["tradingsymbol"], instrument["instrument_token"], req.notes, tag
         )
     except sqlite3.IntegrityError as e:
         raise HTTPException(409, {
@@ -63,3 +70,21 @@ def remove_watchlist_symbol(watchlist_id: int, kite: KiteConnect = Depends(requi
     watchlist.remove_from_watchlist(account["id"], watchlist_id)
     _resubscribe_ticker(kite, account["id"])
     return {"data": {"deleted": True}}
+
+
+@router.get("/api/watchlist/tags")
+def get_watchlist_tags(kite: KiteConnect = Depends(require_trading_account)):
+    account = get_trading_account()
+    return {"data": watchlist.distinct_tags(account["id"])}
+
+
+@router.put("/api/watchlist/{watchlist_id}/tag")
+def update_watchlist_tag(
+    watchlist_id: int, req: WatchlistTagRequest, kite: KiteConnect = Depends(require_trading_account)
+):
+    account = get_trading_account()
+    tag = req.tag.strip() or None if req.tag else None
+    row = watchlist.set_tag(account["id"], watchlist_id, tag)
+    if row is None:
+        raise HTTPException(404, {"error_code": "NOT_FOUND", "message": "Watchlist entry not found"})
+    return {"data": row}

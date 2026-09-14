@@ -6,6 +6,7 @@ import asyncio
 import json
 from datetime import date, timedelta
 
+import pytest
 from kiteconnect.exceptions import InputException, OrderException
 
 from conftest import account_id, add_watch, last_weekday, make_candles, seed_ohlc, set_mode, ticket_row
@@ -312,6 +313,25 @@ def test_dashboard_panels_and_ui_prefs(env):
     assert c.get("/api/ui-prefs").json()["data"]["sidebar_collapsed"] is True
 
 
+def test_dashboard_panels_screen_scoping(env):
+    # The Watchlist screen's configurable panel grid reuses this same table
+    # and endpoint via the `screen` param — saving one screen's layout must
+    # never touch the other's rows (they used to share one unscoped table).
+    c = env.client
+    dash_panels = c.get("/api/dashboard-panels").json()["data"]
+    wl_panels = c.get("/api/dashboard-panels", params={"screen": "watchlist"}).json()["data"]
+    assert {p["panel_type"] for p in wl_panels} == {"watchlist_all", "watchlist_near_breakout"}
+    assert not ({p["panel_type"] for p in dash_panels} & {p["panel_type"] for p in wl_panels})
+
+    wl_panels[0]["size"] = "small"
+    c.put("/api/dashboard-panels", json={"panels": wl_panels}, params={"screen": "watchlist"})
+
+    dash_panels_after = c.get("/api/dashboard-panels").json()["data"]
+    assert {p["panel_type"] for p in dash_panels_after} == {p["panel_type"] for p in dash_panels}
+    wl_panels_after = c.get("/api/dashboard-panels", params={"screen": "watchlist"}).json()["data"]
+    assert next(p for p in wl_panels_after if p["panel_type"] == "watchlist_all")["size"] == "small"
+
+
 # ---------------------------------------------------------------- watchlist
 
 def test_watchlist_add_remove(env):
@@ -324,6 +344,41 @@ def test_watchlist_add_remove(env):
     assert items[0]["symbol"] == "INFY"
     c.delete(f"/api/watchlist/{items[0]['id']}")
     assert c.get("/api/watchlist").json()["data"] == []
+
+
+def test_watchlist_seeds_live_price_without_a_websocket_tick(env):
+    # Regression test: before this fix, last_price/day_change_percentage on
+    # a freshly loaded watchlist row came ONLY from a live WS tick, so every
+    # row showed blank until an unrelated add/remove forced a resubscribe.
+    c = env.client
+    seed_ohlc(env.db, 738561, "RELIANCE", [
+        {"date": last_weekday(date.today()), "open": 1290.0, "high": 1310.0, "low": 1285.0,
+         "close": 1290.0, "volume": 100000},
+    ])
+    env.kite.ltp_map["NSE:RELIANCE"] = 1300.0
+    c.post("/api/watchlist", json={"symbol": "RELIANCE"})
+    row = c.get("/api/watchlist").json()["data"][0]
+    assert row["last_price"] == 1300.0
+    assert row["day_change_percentage"] == pytest.approx((1300.0 - 1290.0) / 1290.0 * 100)
+
+
+def test_watchlist_tags(env):
+    c = env.client
+    added = c.post("/api/watchlist", json={"symbol": "TCS", "tag": "Momentum candidates"}).json()["data"]
+    c.post("/api/watchlist", json={"symbol": "INFY"})  # untagged
+    assert added["tag"] == "Momentum candidates"
+
+    tags = c.get("/api/watchlist/tags").json()["data"]
+    assert tags == ["Momentum candidates"]
+
+    updated = c.put(f"/api/watchlist/{added['id']}/tag", json={"tag": "Earnings this week"}).json()["data"]
+    assert updated["tag"] == "Earnings this week"
+
+    cleared = c.put(f"/api/watchlist/{added['id']}/tag", json={"tag": ""}).json()["data"]
+    assert cleared["tag"] is None
+
+    missing = c.put("/api/watchlist/999999/tag", json={"tag": "X"})
+    assert missing.status_code == 404
 
 
 # ---------------------------------------------------------------- strategies / backtest

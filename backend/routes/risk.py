@@ -84,3 +84,25 @@ def position_size(
         return {"data": risk_engine.compute_position_size(entry_price, stop_loss, ctx.portfolio_value, settings)}
     finally:
         conn.close()
+
+
+@router.get("/api/risk/position-reduction")
+def position_reduction(
+    symbol: str = Query(min_length=1),
+    kite: KiteConnect = Depends(require_trading_account),
+):
+    # Quick Action popup's concentration-alert default sell quantity: how
+    # many shares to sell to bring `symbol` back to exactly
+    # max_single_stock_exposure_pct — see
+    # risk_engine.compute_suggested_exit_quantity for the basis/formula.
+    account = get_trading_account()
+    conn = get_connection()
+    try:
+        settings = risk_engine.get_settings(conn, account["id"])
+        try:
+            ctx = risk_engine.build_portfolio_context(kite)
+        except risk_engine.RiskCheckUnavailableError as e:
+            raise HTTPException(status_code=e.status_code, detail={"error_code": e.error_code, "message": e.message})
+        return {"data": risk_engine.compute_suggested_exit_quantity(conn, account["id"], symbol.strip().upper(), ctx, settings)}
+    finally:
+        conn.close()

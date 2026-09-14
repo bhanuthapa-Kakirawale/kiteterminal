@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS idx_mf_holdings_snapshot_batch ON mf_holdings_snapsho
 CREATE TABLE IF NOT EXISTS trade_tickets (
     id                     INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id             INTEGER NOT NULL REFERENCES accounts(id),
-    source                 TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'strategy')),
+    source                 TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'strategy', 'alert_action')),
     strategy_name          TEXT,
     symbol                 TEXT NOT NULL,
     exchange               TEXT NOT NULL DEFAULT 'NSE',
@@ -978,9 +978,151 @@ def _ensure_execution_tracking_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE trade_tickets ADD COLUMN {column} {sql_type}")
 
 
+def _ensure_alert_action_source(conn: sqlite3.Connection) -> None:
+    # Same rebuild rationale as _ensure_risk_rejected_status: SQLite can't
+    # ALTER a CHECK constraint, so widening trade_tickets.source to allow
+    # 'alert_action' (the Dashboard alert Quick Action popup's sell/buy
+    # tickets) needs the standard rebuild — replacement table with the new
+    # CHECK list, copy all data via an explicit column list covering every
+    # column that exists on this table today (including the ones added by
+    # later migrations than the one that first wrote this rebuild pattern),
+    # drop the old table, rename the replacement into place.
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='trade_tickets'"
+    ).fetchone()
+    if row is None or "'alert_action'" in row["sql"]:
+        return  # fresh install (SCHEMA already has it) or already migrated
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        """
+        CREATE TABLE trade_tickets_new (
+            id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id             INTEGER NOT NULL REFERENCES accounts(id),
+            source                 TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'strategy', 'alert_action')),
+            strategy_name          TEXT,
+            symbol                 TEXT NOT NULL,
+            exchange               TEXT NOT NULL DEFAULT 'NSE',
+            instrument_token       INTEGER NOT NULL,
+            transaction_type       TEXT NOT NULL CHECK (transaction_type IN ('BUY', 'SELL')),
+            quantity               INTEGER NOT NULL CHECK (quantity > 0),
+            entry_price            REAL NOT NULL CHECK (entry_price > 0),
+            entry_order_type       TEXT NOT NULL CHECK (entry_order_type IN ('MARKET', 'LIMIT')),
+            stop_loss              REAL NOT NULL CHECK (stop_loss > 0),
+            target_1               REAL NOT NULL CHECK (target_1 > 0),
+            target_2               REAL,
+            trailing_enabled       INTEGER NOT NULL DEFAULT 0,
+            trailing_trigger       TEXT CHECK (trailing_trigger IN ('after_target_1', 'manual') OR trailing_trigger IS NULL),
+            trailing_distance      REAL CHECK (trailing_distance IS NULL OR trailing_distance > 0),
+            current_stop_loss      REAL,
+            trailing_active        INTEGER NOT NULL DEFAULT 0,
+            product_type           TEXT NOT NULL CHECK (product_type IN ('CNC', 'MIS', 'NRML')),
+            use_gtt                INTEGER NOT NULL DEFAULT 1,
+            risk_amount            REAL,
+            risk_reward_ratio      REAL,
+            rationale              TEXT NOT NULL,
+            status                 TEXT NOT NULL DEFAULT 'draft'
+                                   CHECK (status IN ('draft', 'pending_confirmation', 'confirmed', 'executed', 'rejected', 'cancelled', 'failed', 'risk_rejected')),
+            mode                   TEXT CHECK (mode IN ('dry_run', 'live') OR mode IS NULL),
+            kite_order_id          TEXT,
+            kite_gtt_id            INTEGER,
+            created_at             TEXT NOT NULL DEFAULT (datetime('now')),
+            executed_at            TEXT,
+            closed_at              TEXT,
+            last_trailing_check_at TEXT,
+            closes_ticket_id       INTEGER REFERENCES trade_tickets(id),
+            risk_check_results     TEXT,
+            archived               INTEGER NOT NULL DEFAULT 0,
+            rule_checklist         TEXT,
+            strategy_version       INTEGER,
+            order_variety          TEXT,
+            entry_fill_status      TEXT,
+            filled_price           REAL,
+            filled_at              TEXT,
+            signal_date            TEXT
+        )
+        """
+    )
+    columns = (
+        "id, account_id, source, strategy_name, symbol, exchange, instrument_token, "
+        "transaction_type, quantity, entry_price, entry_order_type, stop_loss, target_1, target_2, "
+        "trailing_enabled, trailing_trigger, trailing_distance, current_stop_loss, trailing_active, "
+        "product_type, use_gtt, risk_amount, risk_reward_ratio, rationale, status, mode, "
+        "kite_order_id, kite_gtt_id, created_at, executed_at, closed_at, last_trailing_check_at, "
+        "closes_ticket_id, risk_check_results, archived, rule_checklist, strategy_version, "
+        "order_variety, entry_fill_status, filled_price, filled_at, signal_date"
+    )
+    conn.execute(f"INSERT INTO trade_tickets_new ({columns}) SELECT {columns} FROM trade_tickets")
+    conn.execute("DROP TABLE trade_tickets")
+    conn.execute("ALTER TABLE trade_tickets_new RENAME TO trade_tickets")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_tickets_account ON trade_tickets(account_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_tickets_status ON trade_tickets(status)")
+
+    violations = conn.execute("PRAGMA foreign_key_check(trade_tickets)").fetchall()
+    if violations:
+        raise RuntimeError(f"trade_tickets rebuild left foreign key violations: {[dict(v) for v in violations]}")
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
 def _ensure_instrument_tick_size_column(conn: sqlite3.Connection) -> None:
     if not _column_exists(conn, "instrument_cache", "tick_size"):
         conn.execute("ALTER TABLE instrument_cache ADD COLUMN tick_size REAL")
+
+
+def _ensure_watchlist_tag_column(conn: sqlite3.Connection) -> None:
+    # Short free-text categorical label, separate from `notes` (free-form
+    # commentary) — used only for the Watchlist's optional "group by tag"
+    # view. Nullable, no CHECK constraint (deliberately no fixed taxonomy),
+    # so a plain ALTER TABLE suffices.
+    if not _column_exists(conn, "watchlist", "tag"):
+        conn.execute("ALTER TABLE watchlist ADD COLUMN tag TEXT")
+
+
+def _ensure_dashboard_panels_screen_column(conn: sqlite3.Connection) -> None:
+    # dashboard_panels already holds every field a configurable panel grid
+    # needs (type/order/size/visible); the Watchlist screen's own panel grid
+    # reuses that exact same table/mechanism rather than a parallel one —
+    # this column is the only change needed to serve two screens with it.
+    # Backfilled to 'dashboard' so every pre-existing row keeps behaving
+    # exactly as it did before this column existed.
+    if not _column_exists(conn, "dashboard_panels", "screen"):
+        conn.execute("ALTER TABLE dashboard_panels ADD COLUMN screen TEXT NOT NULL DEFAULT 'dashboard'")
+        # The old UNIQUE(account_id, panel_type) index would otherwise block
+        # the dashboard's own 'watchlist_summary' panel_type from ever
+        # coexisting with a same-named Watchlist-screen panel_type; scope
+        # uniqueness to (account_id, screen, panel_type) instead.
+        conn.execute("DROP INDEX IF EXISTS idx_dashboard_panels_account_type")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_panels_account_screen_type "
+            "ON dashboard_panels(account_id, screen, panel_type)"
+        )
+
+
+_DEFAULT_WATCHLIST_PANELS = [
+    # (panel_type, display_order, size) — screen='watchlist'. Visible by
+    # default (unlike the Dashboard's opt-in extras): this IS the content of
+    # the Watchlist screen, not an optional add-on to it.
+    ("watchlist_all", 0, "large"),
+    ("watchlist_near_breakout", 1, "medium"),
+]
+
+
+def _ensure_watchlist_panels(conn: sqlite3.Connection) -> None:
+    accounts = conn.execute("SELECT id FROM accounts").fetchall()
+    for account in accounts:
+        existing = conn.execute(
+            "SELECT COUNT(*) AS n FROM dashboard_panels WHERE account_id = ? AND screen = 'watchlist'",
+            (account["id"],),
+        ).fetchone()["n"]
+        if existing > 0:
+            continue
+        conn.executemany(
+            """
+            INSERT INTO dashboard_panels (account_id, screen, panel_type, display_order, size, visible)
+            VALUES (?, 'watchlist', ?, ?, ?, 1)
+            """,
+            [(account["id"], panel_type, order, size) for panel_type, order, size in _DEFAULT_WATCHLIST_PANELS],
+        )
 
 
 def init_db() -> None:
@@ -1002,7 +1144,10 @@ def init_db() -> None:
         _ensure_strategy_configs_versioning_columns(conn)
         _ensure_backtest_runs_rigor_columns(conn)
         _ensure_execution_tracking_columns(conn)
+        _ensure_alert_action_source(conn)
         _ensure_instrument_tick_size_column(conn)
+        _ensure_watchlist_tag_column(conn)
+        _ensure_dashboard_panels_screen_column(conn)
         conn.executescript(_ACCOUNT_ID_INDEXES)
         _seed_default_account(conn)
         _ensure_trading_account_type(conn)
@@ -1010,6 +1155,7 @@ def init_db() -> None:
         _seed_risk_settings(conn)
         _seed_dashboard_panels(conn)
         _ensure_watchlist_summary_panel(conn)
+        _ensure_watchlist_panels(conn)
         _seed_strategy_configs(conn)
         _ensure_todays_actions_panel(conn)
         _seed_strategy_config_versions(conn)

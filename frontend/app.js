@@ -61,6 +61,9 @@ const API = {
   },
   getTicket: (id) => fetchJson(`/api/tickets/${id}`),
   createTicket: (body) => fetchJsonMutate("/api/tickets", "POST", body),
+  createAlertActionSell: (body) => fetchJsonMutate("/api/tickets/alert-action/sell", "POST", body),
+  createAlertActionBuy: (body) => fetchJsonMutate("/api/tickets/alert-action/buy", "POST", body),
+  getPositionReduction: (symbol) => fetchJson(`/api/risk/position-reduction?symbol=${encodeURIComponent(symbol)}`),
   editTicket: (id, body) => fetchJsonMutate(`/api/tickets/${id}`, "PUT", body),
   deleteTicket: (id) => fetchJsonMutate(`/api/tickets/${id}`, "DELETE"),
   confirmTicket: (id) => fetchJsonMutate(`/api/tickets/${id}/confirm`, "POST"),
@@ -90,12 +93,14 @@ const API = {
   getUiPrefs: () => fetchJson("/api/ui-prefs"),
   saveUiPrefs: (body) => fetchJsonMutate("/api/ui-prefs", "POST", body),
 
-  getDashboardPanels: () => fetchJson("/api/dashboard-panels"),
-  saveDashboardPanels: (panels) => fetchJsonMutate("/api/dashboard-panels", "PUT", { panels }),
+  getDashboardPanels: (screen = "dashboard") => fetchJson(`/api/dashboard-panels?screen=${encodeURIComponent(screen)}`),
+  saveDashboardPanels: (panels, screen = "dashboard") =>
+    fetchJsonMutate(`/api/dashboard-panels?screen=${encodeURIComponent(screen)}`, "PUT", { panels }),
 
   getWatchlist: () => fetchJson("/api/watchlist"),
   addWatchlistSymbol: (body) => fetchJsonMutate("/api/watchlist", "POST", body),
   removeWatchlistSymbol: (id) => fetchJsonMutate(`/api/watchlist/${id}`, "DELETE"),
+  updateWatchlistTag: (id, tag) => fetchJsonMutate(`/api/watchlist/${id}/tag`, "PUT", { tag }),
 
   listStrategies: () => fetchJson("/api/strategies"),
   getStrategyConfig: (strategyName) => fetchJson(`/api/strategies/${encodeURIComponent(strategyName)}`),
@@ -242,9 +247,21 @@ const el = {
   // Phase 4.5: watchlist
   watchlistAddForm: document.getElementById("watchlist-add-form"),
   watchlistSymbolInput: document.getElementById("wl-symbol"),
+  watchlistTagInput: document.getElementById("wl-tag"),
   watchlistAddError: document.getElementById("watchlist-add-error"),
   watchlistBody: document.querySelector("#watchlist-table tbody"),
   watchlistSummaryBody: document.querySelector("#watchlist-summary-table tbody"),
+  watchlistNearBreakoutBody: document.querySelector("#watchlist-near-breakout-table tbody"),
+  watchlistCount: document.getElementById("watchlist-count"),
+  watchlistGroupToggle: document.getElementById("watchlist-group-toggle"),
+  tagOptions: document.getElementById("tag-options"),
+
+  // Phase 9: configurable Watchlist panels (same mechanism as Dashboard panels)
+  watchlistPanelsGrid: document.getElementById("watchlist-panels-grid"),
+  watchlistEmptyNote: document.getElementById("watchlist-empty-note"),
+  watchlistCustomizeModeToggle: document.getElementById("watchlist-customize-mode-toggle"),
+  watchlistAddPanelControl: document.getElementById("watchlist-add-panel-control"),
+  watchlistAddPanelSelect: document.getElementById("watchlist-add-panel-select"),
 
   strategySelect: document.getElementById("strategy-select"),
   strategyEnabledToggle: document.getElementById("strategy-enabled-toggle"),
@@ -336,6 +353,31 @@ const el = {
   appConfirmTitle: document.getElementById("app-confirm-title"),
   appConfirmBody: document.getElementById("app-confirm-body"),
   appConfirmOk: document.getElementById("app-confirm-ok"),
+
+  // Quick Action popup (Dashboard per-stock alert -> Sell/Buy)
+  quickActionDialog: document.getElementById("quick-action-dialog"),
+  qaTitle: document.getElementById("qa-title"),
+  qaHeader: document.getElementById("qa-header"),
+  qaSellSection: document.getElementById("qa-sell-section"),
+  qaSellTitle: document.getElementById("qa-sell-title"),
+  qaSellQty: document.getElementById("qa-sell-qty"),
+  qaSellOrderType: document.getElementById("qa-sell-order-type"),
+  qaSellRationale: document.getElementById("qa-sell-rationale"),
+  qaSellPreview: document.getElementById("qa-sell-preview"),
+  qaSellSubmit: document.getElementById("qa-sell-submit"),
+  qaSellError: document.getElementById("qa-sell-error"),
+  qaBuySection: document.getElementById("qa-buy-section"),
+  qaBuyQty: document.getElementById("qa-buy-qty"),
+  qaBuyOrderType: document.getElementById("qa-buy-order-type"),
+  qaBuyEntryPrice: document.getElementById("qa-buy-entry-price"),
+  qaBuyProductType: document.getElementById("qa-buy-product-type"),
+  qaBuyStopLoss: document.getElementById("qa-buy-stop-loss"),
+  qaBuyTarget1: document.getElementById("qa-buy-target-1"),
+  qaBuyRationale: document.getElementById("qa-buy-rationale"),
+  qaBuyPreview: document.getElementById("qa-buy-preview"),
+  qaBuySubmit: document.getElementById("qa-buy-submit"),
+  qaBuyError: document.getElementById("qa-buy-error"),
+  qaCloseBtn: document.getElementById("qa-close-btn"),
   appConfirmCancel: document.getElementById("app-confirm-cancel"),
   themeToggleBtn: document.getElementById("theme-toggle-btn"),
   ticketConfirmExecNote: document.getElementById("ticket-confirm-exec-note"),
@@ -367,6 +409,8 @@ const state = {
   executionMode: "dry_run",
   trailingHeartbeat: null, // { last_run_at, active_ticket_count }
   trailingErrorAlerts: [],
+  currentAlerts: [],
+  quickActionAlert: null,
   ticketDraftDirty: false,
   lastSymbolMatches: [],
   orders: [],
@@ -387,11 +431,15 @@ const state = {
   // Phase 6: nav shell + dashboard panels
   activeSection: "dashboard",
   dashboardPanels: [],
-  customizeMode: false,
 
   // Phase 4.5: watchlist
   watchlist: [],
   lastWatchlistSymbolMatches: [],
+  watchlistGroupByTag: false,
+  watchlistCollapsedGroups: new Set(),
+
+  // Phase 9: configurable Watchlist panels
+  watchlistPanels: [],
 
   // Phase 5: momentum breakout strategy engine
   strategyConfigs: {}, // { [strategy_name]: { strategy_name, enabled, params, updated_at } }
@@ -507,6 +555,16 @@ function strategyChipHtml(name) {
   return name
     ? `<span class="chip strategy">${esc(strategyLabel(name.replace(/_exit$/, "")))}</span>`
     : `<span class="chip">Manual</span>`;
+}
+
+// Shared by ticketConfirmHtml/approvalCardHtml so a ticket's origin (how it
+// was created) always reads the same way wherever it's shown — including
+// source='alert_action' (the Dashboard Quick Action popup), which used to
+// fall through to the generic "Manual" label alongside true manual tickets.
+function originChipHtml(t) {
+  if (t.source === "strategy") return strategyChipHtml(t.strategy_name);
+  if (t.source === "alert_action") return `<span class="chip strategy">Quick Action</span>`;
+  return `<span class="chip">Manual</span>`;
 }
 
 function modeChipHtml(mode) {
@@ -642,8 +700,11 @@ function evaluateAlerts(view, totalValue, dayPnl, margins, sessionStatus) {
       alerts.push({
         id: `loss-${h.tradingsymbol}`,
         severity: "urgent",
-        message: `${h.tradingsymbol} down ${Math.abs(h.loss_pct).toFixed(1)}% from avg cost`,
+        message: `${h.tradingsymbol} down ${Math.abs(h.loss_pct).toFixed(1)}% from avg cost of ${inr(h.average_price)}`,
         scrollTargetSelector: `#holdings-row-${CSS.escape(h.tradingsymbol)}`,
+        type: "breach_loss",
+        symbol: h.tradingsymbol,
+        holding: h,
       });
     }
     if (h.breach_concentration) {
@@ -652,6 +713,9 @@ function evaluateAlerts(view, totalValue, dayPnl, margins, sessionStatus) {
         severity: "warning",
         message: `${h.tradingsymbol} is ${h.pct_of_portfolio.toFixed(1)}% of portfolio value`,
         scrollTargetSelector: `#holdings-row-${CSS.escape(h.tradingsymbol)}`,
+        type: "breach_concentration",
+        symbol: h.tradingsymbol,
+        holding: h,
       });
     }
   }
@@ -722,6 +786,7 @@ function evaluateAlerts(view, totalValue, dayPnl, margins, sessionStatus) {
 }
 
 function renderAlertBanner(alerts) {
+  state.currentAlerts = alerts;
   if (alerts.length === 0) {
     el.alertBanner.hidden = true;
     el.alertBanner.innerHTML = "";
@@ -731,7 +796,7 @@ function renderAlertBanner(alerts) {
   el.alertBanner.innerHTML = alerts
     .map(
       (a) => `
-      <div class="alert-chip ${a.severity}" data-scroll-target="${esc(a.scrollTargetSelector)}">
+      <div class="alert-chip ${a.severity}" data-alert-id="${esc(a.id)}" data-scroll-target="${esc(a.scrollTargetSelector)}">
         <span class="icon">${a.severity === "urgent" ? "⛔" : "⚠"}</span>
         <span>${esc(a.message)}</span>
       </div>`
@@ -739,6 +804,14 @@ function renderAlertBanner(alerts) {
     .join("");
   el.alertBanner.querySelectorAll(".alert-chip").forEach((chip) => {
     chip.addEventListener("click", () => {
+      const alert = state.currentAlerts.find((a) => a.id === chip.dataset.alertId);
+      // Quick Action modal only for per-stock alerts on a trading account —
+      // portfolio-level alerts (day P&L, margin, session) and any other
+      // account type keep today's scroll-only behavior.
+      if (alert?.type && state.accountType === "trading") {
+        openQuickActionModal(alert);
+        return;
+      }
       const target = document.querySelector(chip.dataset.scrollTarget);
       if (target) {
         target.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -747,6 +820,183 @@ function renderAlertBanner(alerts) {
     });
   });
 }
+
+// ---- Quick Action popup (Dashboard per-stock alert -> Sell/Buy) ----
+
+async function openQuickActionModal(alert) {
+  state.quickActionAlert = alert;
+  el.qaSellError.textContent = "";
+  el.qaBuyError.textContent = "";
+  const h = alert.holding;
+  const isLoss = alert.type === "breach_loss";
+
+  const qaRow = (label, value, cls = "") => `<div class="row"><span>${label}</span><strong class="${cls}">${value}</strong></div>`;
+  el.qaTitle.textContent = `${h.tradingsymbol} — Quick Action`;
+  el.qaHeader.innerHTML = [
+    qaRow("Quantity", fmt(h.quantity, 0)),
+    qaRow("Avg Cost", inr(h.average_price)),
+    qaRow("LTP", inr(h.last_price)),
+    qaRow("Unrealized P&L", `${inr(h.pnl)} (${h.pnl_pct >= 0 ? "+" : ""}${fmt(h.pnl_pct)}%)`, pnlClass(h.pnl)),
+  ].join("") + `<div class="rationale">${esc(alert.message)}</div>`;
+
+  // Concentration alert -> Sell only (buying more would worsen the exact
+  // problem being flagged); down-X% alert -> both Sell and Buy.
+  el.qaBuySection.hidden = !isLoss;
+  el.qaSellTitle.textContent = isLoss ? "Sell to cut loss" : "Sell to reduce exposure";
+  el.qaSellSubmit.textContent = isLoss ? "Sell to cut loss" : "Sell to reduce exposure";
+
+  el.qaSellOrderType.value = "MARKET";
+  el.qaSellRationale.value = alert.message;
+  el.qaSellQty.value = h.quantity; // down-X% default: full holding, editable
+  renderQaSellPreview();
+
+  if (!isLoss) {
+    // Concentration default: the quantity that brings this position back to
+    // exactly max_single_stock_exposure_pct (risk_engine's own basis, not
+    // the dashboard alert's own MTM-basis %) — fetched once on open, not
+    // per keystroke.
+    try {
+      const reduction = await API.getPositionReduction(h.tradingsymbol);
+      if (state.quickActionAlert === alert) { // modal wasn't closed/reopened while awaiting
+        el.qaSellQty.value = reduction.suggested_qty || h.quantity;
+        el.qaHeader.innerHTML += `<div class="row"><span>Exposure (cost basis)</span>` +
+          `<strong>${fmt(reduction.current_exposure_pct)}% → target ${fmt(reduction.target_exposure_pct)}%</strong></div>`;
+        renderQaSellPreview();
+      }
+    } catch (e) {
+      // fall back to the full holding quantity, already set above
+    }
+  }
+
+  if (isLoss) {
+    el.qaBuyOrderType.value = "MARKET";
+    el.qaBuyEntryPrice.value = h.last_price;
+    el.qaBuyProductType.value = "CNC";
+    el.qaBuyStopLoss.value = "";
+    el.qaBuyTarget1.value = "";
+    el.qaBuyQty.value = "";
+    el.qaBuyRationale.value = `Averaging down — ${alert.message}`;
+    renderQaBuyPreview();
+  }
+
+  el.quickActionDialog.showModal();
+}
+
+function renderQaSellPreview() {
+  const alert = state.quickActionAlert;
+  if (!alert) return;
+  const h = alert.holding;
+  const qty = Number(el.qaSellQty.value) || 0;
+  if (qty <= 0) {
+    el.qaSellPreview.innerHTML = "";
+    return;
+  }
+  const exitPrice = h.last_price;
+  // Same formula backend/journal.py:record_closed_trade uses for a real
+  // closed_trades row (realized_pnl = (exit_price - entry_price) *
+  // quantity) — evaluated here against an ESTIMATED exit (current LTP) for
+  // a live preview instead of a real fill, not a separate calculation.
+  const realizedPnl = (exitPrice - h.average_price) * qty;
+  const realizedPnlPct = h.average_price ? (realizedPnl / (h.average_price * qty)) * 100 : 0;
+  el.qaSellPreview.innerHTML = [
+    ["Est. exit price", `${inr(exitPrice)} (estimate — market order)`],
+    ["Realized P&L", `${inr(realizedPnl)} (${realizedPnlPct >= 0 ? "+" : ""}${fmt(realizedPnlPct)}%)`],
+  ].map(([label, value]) => `<div class="ac-metric"><label>${label}</label><strong>${value}</strong></div>`).join("");
+}
+
+function renderQaBuyPreview() {
+  const alert = state.quickActionAlert;
+  if (!alert) return;
+  const h = alert.holding;
+  const newQty = Number(el.qaBuyQty.value) || 0;
+  const price = Number(el.qaBuyEntryPrice.value) || h.last_price;
+  if (newQty <= 0) {
+    el.qaBuyPreview.innerHTML = "";
+    return;
+  }
+  const totalQty = h.quantity + newQty;
+  const newAvg = (h.quantity * h.average_price + newQty * price) / totalQty;
+  const newValue = totalQty * h.last_price;
+  const view = computeHoldingsView(state.holdings);
+  const totalPortfolioValue = view.reduce((sum, r) => sum + r.value, 0)
+    - h.quantity * h.last_price + newValue; // swap this symbol's old MTM value for the post-buy one
+  const newPct = totalPortfolioValue > 0 ? (newValue / totalPortfolioValue) * 100 : 0;
+  el.qaBuyPreview.innerHTML = [
+    ["Est. entry price", inr(price)],
+    ["New blended avg cost", inr(newAvg)],
+    ["New position value", inr(newValue)],
+    ["New % of portfolio", `${fmt(newPct)}%`],
+  ].map(([label, value]) => `<div class="ac-metric"><label>${label}</label><strong>${value}</strong></div>`).join("");
+}
+
+el.qaSellQty.addEventListener("input", renderQaSellPreview);
+el.qaBuyQty.addEventListener("input", renderQaBuyPreview);
+el.qaBuyEntryPrice.addEventListener("input", renderQaBuyPreview);
+
+el.qaSellSubmit.addEventListener("click", async () => {
+  const alert = state.quickActionAlert;
+  if (!alert) return;
+  el.qaSellError.textContent = "";
+  const qty = Number(el.qaSellQty.value);
+  if (!(qty > 0)) {
+    el.qaSellError.textContent = "Enter a quantity greater than zero.";
+    return;
+  }
+  try {
+    const ticket = await API.createAlertActionSell({
+      symbol: alert.symbol,
+      quantity: qty,
+      entry_order_type: el.qaSellOrderType.value,
+      entry_price: alert.holding.last_price,
+      rationale: el.qaSellRationale.value || alert.message,
+      alert_type: alert.type,
+    });
+    el.quickActionDialog.close();
+    openConfirmDialog(ticket);
+  } catch (e) {
+    el.qaSellError.textContent = e.message;
+  }
+});
+
+el.qaBuySubmit.addEventListener("click", async () => {
+  const alert = state.quickActionAlert;
+  if (!alert) return;
+  el.qaBuyError.textContent = "";
+  const body = {
+    symbol: alert.symbol,
+    exchange: "NSE",
+    transaction_type: "BUY",
+    quantity: Number(el.qaBuyQty.value),
+    entry_price: Number(el.qaBuyEntryPrice.value),
+    entry_order_type: el.qaBuyOrderType.value,
+    stop_loss: Number(el.qaBuyStopLoss.value),
+    target_1: Number(el.qaBuyTarget1.value),
+    target_2: null,
+    trailing_enabled: false,
+    trailing_trigger: null,
+    trailing_distance: null,
+    product_type: el.qaBuyProductType.value,
+    use_gtt: true,
+    rationale: el.qaBuyRationale.value,
+  };
+  if (!(body.quantity > 0) || !(body.entry_price > 0) || !(body.stop_loss > 0) || !(body.target_1 > 0)) {
+    el.qaBuyError.textContent = "Quantity, entry price, stop-loss and target 1 are all required.";
+    return;
+  }
+  try {
+    const ticket = await API.createAlertActionBuy(body);
+    el.quickActionDialog.close();
+    openConfirmDialog(ticket);
+  } catch (e) {
+    el.qaBuyError.textContent = e.message;
+  }
+});
+
+el.qaCloseBtn.addEventListener("click", () => {
+  // Closing without choosing an action does nothing — no ticket created, no
+  // state change. The underlying alert reappears unchanged on next refresh.
+  el.quickActionDialog.close();
+});
 
 // ---- Rendering ----
 
@@ -882,28 +1132,96 @@ function distanceLabel(distancePct) {
   return `${Math.abs(distancePct).toFixed(1)}% ${dir} 20-day high`;
 }
 
+const WATCHLIST_COLSPAN = 9;
+const UNTAGGED_LABEL = "Untagged";
+
+function watchlistRowHtml(w) {
+  const { trend, distancePct } = watchlistDerived(w);
+  return `
+    <td>${esc(w.symbol)}</td>
+    <td class="num">${w.last_price != null ? fmt(w.last_price) : "—"}</td>
+    <td class="num ${w.day_change_percentage != null ? pnlClass(w.day_change_percentage) : ""}">${w.day_change_percentage != null ? fmt(w.day_change_percentage) + "%" : "—"}</td>
+    <td>${trend ?? "—"}</td>
+    <td class="num">${w.rsi_14 != null ? w.rsi_14.toFixed(1) : "—"}</td>
+    <td>${distanceLabel(distancePct)}</td>
+    <td><input class="wl-tag-input" list="tag-options" maxlength="50" data-id="${w.id}" value="${esc(w.tag ?? "")}" placeholder="—" /></td>
+    <td>${esc(w.notes ?? "")}</td>
+    <td><button class="row-action-btn danger" data-action="remove-watchlist" data-id="${w.id}">Remove</button></td>
+  `;
+}
+
+function watchlistRowEl(w) {
+  const tr = document.createElement("tr");
+  tr.dataset.instrumentToken = w.instrument_token;
+  tr.innerHTML = watchlistRowHtml(w);
+  return tr;
+}
+
 function renderWatchlistTable() {
+  if (el.watchlistCount) el.watchlistCount.textContent = `(${state.watchlist.length})`;
   if (!el.watchlistBody) return;
   el.watchlistBody.innerHTML = "";
   if (state.watchlist.length === 0) {
-    el.watchlistBody.innerHTML = `<tr class="empty-row"><td colspan="8">Your watchlist is empty</td></tr>`;
+    el.watchlistBody.innerHTML = `<tr class="empty-row"><td colspan="${WATCHLIST_COLSPAN}">Your watchlist is empty</td></tr>`;
     return;
   }
+
+  if (!state.watchlistGroupByTag) {
+    for (const w of state.watchlist) el.watchlistBody.appendChild(watchlistRowEl(w));
+    return;
+  }
+
+  const groups = new Map(); // tag label -> rows, insertion order = display order
   for (const w of state.watchlist) {
-    const { trend, distancePct } = watchlistDerived(w);
+    const label = w.tag || UNTAGGED_LABEL;
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(w);
+  }
+  const labels = [...groups.keys()].sort((a, b) => {
+    if (a === UNTAGGED_LABEL) return 1;
+    if (b === UNTAGGED_LABEL) return -1;
+    return a.localeCompare(b);
+  });
+
+  for (const label of labels) {
+    const rows = groups.get(label);
+    const collapsed = state.watchlistCollapsedGroups.has(label);
+    const header = document.createElement("tr");
+    header.className = "wl-group-row";
+    header.dataset.group = label;
+    header.innerHTML = `<td colspan="${WATCHLIST_COLSPAN}"><button type="button" class="wl-group-toggle" data-group="${esc(label)}">
+      ${collapsed ? "▸" : "▾"} ${esc(label)} <span class="badge-muted">(${rows.length})</span></button></td>`;
+    el.watchlistBody.appendChild(header);
+    for (const w of rows) {
+      const tr = watchlistRowEl(w);
+      tr.hidden = collapsed;
+      el.watchlistBody.appendChild(tr);
+    }
+  }
+}
+
+function renderTagOptions() {
+  if (!el.tagOptions) return;
+  const tags = [...new Set(state.watchlist.map((w) => w.tag).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  el.tagOptions.innerHTML = tags.map((t) => `<option value="${esc(t)}"></option>`).join("");
+}
+
+function renderWatchlistNearBreakoutPanel(watchList = []) {
+  if (!el.watchlistNearBreakoutBody) return;
+  el.watchlistNearBreakoutBody.innerHTML = "";
+  if (watchList.length === 0) {
+    el.watchlistNearBreakoutBody.innerHTML = `<tr class="empty-row"><td colspan="4">No symbols currently near a breakout</td></tr>`;
+    return;
+  }
+  for (const w of watchList) {
     const tr = document.createElement("tr");
-    tr.dataset.instrumentToken = w.instrument_token;
     tr.innerHTML = `
-      <td>${w.symbol}</td>
-      <td class="num">${w.last_price != null ? fmt(w.last_price) : "—"}</td>
-      <td class="num ${w.day_change_percentage != null ? pnlClass(w.day_change_percentage) : ""}">${w.day_change_percentage != null ? fmt(w.day_change_percentage) + "%" : "—"}</td>
-      <td>${trend ?? "—"}</td>
-      <td class="num">${w.rsi_14 != null ? w.rsi_14.toFixed(1) : "—"}</td>
-      <td>${distanceLabel(distancePct)}</td>
-      <td>${esc(w.notes ?? "")}</td>
-      <td><button class="row-action-btn danger" data-action="remove-watchlist" data-id="${w.id}">Remove</button></td>
+      <td>${esc(w.symbol)}</td>
+      <td class="num">${fmt(w.last_close)}</td>
+      <td class="num">${fmt(w.donchian_high_20)}</td>
+      <td class="num ${pnlClass(w.distance_pct)}">${fmt(w.distance_pct)}%</td>
     `;
-    el.watchlistBody.appendChild(tr);
+    el.watchlistNearBreakoutBody.appendChild(tr);
   }
 }
 
@@ -930,15 +1248,47 @@ function renderWatchlistSummaryPanel() {
 }
 
 el.watchlistBody?.addEventListener("click", async (event) => {
-  const btn = event.target.closest('button[data-action="remove-watchlist"]');
-  if (!btn) return;
+  const removeBtn = event.target.closest('button[data-action="remove-watchlist"]');
+  if (removeBtn) {
+    try {
+      await API.removeWatchlistSymbol(removeBtn.dataset.id);
+      await loadWatchlist();
+      toast("Removed from watchlist.", { type: "success" });
+    } catch (e) {
+      toast(e.message, { type: "error" });
+    }
+    return;
+  }
+
+  const groupToggle = event.target.closest(".wl-group-toggle");
+  if (groupToggle) {
+    const label = groupToggle.dataset.group;
+    if (state.watchlistCollapsedGroups.has(label)) state.watchlistCollapsedGroups.delete(label);
+    else state.watchlistCollapsedGroups.add(label);
+    renderWatchlistTable();
+  }
+});
+
+el.watchlistBody?.addEventListener("change", async (event) => {
+  const input = event.target.closest(".wl-tag-input");
+  if (!input) return;
+  const id = input.dataset.id;
+  const tag = input.value.trim() || null;
+  const row = state.watchlist.find((w) => String(w.id) === String(id));
+  if (row && row.tag === tag) return; // no-op — avoid a pointless request/re-render on blur
   try {
-    await API.removeWatchlistSymbol(btn.dataset.id);
+    await API.updateWatchlistTag(id, tag);
     await loadWatchlist();
-    toast("Removed from watchlist.", { type: "success" });
   } catch (e) {
     toast(e.message, { type: "error" });
+    if (row) input.value = row.tag ?? ""; // revert the input to the last known-good value
   }
+});
+
+el.watchlistGroupToggle?.addEventListener("change", () => {
+  state.watchlistGroupByTag = el.watchlistGroupToggle.checked;
+  renderWatchlistTable();
+  API.saveUiPrefs({ watchlist_group_by_tag: state.watchlistGroupByTag }).catch(() => {});
 });
 
 let watchlistSymbolSearchTimer = null;
@@ -1558,6 +1908,7 @@ async function loadTodaysActions() {
     state.todaysActions = data;
     renderTodaysActionsView(data);
     renderTodaysActionsPanel(data);
+    renderWatchlistNearBreakoutPanel(data.watch_list);
   } catch (e) {
     // leave prior state visible on a transient load failure
   }
@@ -1621,6 +1972,7 @@ el.watchlistAddForm.addEventListener("submit", async (event) => {
     await API.addWatchlistSymbol({
       symbol: formData.get("symbol"),
       notes: formData.get("notes") || null,
+      tag: formData.get("tag") || null,
     });
     el.watchlistAddForm.reset();
     await loadWatchlist();
@@ -1634,6 +1986,7 @@ async function loadWatchlist() {
     state.watchlist = await API.getWatchlist();
     renderWatchlistTable();
     renderWatchlistSummaryPanel();
+    renderTagOptions();
   } catch (e) {
     // non-critical; leave prior state visible
   }
@@ -2203,7 +2556,7 @@ function ticketConfirmHtml(t) {
     ? `On — ${t.trailing_trigger === "manual" ? "started manually" : "after target 1"}, ${inr(t.trailing_distance)} behind price`
     : "Off";
   const isExit = t.closes_ticket_id != null;
-  const origin = t.source === "strategy" ? strategyChipHtml(t.strategy_name) : `<span class="chip">Manual</span>`;
+  const origin = originChipHtml(t);
   return `
     <div class="ticket-head">${sideHtml(t.transaction_type)}<span class="ac-symbol">${esc(t.symbol)}</span>${origin}${isExit ? `<span class="chip warn">closes #${t.closes_ticket_id}</span>` : ""}</div>
     ${metricsRow("Order", `${esc(t.entry_order_type)} × ${fmt(t.quantity, 0)} @ ${inr(t.entry_price)}${t.entry_order_type === "MARKET" ? " (reference)" : ""}`)}
@@ -3058,15 +3411,17 @@ el.sidebarToggleBtn.addEventListener("click", async () => {
   }
 });
 
-// ---- Phase 6: configurable Dashboard panels ----
+// ---- Phase 6/9: configurable panel grids (Dashboard, and Watchlist reusing
+// the exact same mechanism — see createPanelController) ----
 //
-// Extension point for a future panel type (e.g. watchlist_summary,
-// strategy_signals): add its static `.panel-wrapper[data-panel-type="..."]`
-// markup block inside #dashboard-panels-grid in index.html, write whatever
-// function renders its content, add a PANEL_LABELS entry (used by the "Add
-// Panel" dropdown), and insert one dashboard_panels DB row. Nothing in
-// renderDashboardGrid/drag/resize/persist below needs to change for that —
-// they all operate purely on panel_type strings and generic wrapper markup.
+// Extension point for a future panel type: add its static
+// `.panel-wrapper[data-panel-type="..."]` markup block inside the relevant
+// grid element in index.html, write whatever function renders its content,
+// add a PANEL_LABELS entry (used by that screen's "Add Panel" dropdown), and
+// insert one dashboard_panels DB row (scoped to the right `screen`). Nothing
+// in createPanelController below needs to change for that — it operates
+// purely on panel_type strings and generic wrapper markup, scoped to
+// whichever grid element it was constructed with.
 const PANEL_LABELS = {
   portfolio_summary: "Portfolio Summary",
   holdings_table: "Holdings",
@@ -3074,132 +3429,175 @@ const PANEL_LABELS = {
   mf_table: "Mutual Funds",
   watchlist_summary: "Watchlist", // first new panel_type added since the extension point was built — see renderWatchlistSummaryPanel()
   todays_actions: "Today's Actions", // Phase 6 — same zero-infra-change extension point, see renderTodaysActionsPanel()
+  watchlist_all: "Watchlist", // Phase 9 — Watchlist screen's own panel grid, see renderWatchlistTable()
+  watchlist_near_breakout: "Near Breakout", // Phase 9 — see renderWatchlistNearBreakoutPanel()
 };
 
-function panelWrapperEl(panelType) {
-  return document.querySelector(`.panel-wrapper[data-panel-type="${panelType}"]`);
-}
+// One controller per screen (Dashboard, Watchlist) sharing identical
+// drag/resize/hide/add/persist logic — only the DOM elements, the `screen`
+// scoping param sent to the API, and the bit of `state` it reads/writes
+// differ. This is the reuse the Watchlist panel grid was built on top of,
+// rather than a second copy of the Dashboard's panel code.
+function createPanelController({ screen, gridEl, emptyNoteEl, customizeToggleEl, addPanelControlEl, addPanelSelectEl, getPanels, setPanels }) {
+  let sortableInstance = null;
 
-function renderDashboardGrid() {
-  const visiblePanels = state.dashboardPanels
-    .filter((p) => p.visible)
-    .sort((a, b) => a.display_order - b.display_order);
-
-  el.dashboardEmptyNote.hidden = visiblePanels.length > 0;
-  el.dashboardPanelsGrid.hidden = visiblePanels.length === 0;
-
-  for (const panel of visiblePanels) {
-    const wrapper = panelWrapperEl(panel.panel_type);
-    if (!wrapper) continue;
-    wrapper.hidden = false;
-    wrapper.className = `panel-wrapper panel-${panel.size}`;
-    wrapper.dataset.panelType = panel.panel_type;
-    el.dashboardPanelsGrid.appendChild(wrapper); // moves node into correct order; preserves listeners/content
-
-    const header = wrapper.querySelector(".panel-header");
-    header.hidden = !state.customizeMode;
-    header.querySelectorAll(".panel-size-btn").forEach((btn) => {
-      btn.classList.toggle("active-size", btn.dataset.size === panel.size);
-    });
+  function panelWrapperEl(panelType) {
+    return gridEl.querySelector(`.panel-wrapper[data-panel-type="${panelType}"]`);
   }
 
-  for (const panelType of Object.keys(PANEL_LABELS)) {
-    const cfg = state.dashboardPanels.find((p) => p.panel_type === panelType);
-    if (!cfg || !cfg.visible) {
-      const wrapper = panelWrapperEl(panelType);
-      if (wrapper) wrapper.hidden = true;
+  function render() {
+    const panels = getPanels();
+    const customizeMode = customizeToggleEl.checked;
+    const visiblePanels = panels.filter((p) => p.visible).sort((a, b) => a.display_order - b.display_order);
+
+    emptyNoteEl.hidden = visiblePanels.length > 0;
+    gridEl.hidden = visiblePanels.length === 0;
+
+    for (const panel of visiblePanels) {
+      const wrapper = panelWrapperEl(panel.panel_type);
+      if (!wrapper) continue;
+      wrapper.hidden = false;
+      wrapper.className = `panel-wrapper panel-${panel.size}`;
+      wrapper.dataset.panelType = panel.panel_type;
+      gridEl.appendChild(wrapper); // moves node into correct order; preserves listeners/content
+
+      const header = wrapper.querySelector(".panel-header");
+      header.hidden = !customizeMode;
+      header.querySelectorAll(".panel-size-btn").forEach((btn) => {
+        btn.classList.toggle("active-size", btn.dataset.size === panel.size);
+      });
+    }
+
+    for (const panelType of Object.keys(PANEL_LABELS)) {
+      const cfg = panels.find((p) => p.panel_type === panelType);
+      if (!cfg || !cfg.visible) {
+        const wrapper = panelWrapperEl(panelType);
+        if (wrapper) wrapper.hidden = true;
+      }
+    }
+
+    renderAddControl();
+  }
+
+  function renderAddControl() {
+    const panels = getPanels();
+    const hiddenPanels = panels.filter((p) => !p.visible);
+    addPanelControlEl.hidden = !customizeToggleEl.checked || hiddenPanels.length === 0;
+    addPanelSelectEl.innerHTML = `<option value="">Add Panel…</option>` +
+      hiddenPanels.map((p) => `<option value="${p.panel_type}">${PANEL_LABELS[p.panel_type] || p.panel_type}</option>`).join("");
+  }
+
+  async function save() {
+    try {
+      setPanels(await API.saveDashboardPanels(getPanels(), screen));
+    } catch (e) {
+      // keep local state as the source of truth for this session; will
+      // resync with the server on next load if the save silently failed
     }
   }
 
-  renderAddPanelControl();
-}
-
-function renderAddPanelControl() {
-  const hiddenPanels = state.dashboardPanels.filter((p) => !p.visible);
-  el.addPanelControl.hidden = !state.customizeMode || hiddenPanels.length === 0;
-  el.addPanelSelect.innerHTML = `<option value="">Add Panel…</option>` +
-    hiddenPanels.map((p) => `<option value="${p.panel_type}">${PANEL_LABELS[p.panel_type] || p.panel_type}</option>`).join("");
-}
-
-async function saveDashboardPanels() {
-  try {
-    state.dashboardPanels = await API.saveDashboardPanels(state.dashboardPanels);
-  } catch (e) {
-    // keep local state as the source of truth for this session; will
-    // resync with the server on next load if the save silently failed
+  function initSortable() {
+    if (typeof Sortable === "undefined" || sortableInstance) return;
+    sortableInstance = Sortable.create(gridEl, {
+      handle: ".panel-drag-handle",
+      animation: 150,
+      onEnd: () => {
+        const order = [...gridEl.querySelectorAll(".panel-wrapper")].map((w) => w.dataset.panelType);
+        const panels = getPanels();
+        order.forEach((panelType, idx) => {
+          const cfg = panels.find((p) => p.panel_type === panelType);
+          if (cfg) cfg.display_order = idx;
+        });
+        save();
+      },
+    });
   }
-}
 
-let sortableInstance = null;
+  function destroySortable() {
+    sortableInstance?.destroy();
+    sortableInstance = null;
+  }
 
-function initSortable() {
-  if (typeof Sortable === "undefined" || sortableInstance) return;
-  sortableInstance = Sortable.create(el.dashboardPanelsGrid, {
-    handle: ".panel-drag-handle",
-    animation: 150,
-    onEnd: () => {
-      const order = [...el.dashboardPanelsGrid.querySelectorAll(".panel-wrapper")].map((w) => w.dataset.panelType);
-      order.forEach((panelType, idx) => {
-        const cfg = state.dashboardPanels.find((p) => p.panel_type === panelType);
-        if (cfg) cfg.display_order = idx;
-      });
-      saveDashboardPanels();
-    },
+  customizeToggleEl.addEventListener("change", () => {
+    gridEl.classList.toggle("customize-mode", customizeToggleEl.checked);
+    render();
+    if (customizeToggleEl.checked) initSortable(); else destroySortable();
   });
+
+  gridEl.addEventListener("click", (event) => {
+    const wrapper = event.target.closest(".panel-wrapper");
+    if (!wrapper) return;
+    const cfg = getPanels().find((p) => p.panel_type === wrapper.dataset.panelType);
+    if (!cfg) return;
+
+    const sizeBtn = event.target.closest(".panel-size-btn");
+    const hideBtn = event.target.closest(".panel-hide-btn");
+    if (sizeBtn) {
+      cfg.size = sizeBtn.dataset.size;
+      render();
+      save();
+    } else if (hideBtn) {
+      cfg.visible = false;
+      render();
+      save();
+    }
+  });
+
+  addPanelSelectEl.addEventListener("change", (event) => {
+    const panelType = event.target.value;
+    if (!panelType) return;
+    const panels = getPanels();
+    const cfg = panels.find((p) => p.panel_type === panelType);
+    if (cfg) {
+      const maxOrder = Math.max(-1, ...panels.map((p) => p.display_order));
+      cfg.visible = true;
+      cfg.display_order = maxOrder + 1;
+    }
+    event.target.value = "";
+    render();
+    save();
+  });
+
+  async function load() {
+    try {
+      setPanels(await API.getDashboardPanels(screen));
+      render();
+    } catch (e) {
+      // leave the grid in its default static-HTML order/visibility on failure
+    }
+  }
+
+  return { load, render };
 }
 
-function destroySortable() {
-  sortableInstance?.destroy();
-  sortableInstance = null;
-}
-
-el.customizeModeToggle.addEventListener("change", () => {
-  state.customizeMode = el.customizeModeToggle.checked;
-  el.dashboardPanelsGrid.classList.toggle("customize-mode", state.customizeMode);
-  renderDashboardGrid();
-  if (state.customizeMode) initSortable(); else destroySortable();
+const dashboardPanelController = createPanelController({
+  screen: "dashboard",
+  gridEl: el.dashboardPanelsGrid,
+  emptyNoteEl: el.dashboardEmptyNote,
+  customizeToggleEl: el.customizeModeToggle,
+  addPanelControlEl: el.addPanelControl,
+  addPanelSelectEl: el.addPanelSelect,
+  getPanels: () => state.dashboardPanels,
+  setPanels: (panels) => { state.dashboardPanels = panels; },
 });
 
-el.dashboardPanelsGrid.addEventListener("click", (event) => {
-  const wrapper = event.target.closest(".panel-wrapper");
-  if (!wrapper) return;
-  const cfg = state.dashboardPanels.find((p) => p.panel_type === wrapper.dataset.panelType);
-  if (!cfg) return;
-
-  const sizeBtn = event.target.closest(".panel-size-btn");
-  const hideBtn = event.target.closest(".panel-hide-btn");
-  if (sizeBtn) {
-    cfg.size = sizeBtn.dataset.size;
-    renderDashboardGrid();
-    saveDashboardPanels();
-  } else if (hideBtn) {
-    cfg.visible = false;
-    renderDashboardGrid();
-    saveDashboardPanels();
-  }
-});
-
-el.addPanelSelect.addEventListener("change", (event) => {
-  const panelType = event.target.value;
-  if (!panelType) return;
-  const cfg = state.dashboardPanels.find((p) => p.panel_type === panelType);
-  if (cfg) {
-    const maxOrder = Math.max(-1, ...state.dashboardPanels.map((p) => p.display_order));
-    cfg.visible = true;
-    cfg.display_order = maxOrder + 1;
-  }
-  event.target.value = "";
-  renderDashboardGrid();
-  saveDashboardPanels();
+const watchlistPanelController = createPanelController({
+  screen: "watchlist",
+  gridEl: el.watchlistPanelsGrid,
+  emptyNoteEl: el.watchlistEmptyNote,
+  customizeToggleEl: el.watchlistCustomizeModeToggle,
+  addPanelControlEl: el.watchlistAddPanelControl,
+  addPanelSelectEl: el.watchlistAddPanelSelect,
+  getPanels: () => state.watchlistPanels,
+  setPanels: (panels) => { state.watchlistPanels = panels; },
 });
 
 async function loadDashboardPanels() {
-  try {
-    state.dashboardPanels = await API.getDashboardPanels();
-    renderDashboardGrid();
-  } catch (e) {
-    // leave the grid in its default static-HTML order/visibility on failure
-  }
+  await dashboardPanelController.load();
+}
+
+async function loadWatchlistPanels() {
+  await watchlistPanelController.load();
 }
 
 // ---- Approvals inbox, autopilot status, live refresh, theme ----
@@ -3327,7 +3725,7 @@ function approvalCardHtml(t, kind) {
   } else if (checks.length) {
     checkLine = `<span class="chip ok">✓ ${checks.length - failed.length}/${checks.length} risk checks passed</span>`;
   }
-  const origin = t.source === "strategy" ? strategyChipHtml(t.strategy_name) : `<span class="chip">Manual</span>`;
+  const origin = originChipHtml(t);
   return `
     <article class="approval-card ${kind}" data-ticket-id="${t.id}">
       <div class="ac-top">
@@ -3618,8 +4016,10 @@ async function init() {
     const prefs = await API.getUiPrefs();
     el.sidebar.classList.toggle("collapsed", !!prefs.sidebar_collapsed);
     if (prefs.theme) applyTheme(prefs.theme);
+    state.watchlistGroupByTag = !!prefs.watchlist_group_by_tag;
+    if (el.watchlistGroupToggle) el.watchlistGroupToggle.checked = state.watchlistGroupByTag;
   } catch (e) {
-    // default expanded; theme stays as restored from localStorage
+    // default expanded/flat; theme stays as restored from localStorage
   }
 
   const status = await API.status();
@@ -3639,7 +4039,7 @@ async function init() {
     revealTradingNavItems();
     await loadTicketingData();
     await Promise.all([
-      loadRiskData(), loadWatchlist(), loadStrategyData(), loadPhase6Data(),
+      loadRiskData(), loadWatchlist(), loadWatchlistPanels(), loadStrategyData(), loadPhase6Data(),
       loadReconciliationMismatches(), loadApprovals(), loadAutomationStatus(),
     ]);
     if (requestedSection) showSection(requestedSection);

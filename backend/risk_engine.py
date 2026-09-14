@@ -112,6 +112,51 @@ def compute_position_size(entry_price: float, stop_loss: float, portfolio_value:
     }
 
 
+def compute_suggested_exit_quantity(
+    conn: sqlite3.Connection, account_id: int, symbol: str, ctx: PortfolioContext, settings: sqlite3.Row
+) -> dict:
+    """For the Quick Action popup's concentration alert: how many shares to
+    sell to bring this symbol back to exactly max_single_stock_exposure_pct
+    of portfolio_value. Deliberately mirrors _check_single_stock_exposure's
+    own math (via _symbol_exposure, which also folds in same-day-executed
+    live tickets on top of holdings cost, not just bare holdings cost) so
+    the suggested quantity is self-consistent with what that check will
+    actually re-validate once the resulting ticket is created — using a
+    DIFFERENT (e.g. mark-to-market) basis here would suggest a quantity that
+    doesn't actually satisfy the real check.
+
+    Note this basis (cost value / portfolio_value-including-margin) is NOT
+    the same as the Dashboard alert banner's own trigger, which compares
+    mark-to-market holding value against a holdings-only total
+    (CONFIG.concentration_alert_pct, a separate, simpler config knob from
+    risk_settings.max_single_stock_exposure_pct used here) — the two are
+    different metrics on purpose and the frontend shows both rather than
+    conflating them."""
+    holding = ctx.holdings_by_symbol.get(symbol)
+    quantity_held = holding["quantity"] if holding else 0
+    average_price = holding["average_price"] if holding else 0.0
+
+    current_cost = _symbol_exposure(conn, account_id, symbol, ctx)
+    current_exposure_pct = (current_cost / ctx.portfolio_value * 100) if ctx.portfolio_value else 0.0
+    target_pct = settings["max_single_stock_exposure_pct"]
+    target_cost = target_pct / 100 * ctx.portfolio_value
+    excess_cost = current_cost - target_cost
+
+    if excess_cost <= 0 or average_price <= 0 or quantity_held <= 0:
+        suggested_qty = 0
+    else:
+        suggested_qty = min(math.ceil(excess_cost / average_price), quantity_held)
+
+    return {
+        "quantity_held": quantity_held,
+        "average_price": average_price,
+        "portfolio_value": ctx.portfolio_value,
+        "current_exposure_pct": current_exposure_pct,
+        "target_exposure_pct": target_pct,
+        "suggested_qty": suggested_qty,
+    }
+
+
 @dataclass
 class CheckResult:
     rule: str
@@ -283,41 +328,80 @@ def _check_total_portfolio_risk(conn: sqlite3.Connection, ticket_row: sqlite3.Ro
     return CheckResult("max_total_portfolio_risk_pct", "Total portfolio risk", passed, False, pct, limit, "pct", message)
 
 
-def _check_valid_exit_reference(conn: sqlite3.Connection, ticket_row: sqlite3.Row) -> CheckResult:
-    referenced = conn.execute(
-        "SELECT * FROM trade_tickets WHERE id = ? AND account_id = ?",
-        (ticket_row["closes_ticket_id"], ticket_row["account_id"]),
-    ).fetchone()
-    valid = (
-        referenced is not None
-        and referenced["transaction_type"] == "BUY"
-        and referenced["status"] == "executed"
-        and referenced["closed_at"] is None
+def get_held_quantity(kite: KiteConnect, symbol: str) -> int:
+    """Currently held quantity for a symbol per the broker's actual
+    holdings+positions data — reuses the exact formula
+    reconciliation.py:_check_position_state already established: unsettled
+    (T+1) delivery quantity sits in t1_quantity, not quantity, and a
+    same-day CNC buy shows up in positions() net before it settles into
+    holdings() the next day, so both sources are summed."""
+    holdings = kite.holdings()
+    positions = kite.positions().get("net", [])
+    qty = sum(
+        (h.get("quantity") or 0) + (h.get("t1_quantity") or 0)
+        for h in holdings if h["tradingsymbol"] == symbol
     )
-    message = (
-        "Exit ticket — position-sizing checks not applicable, closing position validated"
-        if valid else
-        "Exit ticket rejected: closes_ticket_id does not reference a valid open executed BUY ticket for this account"
-    )
+    qty += sum(p.get("quantity") or 0 for p in positions if p["tradingsymbol"] == symbol)
+    return qty
+
+
+def _check_exit_or_reduction(conn: sqlite3.Connection, ticket_row: sqlite3.Row, kite: KiteConnect) -> CheckResult:
+    """Runs instead of the six position-opening checks for any ticket
+    execution.is_closing_sell() considers a closing sell. Two ways a SELL
+    ticket can validly skip those checks:
+    (a) closes_ticket_id references a specific tracked open executed BUY —
+        Phase 5 strategy exits, the kill switch's emergency exit.
+    (b) closes_ticket_id is NULL but source == 'alert_action' (the Quick
+        Action popup's sell action) — validated instead against the
+        broker's actual currently-held quantity for the symbol, since many
+        real holdings were never opened via a trade_ticket in this app at
+        all (pre-existing positions, or bought directly in Kite)."""
+    if ticket_row["closes_ticket_id"] is not None:
+        referenced = conn.execute(
+            "SELECT * FROM trade_tickets WHERE id = ? AND account_id = ?",
+            (ticket_row["closes_ticket_id"], ticket_row["account_id"]),
+        ).fetchone()
+        valid = (
+            referenced is not None
+            and referenced["transaction_type"] == "BUY"
+            and referenced["status"] == "executed"
+            and referenced["closed_at"] is None
+        )
+        message = (
+            "Exit ticket — closes a specific tracked position, position-sizing checks not applicable"
+            if valid else
+            "Exit ticket rejected: closes_ticket_id does not reference a valid open executed BUY ticket for this account"
+        )
+    else:
+        held_qty = get_held_quantity(kite, ticket_row["symbol"])
+        valid = 0 < ticket_row["quantity"] <= held_qty
+        message = (
+            f"Reduces a held position not tracked by a ticket — {ticket_row['quantity']} of {held_qty} "
+            f"shares currently held, position-sizing checks not applicable"
+            if valid else
+            f"Rejected: requested quantity {ticket_row['quantity']} exceeds currently held quantity {held_qty}"
+        )
     # actual_value/limit_value are None here (this isn't a numeric
     # threshold check) — the frontend renders the message directly whenever
     # actual_value is None, the same path already used by the sector-skip case.
-    return CheckResult("exit_validity", "Exit Ticket Validation", valid, False, None, None, "pct", message)
+    return CheckResult("exit_or_reduction", "Exit / Reduction Validation", valid, False, None, None, "pct", message)
 
 
 def run_checks(
     conn: sqlite3.Connection, account: sqlite3.Row, ticket_row: sqlite3.Row, kite: KiteConnect,
     ctx: PortfolioContext | None = None,
 ) -> RiskCheckReport:
-    # A SELL ticket that closes an existing position is risk-REDUCING, not
-    # risk-adding — the six position-opening checks below (capital,
-    # single-stock/sector exposure, R:R, open-position count, total
-    # portfolio risk) don't meaningfully apply to it. Scoped precisely to
-    # SELL + a non-null closes_ticket_id so an ordinary manual SELL ticket
-    # (no closes_ticket_id) is completely unaffected and still runs all six
-    # checks exactly as before.
-    if ticket_row["transaction_type"] == "SELL" and ticket_row["closes_ticket_id"] is not None:
-        return RiskCheckReport(checks=[_check_valid_exit_reference(conn, ticket_row)])
+    # A SELL ticket that closes/reduces an existing position is risk-
+    # REDUCING, not risk-adding — the six position-opening checks below
+    # (capital, single-stock/sector exposure, R:R, open-position count,
+    # total portfolio risk) don't meaningfully apply to it.
+    # execution.is_closing_sell() is the single source of truth for which
+    # SELL tickets this applies to (closes_ticket_id set, OR
+    # source='alert_action' — see that function's docstring); an ordinary
+    # manual SELL ticket (source='manual', no closes_ticket_id) is
+    # completely unaffected and still runs all six checks exactly as before.
+    if execution.is_closing_sell(ticket_row):
+        return RiskCheckReport(checks=[_check_exit_or_reduction(conn, ticket_row, kite)])
 
     settings = get_settings(conn, account["id"])
     # A batch caller (the strategy scan) passes one context for the whole

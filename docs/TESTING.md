@@ -154,7 +154,7 @@ settings, or execution code.
 - [ ] Opening one more position than `max_open_positions` allows is
       rejected.
 - [ ] An exit ticket for a position that doesn't exist (or was already
-      closed) is rejected by the `exit_validity` check.
+      closed) is rejected by the `exit_or_reduction` check.
 - [ ] Changing a risk setting is reflected immediately in the next
       ticket's checks, and the change appears in risk settings history.
 

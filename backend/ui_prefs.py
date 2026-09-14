@@ -7,7 +7,7 @@ from threading import RLock
 # data, and doesn't need a migration story or per-account scoping.
 PREFS_PATH = Path(__file__).parent / "ui_prefs.json"
 
-DEFAULTS = {"sidebar_collapsed": False}
+DEFAULTS = {"sidebar_collapsed": False, "watchlist_group_by_tag": False}
 
 # Reentrant: save_prefs() calls get_prefs() while already holding the lock,
 # which would deadlock forever on a plain (non-reentrant) Lock.

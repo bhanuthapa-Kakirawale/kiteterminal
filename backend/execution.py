@@ -83,10 +83,26 @@ class ExecutionResult:
     entry_fill_status: str | None = None
 
 
+def is_closing_sell(ticket_row) -> bool:
+    """Single source of truth for 'this SELL ticket reduces/exits a position
+    rather than opening one' — used here (skip the protective GTT, exit via
+    _execute_exit not _execute_live), by order_monitor.py (route a filled
+    order through _resolve_exit not _resolve_entry), and by risk_engine.py
+    (skip the six position-opening checks). A ticket with closes_ticket_id
+    set (Phase 5 strategy exits, the kill switch's emergency exit) is always
+    closing. source='alert_action' SELLs are also always closing — the
+    Quick Action popup's sell endpoint (routes/tickets.py) only ever
+    constructs a ticket that reduces/exits a currently-held position, never
+    one that opens a short."""
+    return ticket_row["transaction_type"] == "SELL" and (
+        ticket_row["closes_ticket_id"] is not None or ticket_row["source"] == "alert_action"
+    )
+
+
 def execute_ticket(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
     if ticket["mode"] == "dry_run":
         return _simulate(ticket)
-    if ticket["closes_ticket_id"] is not None:
+    if is_closing_sell(ticket):
         return _execute_exit(kite, ticket)
     return _execute_live(kite, ticket)
 
@@ -249,18 +265,23 @@ def _execute_live(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
 
 
 def _execute_exit(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
-    """A closing ticket (closes_ticket_id set — Phase 5 strategy exits,
-    Phase 8's Emergency Exit All, or any future manual close-position flow;
-    ordinary manual tickets never set this field) reduces or closes an
-    existing position. It must NOT get a protective GTT of its own —
-    there's nothing new to protect — and the ORIGINAL position's GTT must
-    be cancelled here, synchronously, once this exit is accepted, so a
-    now-flat position doesn't keep a dangling stop-loss GTT that could later
-    trigger against nothing. The original ticket's closed_at is stamped by the
-    caller (routes/tickets.py's confirm_and_execute_ticket), immediately, in
-    the same transaction as this exit's own execution. If the broker later
-    rejects this exit, order_monitor.py re-opens the position and raises an
-    urgent alert."""
+    """A closing ticket (is_closing_sell() — closes_ticket_id set for Phase 5
+    strategy exits/Phase 8's Emergency Exit All, or source='alert_action' for
+    the Quick Action popup's sell action, which reduces/exits a holding that
+    may have no originating ticket at all) reduces or closes an existing
+    position. It must NOT get a protective GTT of its own — there's nothing
+    new to protect — and, when closes_ticket_id IS set, the ORIGINAL
+    position's GTT must be cancelled here, synchronously, once this exit is
+    accepted, so a now-flat position doesn't keep a dangling stop-loss GTT
+    that could later trigger against nothing. The original ticket's
+    closed_at is stamped by the caller (routes/tickets.py's
+    confirm_and_execute_ticket), immediately, in the same transaction as
+    this exit's own execution — that stamping (and the closed_trades journal
+    row) only happens when closes_ticket_id is set; an alert_action sell
+    with no closes_ticket_id has no original ticket to stamp or journal
+    (see routes/tickets.py's alert-action sell endpoint for why). If the
+    broker later rejects this exit, order_monitor.py re-opens the position
+    (when there is an original ticket to reopen) and raises an urgent alert."""
     exchange, symbol = ticket["exchange"], ticket["symbol"]
     tick = instruments.get_tick_size(symbol, exchange)
     variety = resolve_order_variety(kite)
@@ -313,12 +334,13 @@ def _execute_exit(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
                 f"it is now orphaned against a closed/reduced position."
             )
 
+    closes_note = f" (closes ticket {ticket['closes_ticket_id']})" if ticket["closes_ticket_id"] is not None else ""
     return ExecutionResult(
         success=True, kite_order_id=kite_order_id, kite_gtt_id=None,
         status="executed", event_type="executed",
         message=(
             f"order_id={kite_order_id}, {ticket['transaction_type']} {ticket['quantity']} {symbol} "
-            f"@ {ticket['entry_order_type']}{_variety_note(kite, variety)} (closes ticket {ticket['closes_ticket_id']})"
+            f"@ {ticket['entry_order_type']}{_variety_note(kite, variety)}{closes_note}"
         ) + gtt_note,
         order_variety=variety, entry_fill_status="pending",
     )

@@ -668,43 +668,107 @@
     <div class="view" id="view-watchlist" hidden>
       <div class="page-head">
         <div>
-          <h1>Watchlist</h1>
+          <h1>Watchlist <span id="watchlist-count" class="badge-muted">(0)</span></h1>
           <p class="page-sub">The symbols every enabled strategy scans after each close.</p>
         </div>
-      </div>
-      <details class="table-section" open>
-        <summary><h2>Add to Watchlist</h2></summary>
-        <form id="watchlist-add-form" class="ticket-form">
-          <div class="field">
-            <label for="wl-symbol">Symbol</label>
-            <input id="wl-symbol" name="symbol" list="symbol-options" autocomplete="off" placeholder="Search e.g. HDFCBANK" required />
+        <div class="page-actions" id="watchlist-customize-bar">
+          <div id="watchlist-add-panel-control" hidden>
+            <select id="watchlist-add-panel-select">
+              <option value="">Add Panel…</option>
+            </select>
           </div>
-          <div class="field field-wide">
-            <label for="wl-notes">Notes (optional)</label>
-            <input id="wl-notes" name="notes" placeholder="why you're watching this" />
-          </div>
-          <div class="field field-wide form-actions">
-            <button type="submit" class="btn btn-primary">Add to Watchlist</button>
-            <span id="watchlist-add-error" class="form-error"></span>
-          </div>
-        </form>
-      </details>
-
-      <details class="table-section" open>
-        <summary><h2>Watchlist</h2></summary>
-        <div class="table-scroll">
-          <table id="watchlist-table">
-            <thead>
-              <tr>
-                <th>Symbol</th><th class="num">LTP</th><th class="num">Day Chg %</th>
-                <th>Trend</th><th class="num">RSI-14</th><th>vs 20-day High</th>
-                <th>Notes</th><th></th>
-              </tr>
-            </thead>
-            <tbody></tbody>
-          </table>
+          <label class="mode-toggle">
+            <input type="checkbox" id="watchlist-group-toggle" />
+            <span>Group by tag</span>
+          </label>
+          <label class="mode-toggle">
+            <input type="checkbox" id="watchlist-customize-mode-toggle" />
+            <span>Customize layout</span>
+          </label>
         </div>
-      </details>
+      </div>
+
+      <datalist id="tag-options"></datalist>
+
+      <div id="watchlist-panels-grid">
+        <div class="panel-wrapper panel-large" data-panel-type="watchlist_all">
+          <div class="panel-header" hidden>
+            <span class="panel-drag-handle" title="Drag to reorder">⠿</span>
+            <span class="panel-title">Watchlist</span>
+            <span class="panel-controls">
+              <button class="panel-size-btn" data-size="small">S</button>
+              <button class="panel-size-btn" data-size="medium">M</button>
+              <button class="panel-size-btn" data-size="large">L</button>
+              <button class="panel-hide-btn" title="Hide panel">✕</button>
+            </span>
+          </div>
+          <details class="table-section" open>
+            <summary><h2>Add to Watchlist</h2></summary>
+            <form id="watchlist-add-form" class="ticket-form">
+              <div class="field">
+                <label for="wl-symbol">Symbol</label>
+                <input id="wl-symbol" name="symbol" list="symbol-options" autocomplete="off" placeholder="Search e.g. HDFCBANK" required />
+              </div>
+              <div class="field">
+                <label for="wl-tag">Tag (optional)</label>
+                <input id="wl-tag" name="tag" list="tag-options" autocomplete="off" placeholder="e.g. Momentum candidates" maxlength="50" />
+              </div>
+              <div class="field field-wide">
+                <label for="wl-notes">Notes (optional)</label>
+                <input id="wl-notes" name="notes" placeholder="why you're watching this" />
+              </div>
+              <div class="field field-wide form-actions">
+                <button type="submit" class="btn btn-primary">Add to Watchlist</button>
+                <span id="watchlist-add-error" class="form-error"></span>
+              </div>
+            </form>
+          </details>
+
+          <details class="table-section" open>
+            <summary><h2>Watchlist</h2></summary>
+            <div class="table-scroll">
+              <table id="watchlist-table">
+                <thead>
+                  <tr>
+                    <th>Symbol</th><th class="num">LTP</th><th class="num">Day Chg %</th>
+                    <th>Trend</th><th class="num">RSI-14</th><th>vs 20-day High</th>
+                    <th>Tag</th><th>Notes</th><th></th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </details>
+        </div>
+
+        <div class="panel-wrapper panel-medium" data-panel-type="watchlist_near_breakout">
+          <div class="panel-header" hidden>
+            <span class="panel-drag-handle" title="Drag to reorder">⠿</span>
+            <span class="panel-title">Near Breakout</span>
+            <span class="panel-controls">
+              <button class="panel-size-btn" data-size="small">S</button>
+              <button class="panel-size-btn" data-size="medium">M</button>
+              <button class="panel-size-btn" data-size="large">L</button>
+              <button class="panel-hide-btn" title="Hide panel">✕</button>
+            </span>
+          </div>
+          <section class="table-section">
+            <h2>Near Breakout</h2>
+            <p class="page-sub">Trend-passing watchlist symbols trading within a few percent of their 20-day high — no signal yet.</p>
+            <div class="table-scroll">
+              <table id="watchlist-near-breakout-table">
+                <thead>
+                  <tr><th>Symbol</th><th class="num">Last Close</th><th class="num">20-day High</th><th class="num">Distance</th></tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </div>
+      <div id="watchlist-empty-note" class="banner banner-neutral" hidden>
+        No panels visible — turn on Customize layout and use Add Panel.
+      </div>
     </div>
     <div class="view" id="view-strategies" hidden>
       <div class="page-head">
@@ -1156,6 +1220,87 @@
     <div class="dialog-actions">
       <button id="app-confirm-cancel" class="btn" autofocus>Cancel</button>
       <button id="app-confirm-ok" class="btn btn-primary">Confirm</button>
+    </div>
+  </dialog>
+
+  <dialog id="quick-action-dialog" class="ticket-dialog quick-action-dialog">
+    <h2 id="qa-title">Quick Action</h2>
+    <div id="qa-header" class="ticket-confirm-body"></div>
+
+    <div id="qa-sell-section" class="qa-action-section">
+      <h3 id="qa-sell-title">Sell</h3>
+      <div class="ticket-form">
+        <div class="field">
+          <label for="qa-sell-qty">Quantity</label>
+          <input id="qa-sell-qty" type="number" min="1" step="1" />
+        </div>
+        <div class="field">
+          <label for="qa-sell-order-type">Order Type</label>
+          <select id="qa-sell-order-type">
+            <option value="MARKET">MARKET</option>
+            <option value="LIMIT">LIMIT</option>
+          </select>
+        </div>
+        <div class="field field-wide">
+          <label for="qa-sell-rationale">Rationale</label>
+          <textarea id="qa-sell-rationale" rows="2"></textarea>
+        </div>
+      </div>
+      <div id="qa-sell-preview" class="ticket-preview"></div>
+      <div class="form-actions">
+        <button id="qa-sell-submit" class="btn btn-danger" type="button">Create Sell Ticket</button>
+        <span id="qa-sell-error" class="form-error"></span>
+      </div>
+    </div>
+
+    <div id="qa-buy-section" class="qa-action-section">
+      <h3>Buy more (average down)</h3>
+      <div class="ticket-form">
+        <div class="field">
+          <label for="qa-buy-qty">Quantity</label>
+          <input id="qa-buy-qty" type="number" min="1" step="1" />
+        </div>
+        <div class="field">
+          <label for="qa-buy-order-type">Order Type</label>
+          <select id="qa-buy-order-type">
+            <option value="MARKET">MARKET</option>
+            <option value="LIMIT">LIMIT</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="qa-buy-entry-price">Entry Price</label>
+          <input id="qa-buy-entry-price" type="number" step="any" min="0.01" />
+        </div>
+        <div class="field">
+          <label for="qa-buy-product-type">Product</label>
+          <select id="qa-buy-product-type">
+            <option value="CNC">CNC</option>
+            <option value="MIS">MIS</option>
+            <option value="NRML">NRML</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="qa-buy-stop-loss">Stop-loss</label>
+          <input id="qa-buy-stop-loss" type="number" step="any" min="0.01" />
+        </div>
+        <div class="field">
+          <label for="qa-buy-target-1">Target 1</label>
+          <input id="qa-buy-target-1" type="number" step="any" min="0.01" />
+        </div>
+        <div class="field field-wide">
+          <label for="qa-buy-rationale">Rationale</label>
+          <textarea id="qa-buy-rationale" rows="2"></textarea>
+        </div>
+      </div>
+      <div id="qa-buy-preview" class="ticket-preview"></div>
+      <div class="form-actions">
+        <button id="qa-buy-submit" class="btn btn-success" type="button">Create Buy Ticket</button>
+        <span id="qa-buy-error" class="form-error"></span>
+      </div>
+    </div>
+
+    <div class="dialog-actions">
+      <button id="qa-close-btn" class="btn" autofocus>Close</button>
     </div>
   </dialog>
 

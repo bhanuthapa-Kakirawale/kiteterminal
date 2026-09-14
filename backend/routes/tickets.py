@@ -9,7 +9,12 @@ from backend import execution, instruments, journal, risk_engine, system_events
 from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
-from backend.models import TicketCreateRequest, TicketEditRequest, TicketRejectRequest
+from backend.models import (
+    AlertActionSellRequest,
+    TicketCreateRequest,
+    TicketEditRequest,
+    TicketRejectRequest,
+)
 from backend.ticker import ticker_manager
 
 logger = logging.getLogger(__name__)
@@ -91,8 +96,14 @@ def _validate_prices(req: TicketCreateRequest | TicketEditRequest) -> None:
         })
 
 
-@router.post("/api/tickets", status_code=201)
-def create_ticket(req: TicketCreateRequest, kite: KiteConnect = Depends(require_trading_account)):
+def _create_ticket_internal(
+    req: TicketCreateRequest, kite: KiteConnect, account: sqlite3.Row, source: str
+) -> dict:
+    """Shared body behind both the public manual-ticket endpoint
+    (source='manual') and the Quick Action popup's buy/average-down endpoint
+    (source='alert_action') — same factor-out-the-shared-body pattern as
+    confirm_and_execute_ticket below, which is likewise shared by the
+    single-ticket confirm endpoint and Emergency Exit All's batch loop."""
     _validate_prices(req)
 
     instrument = instruments.get_instrument_by_symbol(req.symbol, req.exchange)
@@ -103,7 +114,6 @@ def create_ticket(req: TicketCreateRequest, kite: KiteConnect = Depends(require_
                        f"Check spelling or refresh the instrument list.",
         })
 
-    account = get_trading_account()
     metrics = execution.compute_risk_metrics(req.model_dump())
 
     conn = get_connection()
@@ -117,10 +127,10 @@ def create_ticket(req: TicketCreateRequest, kite: KiteConnect = Depends(require_
                 trailing_enabled, trailing_trigger, trailing_distance,
                 product_type, use_gtt, risk_amount, risk_reward_ratio,
                 rationale, status
-            ) VALUES (?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')
             """,
             (
-                account["id"], req.symbol, req.exchange, instrument["instrument_token"],
+                account["id"], source, req.symbol, req.exchange, instrument["instrument_token"],
                 req.transaction_type, req.quantity, req.entry_price, req.entry_order_type,
                 req.stop_loss, req.target_1, req.target_2,
                 int(req.trailing_enabled), req.trailing_trigger, req.trailing_distance,
@@ -129,7 +139,123 @@ def create_ticket(req: TicketCreateRequest, kite: KiteConnect = Depends(require_
             ),
         )
         ticket_id = cursor.lastrowid
-        _log_event(conn, ticket_id, "created", f"Ticket created (source=manual)")
+        _log_event(conn, ticket_id, "created", f"Ticket created (source={source})")
+        conn.commit()
+
+        _run_risk_checks_and_transition(conn, account, ticket_id, kite)
+        _notify("created", ticket_id=ticket_id)
+
+        ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
+        return _serialize(ticket)
+    finally:
+        conn.close()
+
+
+@router.post("/api/tickets", status_code=201)
+def create_ticket(req: TicketCreateRequest, kite: KiteConnect = Depends(require_trading_account)):
+    account = get_trading_account()
+    return {"data": _create_ticket_internal(req, kite, account, source="manual")}
+
+
+@router.post("/api/tickets/alert-action/buy", status_code=201)
+def create_alert_action_buy(req: TicketCreateRequest, kite: KiteConnect = Depends(require_trading_account)):
+    # Quick Action popup's "Buy more (average down)" action. Full risk
+    # engine runs, no skip logic — this is risk-ADDING, unlike the sell
+    # action below. Deliberately reuses TicketCreateRequest as-is: it needs
+    # the exact same required fields (stop_loss/target_1 are a fresh risk
+    # decision for THIS trade, never auto-filled or exempted).
+    if req.transaction_type != "BUY":
+        raise HTTPException(400, {
+            "error_code": "VALIDATION_ERROR",
+            "message": "The alert-action buy endpoint only creates BUY tickets.",
+        })
+    account = get_trading_account()
+    return {"data": _create_ticket_internal(req, kite, account, source="alert_action")}
+
+
+@router.post("/api/tickets/alert-action/sell", status_code=201)
+def create_alert_action_sell(req: AlertActionSellRequest, kite: KiteConnect = Depends(require_trading_account)):
+    # Quick Action popup's "Sell to cut loss" / "Sell to reduce exposure"
+    # action. Unlike a normal manual ticket, this always reduces/exits a
+    # currently-held position — stop_loss/target_1/product_type are derived
+    # server-side from the broker's own holdings data, never trusted from
+    # the client (same "never trust the client" precedent as
+    # instrument_token resolution above).
+    account = get_trading_account()
+    instrument = instruments.get_instrument_by_symbol(req.symbol, req.exchange)
+    if instrument is None:
+        raise HTTPException(400, {
+            "error_code": "INSTRUMENT_NOT_FOUND",
+            "message": f"Could not resolve '{req.symbol}' on {req.exchange}. "
+                       f"Check spelling or refresh the instrument list.",
+        })
+
+    holdings = kite.holdings()
+    holding = next((h for h in holdings if h["tradingsymbol"] == req.symbol), None)
+    if holding is None:
+        raise HTTPException(400, {
+            "error_code": "NOT_HELD",
+            "message": f"'{req.symbol}' is not currently held — nothing to sell.",
+        })
+
+    held_qty = risk_engine.get_held_quantity(kite, req.symbol)
+    if req.quantity > held_qty:
+        raise HTTPException(400, {
+            "error_code": "EXCEEDS_HELD_QUANTITY",
+            "message": f"Requested quantity {req.quantity} exceeds the {held_qty} shares currently held.",
+        })
+
+    average_price = holding["average_price"]
+    product_type = holding.get("product") or "CNC"
+
+    conn = get_connection()
+    try:
+        # Only link to a specific tracked ticket on a genuine FULL close —
+        # this app's exit model has no partial-exit/quantity-split modeling
+        # (execution.py's own comment), so linking a PARTIAL sell to a
+        # tracked ticket would make journal.record_closed_trade compute P&L
+        # against the wrong (larger) quantity and incorrectly mark the whole
+        # original position closed. A partial reduction (the common case for
+        # the concentration action) always falls through to case (b): no
+        # closes_ticket_id, validated instead against held quantity by
+        # risk_engine._check_exit_or_reduction.
+        open_positions = [p for p in risk_engine.list_open_positions(conn, account["id"]) if p["symbol"] == req.symbol]
+        closes_ticket_id = None
+        link_note = "none (partial reduction)"
+        if len(open_positions) == 1 and open_positions[0]["quantity"] == req.quantity:
+            closes_ticket_id = open_positions[0]["id"]
+            link_note = "full_close"
+        elif len(open_positions) > 1:
+            link_note = f"none ({len(open_positions)} open tickets for this symbol, ambiguous which to link)"
+
+        rule_checklist = json.dumps({
+            "alert_action": {
+                "trigger": req.alert_type,
+                "held_quantity": held_qty,
+                "average_price": average_price,
+                "linked_ticket": link_note,
+            }
+        })
+
+        cursor = conn.execute(
+            """
+            INSERT INTO trade_tickets (
+                account_id, source, symbol, exchange, instrument_token,
+                transaction_type, quantity, entry_price, entry_order_type,
+                stop_loss, target_1, product_type, use_gtt,
+                rationale, status, closes_ticket_id, rule_checklist
+            ) VALUES (?, 'alert_action', ?, ?, ?, 'SELL', ?, ?, ?, ?, ?, ?, 1, ?, 'draft', ?, ?)
+            """,
+            (
+                account["id"], req.symbol, req.exchange, instrument["instrument_token"],
+                req.quantity, req.entry_price, req.entry_order_type,
+                average_price, average_price, product_type,
+                req.rationale, closes_ticket_id, rule_checklist,
+            ),
+        )
+        ticket_id = cursor.lastrowid
+        _log_event(conn, ticket_id, "created", "Ticket created (source=alert_action): "
+                                                f"{req.alert_type} on {req.symbol}")
         conn.commit()
 
         _run_risk_checks_and_transition(conn, account, ticket_id, kite)

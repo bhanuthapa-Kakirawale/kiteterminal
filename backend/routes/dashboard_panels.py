@@ -28,13 +28,18 @@ def _serialize(row) -> dict:
 
 
 @router.get("/api/dashboard-panels")
-def get_dashboard_panels(kite: KiteConnect = Depends(require_kite)):
+def get_dashboard_panels(screen: str = "dashboard", kite: KiteConnect = Depends(require_kite)):
+    # `screen` distinguishes which screen's layout this is — the Watchlist
+    # screen's configurable panel grid (Phase 9) reuses this exact table and
+    # endpoint rather than a parallel implementation; only this scoping
+    # param changes. Defaults to 'dashboard' so every pre-existing caller
+    # (the Dashboard itself) is unaffected.
     account = get_default_account()
     conn = get_connection()
     try:
         rows = conn.execute(
-            "SELECT * FROM dashboard_panels WHERE account_id = ? ORDER BY display_order",
-            (account["id"],),
+            "SELECT * FROM dashboard_panels WHERE account_id = ? AND screen = ? ORDER BY display_order",
+            (account["id"], screen),
         ).fetchall()
         return {"data": [_serialize(r) for r in rows]}
     finally:
@@ -42,29 +47,31 @@ def get_dashboard_panels(kite: KiteConnect = Depends(require_kite)):
 
 
 @router.put("/api/dashboard-panels")
-def save_dashboard_panels(req: PanelsUpdateRequest, kite: KiteConnect = Depends(require_kite)):
+def save_dashboard_panels(req: PanelsUpdateRequest, screen: str = "dashboard", kite: KiteConnect = Depends(require_kite)):
     # Full-replace, not a per-field patch: the frontend always holds the
     # complete current layout in memory, so every interaction (drag reorder,
     # resize, hide, show, re-add) is naturally "here is the new full list" —
     # one endpoint covers every mutation instead of four fine-grained ones.
+    # Scoped to `screen` so saving one screen's layout never touches the
+    # other's rows.
     account = get_default_account()
     conn = get_connection()
     try:
-        conn.execute("DELETE FROM dashboard_panels WHERE account_id = ?", (account["id"],))
+        conn.execute("DELETE FROM dashboard_panels WHERE account_id = ? AND screen = ?", (account["id"], screen))
         conn.executemany(
             """
-            INSERT INTO dashboard_panels (account_id, panel_type, display_order, size, visible, updated_at)
-            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            INSERT INTO dashboard_panels (account_id, screen, panel_type, display_order, size, visible, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
             """,
             [
-                (account["id"], p.panel_type, p.display_order, p.size, int(p.visible))
+                (account["id"], screen, p.panel_type, p.display_order, p.size, int(p.visible))
                 for p in req.panels
             ],
         )
         conn.commit()
         rows = conn.execute(
-            "SELECT * FROM dashboard_panels WHERE account_id = ? ORDER BY display_order",
-            (account["id"],),
+            "SELECT * FROM dashboard_panels WHERE account_id = ? AND screen = ? ORDER BY display_order",
+            (account["id"], screen),
         ).fetchall()
         return {"data": [_serialize(r) for r in rows]}
     finally:

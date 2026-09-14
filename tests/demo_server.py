@@ -196,9 +196,9 @@ def seed_database(db, fake, market) -> None:
             entry_price=1561.05, entry_order_type="MARKET", stop_loss=1452.0, target_1=1590.0, product_type="CNC",
             use_gtt=1, risk_amount=2398.0, risk_reward_ratio=0.27, status="pending_confirmation",
             closes_ticket_id=sun,
-            risk_check_results=json.dumps([{"rule": "exit_validity", "label": "Exit Ticket Validation", "passed": True,
+            risk_check_results=json.dumps([{"rule": "exit_or_reduction", "label": "Exit / Reduction Validation", "passed": True,
                                             "skipped": False, "actual_value": None, "limit_value": None,
-                                            "unit": "pct", "message": "Exit ticket — closing position validated"}]),
+                                            "unit": "pct", "message": "Exit ticket — closes a specific tracked position, position-sizing checks not applicable"}]),
             rule_checklist=json.dumps({"time_exit": {"pass": True, "days_held": 16, "limit_days": 15}}),
             rationale="held 16 trading days without hitting stop or target (limit 15)")
 
