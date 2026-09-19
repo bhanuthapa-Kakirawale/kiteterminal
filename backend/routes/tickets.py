@@ -5,7 +5,7 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException
 from kiteconnect import KiteConnect
 
-from backend import execution, instruments, journal, risk_engine, system_events
+from backend import execution, instruments, journal, kite_chart, risk_engine, signal_chart, system_events
 from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
@@ -50,6 +50,18 @@ def _serialize(ticket: sqlite3.Row) -> dict:
     data["capital"] = metrics["capital"]
     data["target_2_risk_reward_ratio"] = metrics["target_2_risk_reward_ratio"]
     data["risk_check_results"] = json.loads(data["risk_check_results"]) if data.get("risk_check_results") else []
+    # Parsed the same way risk_check_results is, so the frontend never has to
+    # JSON.parse a field of a ticket payload itself.
+    data["entry_evaluation"] = signal_chart.parse_evaluation(data.get("entry_evaluation"))
+    # The three link variants are derived, not stored — see backend/kite_chart.py.
+    data["kite_chart"] = {
+        "url": data.get("kite_chart_url"),
+        "status": data.get("kite_chart_status"),
+        "options": kite_chart.fallback_chain(
+            data["symbol"], data.get("exchange") or "NSE",
+            data.get("instrument_token"), data.get("kite_chart_status") or kite_chart.STATUS_OK,
+        ),
+    }
     return data
 
 
@@ -321,6 +333,44 @@ def get_ticket(ticket_id: int, kite: KiteConnect = Depends(require_trading_accou
         data = _serialize(ticket)
         data["events"] = [dict(e) for e in events]
         return {"data": data}
+    finally:
+        conn.close()
+
+
+@router.get("/api/tickets/{ticket_id}/chart")
+def get_ticket_chart(ticket_id: int, kite: KiteConnect = Depends(require_trading_account)):
+    """Everything the Signal Detail view needs, in one payload: candles and
+    indicator series from ohlc_daily, the ticket's already-tick-snapped
+    levels, the bars the strategy keyed off, and the freshness/expiry state.
+
+    Read-only and Kite-free by design — see backend/signal_chart.py. The
+    `kite` dependency is the standard server-side auth/permission gate every
+    other ticket route carries, not a data source.
+    """
+    account = get_trading_account()
+    conn = get_connection()
+    try:
+        ticket = _serialize(_get_ticket_or_404(conn, ticket_id, account["id"]))
+
+        # Tickets created before this feature shipped have no stored chart
+        # URL. Rather than showing them a dead link, resolve once on first
+        # view and write it back, so the backlog of already-pending signals
+        # behaves exactly like a freshly created one from here on.
+        if ticket.get("kite_chart_status") is None:
+            resolved = kite_chart.resolve_and_log(
+                conn, account["id"], ticket["symbol"], ticket.get("exchange") or "NSE",
+                ticket.get("instrument_token"),
+            )
+            conn.execute(
+                "UPDATE trade_tickets SET kite_chart_url = ?, kite_chart_status = ? WHERE id = ?",
+                (resolved["url"], resolved["status"], ticket_id),
+            )
+            conn.commit()
+            ticket["kite_chart_url"] = resolved["url"]
+            ticket["kite_chart_status"] = resolved["status"]
+
+        settings = risk_engine.get_settings(conn, account["id"])
+        return {"data": signal_chart.build_payload(ticket, settings)}
     finally:
         conn.close()
 

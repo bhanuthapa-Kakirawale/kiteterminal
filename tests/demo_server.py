@@ -31,8 +31,11 @@ from fake_kite import FakeKite, make_candles  # noqa: E402
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # token, symbol, name, start price, daily drift %, sector
+# `sector` None means the symbol is deliberately left OUT of sector_mapping, so
+# the Signal Detail view's risk section has a real example of the sector check
+# being SKIPPED rather than passed (it must never render as a pass).
 UNIVERSE = [
-    (2953217, "TCS", "TATA CONSULTANCY SERV LT", 3350.0, -0.010, "IT"),
+    (2953217, "TCS", "TATA CONSULTANCY SERV LT", 3350.0, 0.030, "IT"),
     (408065, "INFY", "INFOSYS", 1180.0, 0.030, "IT"),
     (738561, "RELIANCE", "RELIANCE INDUSTRIES", 1120.0, 0.032, "Energy"),
     (341249, "HDFCBANK", "HDFC BANK", 1420.0, 0.025, "Banking"),
@@ -40,9 +43,95 @@ UNIVERSE = [
     (424961, "ITC", "ITC", 430.0, -0.005, "FMCG"),
     (2939649, "LT", "LARSEN & TOUBRO", 2900.0, 0.030, "Infra"),
     (2714625, "BHARTIARTL", "BHARTI AIRTEL", 1400.0, 0.040, "Telecom"),
+    # Steep drift is required for the oversold setup (price must stay above
+    # its SMA-200 through a 9-day sell-off), so the START price is scaled
+    # down to keep the compounded end price in a realistic range.
+    (2800641, "DIVISLAB", "DIVIS LABORATORIES", 128.0, 0.450, "Pharma"),
+    (4508673, "NEWLISTCO", "NEW LISTING CO", 640.0, 0.120, None),
 ]
+# TCS is held in size on purpose: its signal below is meant to be BLOCKED by
+# the single-stock-exposure risk check, so the Approvals inbox always has a
+# risk-rejected card whose failed check can be inspected.
 USER_HOLDINGS = {"RELIANCE": (40, 1310.0), "INFY": (60, 1390.0), "ITC": (300, 402.0), "HDFCBANK": (25, 1650.0),
-                 "TCS": (10, 3480.0)}
+                 "TCS": (260, 3480.0)}
+
+# Which strategy each symbol's candle series is shaped to trigger. Four
+# momentum candidates against a cap of three means one qualifying signal is
+# always dropped, so the detail view's "ranked N of 3 kept, from 4 candidates
+# that qualified" line has something real to report.
+SETUPS = {
+    "LT": "breakout", "NEWLISTCO": "breakout", "TCS": "breakout", "HDFCBANK": "breakout",
+    "BHARTIARTL": "pullback",
+    "DIVISLAB": "oversold",
+}
+
+
+def _avg_volume(candles, period=20):
+    return sum(c["volume"] for c in candles[-(period + 1):-1]) / period
+
+
+def shape_breakout(candles):
+    """Final bar closes decisively above the prior Donchian high on heavy volume.
+
+    Lookback and volume multiple are read from the strategy module rather
+    than hardcoded. The 2026-09 parameter revision raised both, and hardcoded
+    values here would silently stop producing signals -- leaving the demo
+    server, and the E2E test that runs against it, with an empty inbox."""
+    from backend.strategies import momentum_breakout as mb
+
+    lookback = mb.DEFAULT_PARAMS["donchian_lookback"]
+    prior_max = max(c["close"] for c in candles[-(lookback + 1):-1])
+    last = candles[-1]
+    last["close"] = round(prior_max * 1.028, 2)
+    last["open"] = round(prior_max * 1.002, 2)
+    last["high"] = round(last["close"] * 1.005, 2)
+    last["low"] = round(last["open"] * 0.997, 2)
+    last["volume"] = int(_avg_volume(candles) * (mb.DEFAULT_PARAMS["volume_multiple"] + 0.6))
+    return candles
+
+
+def shape_pullback(candles):
+    """Second-to-last bar dips to its own 20-EMA; the final bar closes back
+    above both that EMA and the previous close, on heavy volume."""
+    from backend.strategies import trend_pullback as tp
+
+    dip = candles[-2]
+    dip["low"] = round(dip["low"] * 0.94, 2)
+    dip["close"] = round(dip["close"] * 0.97, 2)
+    dip["open"] = round(dip["close"] * 1.01, 2)
+    last = candles[-1]
+    last["open"] = dip["close"]
+    last["close"] = round(dip["close"] * 1.09, 2)
+    last["high"] = round(last["close"] * 1.004, 2)
+    last["low"] = round(dip["close"] * 0.998, 2)
+    # The recovery bar must clear the participation filter added in 2026-09.
+    last["volume"] = int(_avg_volume(candles) * (tp.DEFAULT_PARAMS["volume_multiple"] + 0.6))
+    return candles
+
+
+def shape_oversold(candles):
+    """A steep long-run uptrend (so the hard SMA-200 filter still passes)
+    followed by a 9-day sell-off that drives RSI-14 under 35, then one up-bar
+    so RSI is turning back up. The two halves are balanced deliberately: a
+    deeper dip drives RSI lower but also drags price below its own SMA-200, at
+    which point this strategy's hard trend filter rejects the candidate."""
+    dip_days = 9
+    price = candles[-(dip_days + 2)]["close"]
+    for candle in candles[-(dip_days + 1):-1]:
+        price = round(price * 0.982, 2)
+        candle["open"] = round(price * 1.004, 2)
+        candle["close"] = price
+        candle["high"] = round(price * 1.006, 2)
+        candle["low"] = round(price * 0.994, 2)
+    last = candles[-1]
+    last["open"] = price
+    last["close"] = round(price * 1.008, 2)
+    last["high"] = round(last["close"] * 1.004, 2)
+    last["low"] = round(price * 0.998, 2)
+    return candles
+
+
+_SHAPERS = {"breakout": shape_breakout, "pullback": shape_pullback, "oversold": shape_oversold}
 
 
 def build_fake(market) -> FakeKite:
@@ -50,6 +139,12 @@ def build_fake(market) -> FakeKite:
     candles, ltp, closes = {}, {}, {}
     for token, sym, _, start, drift, _ in UNIVERSE:
         series = make_candles(session, 760, start, daily_drift_pct=drift, volume=250_000)
+        # Shape the tail so the scan below produces genuine signals from this
+        # data, rather than the signals being hand-written constants that
+        # happen to sit nowhere near the candles a chart would plot.
+        shaper = _SHAPERS.get(SETUPS.get(sym))
+        if shaper:
+            series = shaper(series)
         candles[token] = series
         closes[sym] = series[-1]["close"]
         ltp[f"NSE:{sym}"] = round(series[-1]["close"] * 1.004, 2)
@@ -100,7 +195,7 @@ def seed_database(db, fake, market) -> None:
         [(token, sym, name) for token, sym, name, *_ in UNIVERSE],
     )
     conn.executemany("INSERT OR IGNORE INTO sector_mapping (symbol, sector) VALUES (?, ?)",
-                     [(sym, sector) for _, sym, _, _, _, sector in UNIVERSE])
+                     [(sym, sector) for _, sym, _, _, _, sector in UNIVERSE if sector])
     conn.execute(
         "INSERT INTO sessions (access_token, user_id, user_name, login_time, account_id) VALUES (?, ?, ?, ?, ?)",
         ("demo-token", "DT0001", "Demo Trader", datetime.now(IST).isoformat(), aid),
@@ -125,7 +220,11 @@ def seed_database(db, fake, market) -> None:
     for token, sym, *_ in UNIVERSE:
         indicators.compute_and_store(token, sym)
 
-    for name in ("momentum_breakout", "trend_pullback"):
+    # All three strategies are enabled so the Signal Detail view can be
+    # explored against every overlay set it knows how to draw — including
+    # rsi_mean_reversion's RSI subpanel, which has no equivalent in the other
+    # two.
+    for name in ("momentum_breakout", "trend_pullback", "rsi_mean_reversion"):
         strategy_engine.save_config(conn, aid, name, True, dict(STRATEGIES[name].DEFAULT_PARAMS))
 
     signal = session.isoformat()
@@ -136,35 +235,6 @@ def seed_database(db, fake, market) -> None:
         conn.commit()
         risk_engine.run_risk_checks_and_transition(conn, account, tid, fake, ctx=ctx)
         return tid
-
-    # --- entry signals awaiting approval --------------------------------
-    risk_checked(
-        source="strategy", strategy_name="momentum_breakout", strategy_version=1, symbol="LT", exchange="NSE",
-        instrument_token=2939649, transaction_type="BUY", quantity=21, entry_price=3612.15, entry_order_type="LIMIT",
-        stop_loss=3480.30, target_1=3875.85, trailing_enabled=1, trailing_trigger="after_target_1",
-        trailing_distance=98.90, product_type="CNC", use_gtt=1, risk_amount=2768.85, risk_reward_ratio=2.0,
-        signal_date=signal, rule_checklist=json.dumps({"breakout": {"pass": True, "breakout_pct_above_level": 1.8}}),
-        rationale="Momentum breakout: close ₹3,608.50 broke above 20-day high ₹3,545.20 on 2.4x avg volume, "
-                  "trend confirmed (close above 200-day SMA ₹3,210.40).",
-    )
-    risk_checked(
-        source="strategy", strategy_name="trend_pullback", strategy_version=1, symbol="BHARTIARTL", exchange="NSE",
-        instrument_token=2714625, transaction_type="BUY", quantity=40, entry_price=1905.40, entry_order_type="LIMIT",
-        stop_loss=1858.25, target_1=1999.70, trailing_enabled=1, trailing_trigger="after_target_1",
-        trailing_distance=47.15, product_type="CNC", use_gtt=1, risk_amount=1886.0, risk_reward_ratio=2.0,
-        signal_date=signal,
-        rationale="Trend pullback: close ₹1,903.50 pulled back to touch the 20-EMA (₹1,871.30) and is now confirmed "
-                  "recovering above it, with the 200-day uptrend still intact.",
-    )
-    # --- blocked by the risk engine today --------------------------------
-    risk_checked(
-        source="strategy", strategy_name="trend_pullback", strategy_version=1, symbol="TCS", exchange="NSE",
-        instrument_token=2953217, transaction_type="BUY", quantity=24, entry_price=3134.60, entry_order_type="LIMIT",
-        stop_loss=3052.10, target_1=3299.60, trailing_enabled=1, trailing_trigger="after_target_1",
-        trailing_distance=82.50, product_type="CNC", use_gtt=1, risk_amount=1980.0, risk_reward_ratio=2.0,
-        signal_date=signal,
-        rationale="Trend pullback: close ₹3,131.45 recovered above its 20-EMA after a 3-day dip.",
-    )
 
     # --- open live positions (placed by the app) -----------------------
     sun_gtt = fake.place_gtt("single", "SUNPHARMA", "NSE", [1452.0], 1560.0, [])["trigger_id"]
@@ -190,6 +260,25 @@ def seed_database(db, fake, market) -> None:
     conn.execute("INSERT INTO stop_adjustment_proposals (ticket_id, current_stop, proposed_stop, reason) "
                  "VALUES (?, 1402.0, 1446.40, 'Position up 1.12R (trigger 1.0R), tightening stop to breakeven')",
                  (infy,))
+    conn.commit()
+
+    # --- entry signals, produced by the REAL scan ----------------------
+    # Running the actual scanner rather than inserting hand-written tickets is
+    # what makes the demo usable for this feature: the tickets come back with
+    # a genuine entry_evaluation record, a rationale generated from it, a
+    # resolved Kite chart URL, and price levels that actually sit on the
+    # candles the chart will plot. Hand-written constants looked fine on a
+    # card and fell apart the moment anything drew them against real bars.
+    #
+    # It runs AFTER the open positions above so the scanner's
+    # "don't re-propose a symbol I already hold" guard behaves realistically.
+    for name in ("momentum_breakout", "trend_pullback", "rsi_mean_reversion"):
+        module = STRATEGIES[name]
+        diagnostics: dict = {}
+        created = strategy_engine.run_entry_scan(
+            module, conn, account, fake, dict(module.DEFAULT_PARAMS), ctx=ctx, diagnostics=diagnostics)
+        print(f"  seeded {name}: {len(created)} signal(s) "
+              f"({diagnostics.get('qualified')} qualified, {diagnostics.get('kept')} kept)", flush=True)
     # --- exit signal awaiting approval ---------------------------------
     _insert(conn, account_id=aid, source="strategy", strategy_name="momentum_breakout_exit", strategy_version=1,
             symbol="SUNPHARMA", exchange="NSE", instrument_token=857857, transaction_type="SELL", quantity=22,

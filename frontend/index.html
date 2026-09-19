@@ -1106,6 +1106,69 @@
     </main>
   </div>
 
+  <!-- Signal Detail: a full-screen overlay rather than a <dialog>, because it
+       is a two-pane workspace (chart + evidence) with its own keyboard
+       navigation between signals, not a modal prompt. The ticket dialogs
+       below stay exactly as they were — this view reuses their handlers for
+       approve/reject rather than duplicating an execution path. -->
+  <div id="signal-detail" class="signal-detail" hidden role="dialog" aria-modal="true"
+       aria-labelledby="sd-symbol">
+    <header class="sd-head">
+      <div class="sd-head-main">
+        <span id="sd-side"></span>
+        <h2 id="sd-symbol">—</h2>
+        <span id="sd-strategy"></span>
+        <span id="sd-signal-date" class="badge-muted"></span>
+        <span id="sd-mode-pill"></span>
+      </div>
+      <div class="sd-head-live">
+        <div class="sd-ltp"><label>Last price</label><strong id="sd-ltp">—</strong><span id="sd-ltp-change"></span></div>
+        <div class="sd-asof"><label>Candles as of</label><strong id="sd-asof">—</strong></div>
+      </div>
+      <div class="sd-head-nav">
+        <button id="sd-prev" class="btn btn-ghost btn-small" title="Previous pending signal (←)" aria-label="Previous pending signal">←</button>
+        <span id="sd-position" class="badge-muted"></span>
+        <button id="sd-next" class="btn btn-ghost btn-small" title="Next pending signal (→)" aria-label="Next pending signal">→</button>
+        <!-- The view is full-screen and covers the top bar's theme toggle, so
+             it carries its own. Same handler, same persisted preference. -->
+        <button id="sd-theme" class="btn btn-ghost btn-small" title="Switch theme" aria-label="Switch theme"></button>
+        <button id="sd-close" class="btn btn-ghost btn-small sd-close" title="Close (Esc)" aria-label="Close">×</button>
+      </div>
+    </header>
+
+    <div class="sd-body">
+      <section class="sd-chart-pane">
+        <div class="sd-chart-bar">
+          <div id="sd-toggles" class="sd-toggles"></div>
+          <div id="sd-legend" class="sd-legend"></div>
+        </div>
+        <div id="sd-chart" class="sd-chart"></div>
+        <div id="sd-chart-note" class="sd-chart-note" hidden></div>
+      </section>
+
+      <aside class="sd-evidence" id="sd-evidence" aria-label="Why this signal">
+        <div class="sd-evidence-inner" id="sd-evidence-inner"></div>
+      </aside>
+    </div>
+
+    <footer class="sd-actions">
+      <div class="sd-actions-left">
+        <div class="sd-kite">
+          <button id="sd-kite-open" class="btn btn-outline" type="button"></button>
+          <button id="sd-kite-more" class="btn btn-outline sd-kite-more" type="button"
+                  aria-haspopup="true" aria-expanded="false" title="Other chart options">▾</button>
+          <div id="sd-kite-menu" class="sd-kite-menu" hidden role="menu"></div>
+        </div>
+        <span id="sd-kite-note" class="muted-note"></span>
+      </div>
+      <div class="sd-actions-right">
+        <span id="sd-exec-note" class="exec-note"></span>
+        <button id="sd-reject" class="btn btn-outline-danger">Reject</button>
+        <button id="sd-approve" class="btn btn-success">Approve &amp; place</button>
+      </div>
+    </footer>
+  </div>
+
   <dialog id="ticket-confirm-dialog" class="ticket-dialog">
     <h2 id="ticket-confirm-title">Confirm Trade Ticket</h2>
     <div id="ticket-confirm-body" class="ticket-confirm-body"></div>
@@ -1307,6 +1370,14 @@
   <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.2/Sortable.min.js"></script>
+  <!-- TradingView Lightweight Charts (Apache-2.0), used only by the Signal
+       Detail view. Same CDN-script-tag pattern as Sortable above — no bundler,
+       no build step. Pinned to an exact version deliberately: this library
+       changed its series API between v4 and v5, so an unpinned "latest" would
+       break the chart silently on a future release. Not on cdnjs, hence
+       jsDelivr. Loaded before app.js, which checks for the global and
+       degrades to a readable message if the CDN is unreachable. -->
+  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

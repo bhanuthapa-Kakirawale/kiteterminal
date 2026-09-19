@@ -6,7 +6,7 @@ from datetime import date
 from kiteconnect import KiteConnect
 from kiteconnect.exceptions import KiteException
 
-from backend import config, execution, indicators, instruments, market, risk_engine
+from backend import config, execution, indicators, instruments, kite_chart, market, risk_engine
 from backend.db import get_connection
 from backend.strategies import STRATEGIES
 from backend.watchlist import list_watchlist
@@ -17,6 +17,28 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------
 # Config (strategy_configs table) — generic across every registered module
 # --------------------------------------------------------------------------
+
+def params_with_defaults(strategy_name: str, stored: dict) -> dict:
+    """A stored params dict, backfilled with any key its module has since
+    gained.
+
+    Strategy parameters are persisted as a JSON blob written at the time the
+    config was last saved. When a new parameter is introduced — as
+    trend_pullback's `volume_multiple` was — every config saved before that
+    point lacks the key, and a module reading `params["volume_multiple"]`
+    raises KeyError on a live scan. The failure is silent until the nightly
+    autopilot run, which is the worst possible moment to discover it.
+
+    Backfilling on READ (rather than migrating every row) means a module can
+    add a parameter without a schema migration, and an older config keeps
+    working with the module's own default for anything it does not mention.
+    Stored values always win; only absent keys are filled.
+    """
+    module = STRATEGIES.get(strategy_name)
+    if module is None:
+        return dict(stored)
+    return {**dict(module.DEFAULT_PARAMS), **(stored or {})}
+
 
 def get_config(conn: sqlite3.Connection, account_id: int, strategy_name: str) -> dict:
     row = conn.execute(
@@ -30,7 +52,9 @@ def get_config(conn: sqlite3.Connection, account_id: int, strategy_name: str) ->
             "updated_at": None, "current_version": None, "last_disabled_at": None,
         }
     return {
-        "enabled": bool(row["enabled"]), "params": json.loads(row["params"]), "updated_at": row["updated_at"],
+        "enabled": bool(row["enabled"]),
+        "params": params_with_defaults(strategy_name, json.loads(row["params"])),
+        "updated_at": row["updated_at"],
         "current_version": row["current_version"], "last_disabled_at": row["last_disabled_at"],
     }
 
@@ -195,7 +219,8 @@ def run_entry_scan(
     risk engine. Returns the created ticket ids; `diagnostics` (if given) is
     filled with why symbols were not evaluated."""
     diag = diagnostics if diagnostics is not None else {}
-    diag.update({"evaluated": 0, "insufficient_history": [], "stale_data": [], "already_signalled": []})
+    diag.update({"evaluated": 0, "insufficient_history": [], "stale_data": [], "already_signalled": [],
+                 "qualified": 0, "kept": 0})
     last_session = market.last_complete_session_date()
     min_history = max(params.get("trend_filter_period", 2), 2)
 
@@ -220,8 +245,22 @@ def run_entry_scan(
             "symbol": w["symbol"], "instrument_token": w["instrument_token"], "signal_date": signal_date, **result,
         })
 
+    # How competitive the day was is only knowable HERE — once the list is
+    # truncated, "this signal barely made the cut" versus "it was the only
+    # candidate all day" is unrecoverable. Both readings matter to someone
+    # deciding whether to approve, so the surviving candidates carry their
+    # own rank and the size of the field they beat.
+    qualified_count = len(candidates)
+    cap = params["max_signals_per_day"]
     candidates.sort(key=module.rank_key, reverse=True)
-    candidates = candidates[: params["max_signals_per_day"]]
+    candidates = candidates[:cap]
+    for position, candidate in enumerate(candidates, start=1):
+        candidate["rank_position"] = position
+        candidate["rank_value"] = module.rank_key(candidate)
+        candidate["qualified_count"] = qualified_count
+        candidate["max_signals_per_day"] = cap
+    diag["qualified"] = qualified_count
+    diag["kept"] = len(candidates)
 
     created_ids = []
     for c in candidates:
@@ -229,6 +268,55 @@ def run_entry_scan(
         if ticket_id is not None:
             created_ids.append(ticket_id)
     return created_ids
+
+
+def _build_entry_evaluation(
+    module, candidate: dict, params: dict, strategy_version: int | None,
+    levels_raw: dict, tick: float, sizing: dict, quantity: int,
+) -> dict:
+    """The structured record persisted to trade_tickets.entry_evaluation.
+
+    Everything in it comes from the evaluation that actually produced this
+    signal — the conditions list and marker bars are taken straight off the
+    module's own evaluate_entry result, never re-derived, so the Signal
+    Detail view cannot end up explaining a different evaluation than the one
+    that fired. The params snapshot is included because a signal approved
+    three days after a parameter change must still be explainable against
+    the thresholds it was actually judged by.
+
+    `levels_raw` and `tick` are captured specifically so the detail view can
+    show WHERE a number changed: the stored levels are already snapped onto
+    the exchange tick grid, and without the pre-snap values there is no way
+    to tell afterwards whether a stop moved by a paisa or by a rupee. Same
+    reasoning for `sizing`, which holds the two competing quantity limits
+    before the floor() that produced the final integer.
+    """
+    return {
+        "strategy_name": module.STRATEGY_NAME,
+        "strategy_label": getattr(module, "STRATEGY_LABEL", module.STRATEGY_NAME),
+        "strategy_version": strategy_version,
+        "signal_date": candidate.get("signal_date"),
+        "signal_close": candidate.get("close"),
+        "atr_14": candidate.get("atr_14"),
+        "conditions": candidate.get("conditions", []),
+        "markers": candidate.get("markers", []),
+        "rank": {
+            "position": candidate.get("rank_position"),
+            "value": candidate.get("rank_value"),
+            "qualified_count": candidate.get("qualified_count"),
+            "max_signals_per_day": candidate.get("max_signals_per_day", params.get("max_signals_per_day")),
+        },
+        "sizing": {
+            "portfolio_value": sizing.get("portfolio_value"),
+            "risk_based_qty": sizing.get("risk_based_qty"),
+            "capital_based_qty": sizing.get("capital_based_qty"),
+            "quantity": quantity,
+            "entry_price_buffer_pct": config.ENTRY_PRICE_BUFFER_PCT,
+        },
+        "levels_raw": levels_raw,
+        "tick_size": tick,
+        "params": dict(params),
+    }
 
 
 def _create_entry_ticket(
@@ -274,6 +362,11 @@ def _create_entry_ticket(
         "stop_loss": stop_loss, "target_1": target_1, "target_2": None,
     })
     strategy_version = _current_strategy_version(conn, account["id"], module.STRATEGY_NAME)
+    entry_evaluation = _build_entry_evaluation(
+        module, candidate, params, strategy_version, levels, tick, sizing, quantity)
+    chart = kite_chart.resolve_and_log(
+        conn, account["id"], candidate["symbol"], "NSE", candidate["instrument_token"],
+    )
 
     cursor = conn.execute(
         """
@@ -283,9 +376,10 @@ def _create_entry_ticket(
             stop_loss, target_1, target_2,
             trailing_enabled, trailing_trigger, trailing_distance,
             product_type, use_gtt, risk_amount, risk_reward_ratio,
-            rationale, status, rule_checklist, signal_date
+            rationale, status, rule_checklist, signal_date,
+            entry_evaluation, kite_chart_url, kite_chart_status
         ) VALUES (?, 'strategy', ?, ?, ?, 'NSE', ?, 'BUY', ?, ?, 'LIMIT', ?, ?, NULL,
-                  ?, ?, ?, 'CNC', 1, ?, ?, ?, 'draft', ?, ?)
+                  ?, ?, ?, 'CNC', 1, ?, ?, ?, 'draft', ?, ?, ?, ?, ?)
         """,
         (
             account["id"], module.STRATEGY_NAME, strategy_version, candidate["symbol"], candidate["instrument_token"],
@@ -293,6 +387,7 @@ def _create_entry_ticket(
             int(trailing_enabled), "after_target_1" if trailing_enabled else None, trailing_distance,
             metrics["risk_amount"], metrics["risk_reward_ratio"], rationale,
             json.dumps(candidate["checklist"]), candidate.get("signal_date"),
+            json.dumps(entry_evaluation), chart["url"], chart["status"],
         ),
     )
     ticket_id = cursor.lastrowid
@@ -586,7 +681,7 @@ def run_daily_scans(account: sqlite3.Row, kite: KiteConnect) -> dict:
             if module is None:
                 logger.warning("strategy_configs row references unknown strategy_name %r; skipping", row["strategy_name"])
                 continue
-            enabled.append((module, json.loads(row["params"])))
+            enabled.append((module, params_with_defaults(row["strategy_name"], json.loads(row["params"]))))
         if not enabled:
             return {"enabled": False}
 

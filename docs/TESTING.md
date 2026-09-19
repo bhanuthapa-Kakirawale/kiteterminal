@@ -47,11 +47,23 @@ step, and writes `e2e_results.json` with pass/fail results.
   instruments. Records every call for assertion and supports `fail_next` to
   simulate a broker error on demand.
 - **`tests/demo_server.py`** — a standalone runnable instance of the real
-  app against a throwaway DB and a synthetic 8-symbol universe with
+  app against a throwaway DB and a synthetic 10-symbol universe with
   realistic seeded state (pending signals, a risk-blocked signal, two open
   live positions with GTTs, a pending exit signal, a pending breakeven
   adjustment, historical closed trades, and autopilot run history). Useful
   both for manual exploration and as the E2E test target.
+  Its entry signals are **not** hand-written rows: each symbol's candle tail
+  is shaped to trigger a particular strategy and the real
+  `strategy_engine.run_entry_scan` is then run, so every seeded signal
+  carries a genuine entry-evaluation record, a generated rationale, a
+  resolved Kite chart URL, and price levels that actually sit on the candles
+  a chart will plot. Deliberately included: at least one signal per
+  strategy, a risk-blocked signal (TCS, held in size so single-stock
+  exposure fails), a symbol with **no** sector mapping (NEWLISTCO, so the
+  skipped sector check can be seen), and four momentum candidates against a
+  cap of three so one qualifying signal is always dropped.
+  Note the E2E suite is destructive — it approves, rejects and confirms
+  seeded items — so start a fresh demo server for each run.
 
 ### 1.4 What's covered
 
@@ -68,6 +80,39 @@ duplicate handling, strategy config versioning, an end-to-end "scan now"
 producing a real breakout signal, the backtest endpoint (including
 walk-forward and Monte Carlo options), journal endpoints, reconciliation
 listing/review, and trailing-engine ratchet plus vanished-GTT detection.
+
+**`test_signal_detail.py`** — the Signal Detail view's backend:
+- `GET /api/tickets/{id}/chart` returns candles, the strategy-appropriate
+  indicator series, the ticket's own levels and the marker bars, for a
+  signal produced by a real scan.
+- That endpoint makes **no** Kite call at all (asserted against FakeKite's
+  recorded calls), proving it reads from `ohlc_daily`.
+- Its auth gate (403 on a non-trading account) and account scoping (404 on
+  another account's ticket).
+- Insufficient history, and no history at all, return clean diagnostics
+  alongside the candles that do exist — never a 500.
+- The RSI subpanel carries both the 35 entry and 55 exit threshold lines.
+- The exit plan states the thesis-invalidation rule without inventing an
+  "armed" flag for a signal that has not been executed yet.
+- Rank against the daily cap is captured at scan time and exposed.
+- Kite URL construction: the TradingView and ChartIQ variants, non-EQ series
+  suffixes preserved (`-BE`, `-RR`, `-IV`), NSE/BSE dual listing resolving
+  on the ticket's own exchange, an unresolvable symbol producing a disabled
+  link plus a `system_events` row, a stale instrument cache still producing
+  a link but flagged, a corporate-action rename falling back to the
+  ticket's own token, and all four fallback tiers in order.
+- The URL is stored at ticket-creation time, and backfilled on first view
+  for tickets that predate the feature.
+- The entry-evaluation record is persisted for all three strategies, its
+  rows match the rules in DESIGN.md §6, its conditions AND up to the
+  module's own `passed`, and the card's one-line description is generated
+  from that same record.
+- `rsi_mean_reversion` entry and exit unit coverage, including its hard
+  trend filter, its RSI-recovery exit being evaluated before the shared
+  checks, and its stop being the tighter of the swing low and the ATR
+  level.
+- A manual ticket (no evaluation record) and a malformed record both
+  degrade gracefully rather than breaking the ticket list.
 
 **`test_review_changes.py`** — a regression suite guarding specific
 previously-fixed behaviors:
@@ -94,6 +139,13 @@ previously-fixed behaviors:
   exactly once when needed.
 - Autopilot: full pipeline success, skip-on-no-new-candle, `is_due`
   scheduling/retry/catch-up logic, and the manual `run-now` endpoint.
+- The September 2026 parameter revision: the revised defaults are pinned (so
+  a silent edit back to the old loss-making values fails loudly),
+  `backend/db.py`'s duplicated copy of those defaults is asserted equal to
+  the modules' own, `trend_pullback`'s new volume filter is shown to reject
+  an otherwise-valid pullback on thin volume, and a config blob saved
+  *before* that parameter existed is shown to backfill rather than crash a
+  live scan.
 
 **`e2e_ui.py`** (Playwright) — exercises the real UI end to end: app load
 and the approvals badge, every sidebar section routing correctly,
@@ -104,6 +156,15 @@ curve, the Orders GTT book, theme toggle persistence across reload,
 hash-based deep linking, triggering autopilot from the UI, the emergency
 exit typed-phrase gate, responsive layout at 820px width (no horizontal
 overflow), and zero JavaScript console/page errors.
+It also opens the **Signal Detail** view from an approvals card and asserts
+the chart canvas renders, the three entry/stop/target price lines were
+drawn, the six named risk-check rows and the itemised entry conditions are
+present, the sizing derivation and exit plan are shown, the execution mode
+is called out, the chart re-themes when the theme is toggled, ←/→ move
+between pending signals without closing, there is no horizontal overflow at
+820px, and Escape closes the view. (Price lines and chart colours are
+painted into a canvas, so those two are asserted through the view's own
+read-only `window.__signalDetail` handle rather than against the DOM.)
 
 ### 1.5 Known coverage gaps
 
@@ -117,12 +178,8 @@ manually (see §2):
 - `backtest_analytics.py`'s Sharpe/Sortino/Monte Carlo math is only
   exercised indirectly through the backtest endpoint test, not directly
   with known-answer inputs.
-- `rsi_mean_reversion` has no dedicated entry/exit unit test — only
-  `momentum_breakout` and `trend_pullback` are directly exercised via
-  scan-now/backtest tests.
 - No test for dashboard panel reordering edge cases beyond a single field
   change.
-- No negative/permission test for a non-trading Kite account type.
 - No test of the `/ws/ticks` WebSocket tick delivery itself.
 - No load or rate-limit test for the Kite historical-data queue.
 
@@ -198,6 +255,31 @@ For **each** of the three strategies (`momentum_breakout`,
 - [ ] Advance to a new trading day (or use `demo_server.py`'s seeded data)
       and confirm an old, still-pending signal computed from a stale
       candle is auto-expired rather than approved against stale prices.
+
+For each signal a scan produces, open its **Signal Detail** view from
+Approvals (the **Chart** link on the card) and confirm:
+
+- [ ] **The chart's plotted indicator values match the values the strategy
+      claims it used.** Hover the signal bar and compare the tooltip's
+      indicator readings against the numbers in the Entry Conditions panel
+      — the SMA-200 in "Uptrend filter", the Donchian level in "Donchian
+      breakout", the 20-EMA in "Pullback to 20-EMA", the RSI-14 in "RSI
+      oversold". Both come from the same `indicators.py` functions and must
+      agree exactly. A disagreement means the chart and the strategy are
+      reading different data — investigate before trusting either.
+- [ ] The entry/stop/target lines sit at the prices the card states, and
+      the red/green shading is proportional to the stated R:R.
+- [ ] The marked bars really are the ones the strategy keyed off — for
+      `trend_pullback`, check by hand that the marked pullback bar's low is
+      within the band of *that bar's own* 20-EMA, not today's.
+- [ ] Position sizing reproduces by hand: risk per share × quantity equals
+      the stated risk, and quantity is the floor of the risk budget divided
+      by risk per share.
+- [ ] For a symbol with no sector mapping, the sector risk check renders as
+      *skipped*, not as a pass.
+- [ ] "Open in Kite" opens the correct symbol's chart, and a symbol that
+      cannot be resolved shows the button disabled with a stated reason
+      rather than a dead link.
 
 ### 2.5 Live-mode-only checks (use extreme caution — real money)
 
@@ -277,3 +359,12 @@ code changes:
 3. For any strategy parameter change, run a fresh backtest and compare
    headline statistics (win rate, expectancy, drawdown) against the
    pre-change baseline before enabling it live.
+4. Judge any such change **net of transaction costs**. `backend/backtest.py`
+   models none, and on ATR-based stops a round trip is roughly 0.08–0.10R —
+   enough on its own to turn a gross-positive strategy net-negative. The
+   September 2026 revision found all three shipped strategies looking
+   merely mediocre on gross numbers and clearly losing once costs applied.
+5. Prefer a parameter in the middle of a broad plateau over the single best
+   point of a grid, and require it to hold in both halves of the sample. A
+   value that only works on one half, or that degrades sharply one notch
+   either side, is curve-fitting rather than a finding.

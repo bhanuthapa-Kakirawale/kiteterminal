@@ -60,6 +60,7 @@ const API = {
     return fetchJson(`/api/tickets${qs ? `?${qs}` : ""}`);
   },
   getTicket: (id) => fetchJson(`/api/tickets/${id}`),
+  getTicketChart: (id) => fetchJson(`/api/tickets/${id}/chart`),
   createTicket: (body) => fetchJsonMutate("/api/tickets", "POST", body),
   createAlertActionSell: (body) => fetchJsonMutate("/api/tickets/alert-action/sell", "POST", body),
   createAlertActionBuy: (body) => fetchJsonMutate("/api/tickets/alert-action/buy", "POST", body),
@@ -212,6 +213,33 @@ const el = {
   tfShowArchived: document.getElementById("tf-show-archived"),
   tfApplyBtn: document.getElementById("tf-apply-btn"),
   tfClearBtn: document.getElementById("tf-clear-btn"),
+
+  // Signal Detail view
+  signalDetail: document.getElementById("signal-detail"),
+  sdSide: document.getElementById("sd-side"),
+  sdSymbol: document.getElementById("sd-symbol"),
+  sdStrategy: document.getElementById("sd-strategy"),
+  sdSignalDate: document.getElementById("sd-signal-date"),
+  sdModePill: document.getElementById("sd-mode-pill"),
+  sdLtp: document.getElementById("sd-ltp"),
+  sdLtpChange: document.getElementById("sd-ltp-change"),
+  sdAsof: document.getElementById("sd-asof"),
+  sdPrev: document.getElementById("sd-prev"),
+  sdNext: document.getElementById("sd-next"),
+  sdPosition: document.getElementById("sd-position"),
+  sdClose: document.getElementById("sd-close"),
+  sdTheme: document.getElementById("sd-theme"),
+  sdToggles: document.getElementById("sd-toggles"),
+  sdChart: document.getElementById("sd-chart"),
+  sdChartNote: document.getElementById("sd-chart-note"),
+  sdEvidenceInner: document.getElementById("sd-evidence-inner"),
+  sdKiteOpen: document.getElementById("sd-kite-open"),
+  sdKiteMore: document.getElementById("sd-kite-more"),
+  sdKiteMenu: document.getElementById("sd-kite-menu"),
+  sdKiteNote: document.getElementById("sd-kite-note"),
+  sdExecNote: document.getElementById("sd-exec-note"),
+  sdApprove: document.getElementById("sd-approve"),
+  sdReject: document.getElementById("sd-reject"),
 
   ticketDetailDialog: document.getElementById("ticket-detail-dialog"),
   ticketDetailBody: document.getElementById("ticket-detail-body"),
@@ -2481,6 +2509,7 @@ function connectTickWs() {
     if (msg.type === "ticks") {
       for (const tick of msg.data) {
         applyTick(tick);
+        sdApplyTick(tick);
         document
           .querySelectorAll(`tr[data-instrument-token="${tick.instrument_token}"] .num`)
           .forEach(flashCell);
@@ -2584,9 +2613,14 @@ function executionNote(t) {
   return { live, text: `LIVE — approving sends ${how}${gtt}. This uses real money.` };
 }
 
-function riskCheckRowHtml(c) {
+function riskCheckRowHtml(c, { withLinks = false } = {}) {
   const icon = c.skipped ? "⚠" : c.passed ? "✓" : "✗";
   const cls = c.skipped ? "skipped" : c.passed ? "passed" : "failed";
+  // A skipped sector check is NOT a pass — the symbol simply has no sector
+  // mapped, so the limit was never applied. The detail panel says so and
+  // points at the screen where that is fixed.
+  const fix = withLinks && c.skipped && c.rule === "max_sector_exposure_pct"
+    ? ` <a class="sd-fix-link" href="#settings" data-sd-close="1">Settings → Sector mappings</a>` : "";
   let value;
   if (c.skipped || c.actual_value === null || c.actual_value === undefined) {
     // Non-numeric checks (e.g. an exit ticket's "position validated"
@@ -2600,17 +2634,22 @@ function riskCheckRowHtml(c) {
   } else {
     value = `${c.actual_value.toFixed(1)}% (max ${c.limit_value}%)`;
   }
-  return `<div class="risk-check-row ${cls}"><span class="icon">${icon}</span><span>${esc(c.label)}</span><strong>${esc(value)}</strong></div>`;
+  const shown = c.skipped && withLinks ? `skipped — ${value}` : value;
+  return `<div class="risk-check-row ${cls}"><span class="icon">${icon}</span><span>${esc(c.label)}</span><strong>${esc(shown)}${fix}</strong></div>`;
+}
+
+// Extracted so the Signal Detail panel's RISK CHECKS section renders through
+// the exact same rows as the confirm dialog — expanding the "6/6" badge into
+// named checks must never become a second, subtly different renderer.
+function riskCheckSectionHtml(checks, heading = "Risk checks", options = {}) {
+  if (!checks || checks.length === 0) return "";
+  const passed = checks.filter((c) => c.passed).length;
+  return `<h3>${esc(heading)} · ${passed}/${checks.length} passed</h3>`
+    + checks.map((c) => riskCheckRowHtml(c, options)).join("");
 }
 
 function renderRiskCheckSection(checks) {
-  if (!checks || checks.length === 0) {
-    el.ticketRiskCheckBody.innerHTML = "";
-    return;
-  }
-  const passed = checks.filter((c) => c.passed).length;
-  el.ticketRiskCheckBody.innerHTML = `<h3>Risk checks · ${passed}/${checks.length} passed</h3>`
-    + checks.map(riskCheckRowHtml).join("");
+  el.ticketRiskCheckBody.innerHTML = riskCheckSectionHtml(checks);
 }
 
 function openConfirmDialog(ticket) {
@@ -3686,6 +3725,10 @@ function renderApprovals() {
     ? "1 decision is waiting for your approval."
     : `${total} decisions are waiting for your approval.`;
   document.title = total ? `(${total}) Kite Terminal` : "Kite Terminal";
+  // The Signal Detail view reads its ticket and its ←/→ queue out of
+  // state.approvals, so this is the single point at which it learns that a
+  // tickets_changed broadcast has changed either (D8).
+  sdOnTicketsChanged();
 }
 
 function metricHtml(label, value, cls = "") {
@@ -3713,10 +3756,16 @@ function approvalCardHtml(t, kind) {
         metricHtml("R : R", t.risk_reward_ratio != null ? `1 : ${t.risk_reward_ratio.toFixed(2)}` : "—"),
         metricHtml("Trailing", t.trailing_enabled ? `${inr(t.trailing_distance)} after T1` : "Off"),
       ];
+  // Chart links on entry signals only: the Signal Detail view answers "do I
+  // trust this entry enough to place it", which is not the question an exit
+  // signal or a stop adjustment poses.
+  const chartLinks = isExit ? "" : chartLinksHtml(t);
   const actions = kind === "blocked"
-    ? `<button class="btn btn-ghost btn-small" data-action="details">Why blocked?</button>
+    ? `${chartLinks}
+       <button class="btn btn-ghost btn-small" data-action="details">Why blocked?</button>
        <button class="btn btn-ghost btn-small" data-action="archive">Archive</button>`
-    : `<button class="btn btn-ghost btn-small" data-action="details">Details</button>
+    : `${chartLinks}
+       <button class="btn btn-ghost btn-small" data-action="details">Details</button>
        <button class="btn btn-outline-danger btn-small" data-action="reject">Reject</button>
        <button class="btn btn-success btn-small" data-action="approve">${isExit ? "Approve exit" : "Approve &amp; place"}</button>`;
   let checkLine = "";
@@ -3804,7 +3853,13 @@ el.viewApprovals.addEventListener("click", async (event) => {
   const a = state.approvals;
   const ticket = [...a.entries, ...a.exits, ...a.blocked].find((t) => t.id === id);
   if (!ticket) return;
-  if (action === "details") {
+  if (action === "chart") {
+    openSignalDetail(ticket);
+  } else if (action === "kite") {
+    const primary = (ticket.kite_chart?.options || []).find((o) => o.key === "kite_tvc");
+    if (primary?.enabled && primary.url) window.open(primary.url, "_blank", "noopener");
+    else toast(primary?.reason || "No Kite chart link could be resolved for this symbol.", { type: "warning" });
+  } else if (action === "details") {
     openConfirmDialog(ticket);
   } else if (action === "approve") {
     const live = state.executionMode === "live";
@@ -3835,6 +3890,827 @@ el.viewApprovals.addEventListener("click", async (event) => {
 el.apRefreshBtn.addEventListener("click", () => refreshTicketViews());
 el.dashApprovalsOpen.addEventListener("click", () => showSection("approvals"));
 el.autopilotPill.addEventListener("click", () => showSection("approvals"));
+
+// =====================================================================
+// Signal Detail — the full-screen "why this signal" workspace.
+//
+// Deliberately NOT built on #ticket-confirm-dialog: that dialog is a modal
+// prompt shared with the New Ticket form, and this is a two-pane workspace
+// with its own chart lifecycle and keyboard navigation between signals.
+// What it DOES reuse is everything that matters for correctness — the same
+// riskCheckRowHtml rows, the same confirmAction() dialog, and the same
+// approveTicket()/rejectTicketById() handlers that post to
+// /api/tickets/{id}/confirm. There is no second execution path here.
+// =====================================================================
+
+// How the one pane is divided between price and its subpanels, as
+// scaleMargins ({top, bottom} fractions of the pane). Keyed by subpanel count:
+// every strategy gets volume, and rsi_mean_reversion additionally gets RSI.
+// The price scale stays linear across the whole pane, so its axis labels keep
+// going underneath the subpanels; leaving too much room below price makes it
+// extrapolate down to meaningless (even negative) prices. These margins keep
+// the subpanels readable without pushing that extrapolation absurd.
+const SD_SCALE_BANDS = {
+  1: { price: { top: 0.06, bottom: 0.24 }, panels: [{ top: 0.80, bottom: 0.02 }] },
+  2: {
+    price: { top: 0.05, bottom: 0.38 },
+    panels: [{ top: 0.63, bottom: 0.20 }, { top: 0.84, bottom: 0.02 }],
+  },
+};
+
+// Short on-chart captions; the full label and detail live in the tooltip.
+const SD_MARKER_TEXT = {
+  pullback: "Pullback", recovery: "Recovery", breakout: "Breakout",
+  signal: "Signal", swing_low: "Swing low",
+};
+
+const SD_MARKER_COLOURS = {
+  pullback: "--accent-amber", recovery: "--pnl-positive",
+  breakout: "--pnl-positive", signal: "--accent", swing_low: "--pnl-negative",
+};
+
+const sd = {
+  ticket: null,
+  data: null,
+  chart: null,
+  priceSeries: null,
+  series: new Map(),   // key -> { api, spec }
+  hidden: new Set(),   // series keys the user has toggled off
+  queue: [],           // pending entry-signal ticket ids, for ←/→
+  ltp: null,
+  prevClose: null,
+  resizeObserver: null,
+  disposed: true,
+  priceLines: [],      // entry/stop/target, kept for assertion in tests/e2e_ui.py
+  buildCount: 0,       // increments per chart build, so a re-theme is observable
+};
+
+// Deliberate, read-only handle for the Playwright driver in tests/e2e_ui.py.
+// Price lines and chart colours are painted into a canvas, so there is no DOM
+// for a browser test to assert against; without this the E2E check could only
+// confirm that *a* canvas exists, not that the three levels were drawn or that
+// a theme toggle actually re-rendered them.
+window.__signalDetail = sd;
+
+function chartLinksHtml(t) {
+  const chart = t.kite_chart || {};
+  const primary = (chart.options || []).find((o) => o.key === "kite_tvc");
+  const kiteEnabled = primary && primary.enabled && primary.url;
+  const kiteTitle = kiteEnabled
+    ? "Open this symbol's chart on kite.zerodha.com (needs an active Kite web session)"
+    : (primary && primary.reason) || "No Kite chart link could be resolved for this symbol.";
+  return `<button class="btn btn-ghost btn-small" data-action="chart" title="Annotated chart and the full evidence trail">Chart</button>
+    <button class="btn btn-ghost btn-small" data-action="kite" title="${esc(kiteTitle)}"${kiteEnabled ? "" : " disabled"}>Kite</button>`;
+}
+
+// ---- theme ----------------------------------------------------------
+// Every colour the chart draws is read from the live CSS custom properties,
+// so the chart is themed by the same tokens as the rest of the app and can
+// be re-themed by simply re-reading them after the toggle flips.
+function sdToken(name, fallback = "#888") {
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name);
+  return (value || "").trim() || fallback;
+}
+
+function sdChartTheme() {
+  return {
+    text: sdToken("--text-secondary"),
+    grid: sdToken("--border"),
+    border: sdToken("--border-strong"),
+    up: sdToken("--pnl-positive"),
+    down: sdToken("--pnl-negative"),
+    crosshair: sdToken("--text-muted"),
+  };
+}
+
+// ---- open / close ---------------------------------------------------
+
+function sdPendingQueue() {
+  const entries = state.approvals?.entries ?? [];
+  return entries.filter((t) => t.closes_ticket_id == null).map((t) => t.id);
+}
+
+async function openSignalDetail(ticket) {
+  sd.ticket = ticket;
+  sd.queue = sdPendingQueue();
+  sd.hidden = new Set();
+  sd.disposed = false;
+  el.signalDetail.hidden = false;
+  document.body.classList.add("sd-open");
+  el.sdEvidenceInner.innerHTML = `<div class="empty-row">Loading the evidence trail…</div>`;
+  el.sdChartNote.hidden = true;
+  sdRenderHeader(ticket, null);
+
+  try {
+    sd.data = await API.getTicketChart(ticket.id);
+  } catch (e) {
+    sd.data = null;
+    el.sdEvidenceInner.innerHTML = `<div class="sd-section"><h3>Could not load this signal</h3>
+      <p class="muted-note">${esc(e.message)}</p></div>`;
+    return;
+  }
+  if (sd.disposed) return;
+  sdRenderHeader(ticket, sd.data);
+  sdRenderEvidence();
+  sdRenderActions();
+  sdBuildChart();
+}
+
+function closeSignalDetail() {
+  sd.disposed = true;
+  sdDestroyChart();
+  el.signalDetail.hidden = true;
+  el.sdKiteMenu.hidden = true;
+  el.sdKiteMore.setAttribute("aria-expanded", "false");
+  document.body.classList.remove("sd-open");
+  sd.ticket = null;
+  sd.data = null;
+}
+
+function sdDestroyChart() {
+  if (sd.resizeObserver) {
+    sd.resizeObserver.disconnect();
+    sd.resizeObserver = null;
+  }
+  if (sd.chart) {
+    sd.chart.remove();
+    sd.chart = null;
+  }
+  sd.priceSeries = null;
+  sd.series.clear();
+  el.sdChart.innerHTML = "";
+}
+
+// ---- header ---------------------------------------------------------
+
+function sdSeedPrice(symbol, token) {
+  // Seeded from data the app already holds so the header is populated
+  // immediately, then kept live by the existing /ws/ticks subscription —
+  // this view never opens a second socket, and never calls the broker.
+  const holding = (state.holdings || []).find((h) => h.instrument_token === token);
+  const watched = (state.watchlist || []).find((w) => w.instrument_token === token);
+  const source = holding || watched;
+  sd.ltp = source?.last_price ?? null;
+  sd.prevClose = holding?.close_price ?? watched?.last_close ?? null;
+}
+
+function sdRenderHeader(ticket, data) {
+  el.sdSide.innerHTML = sideHtml(ticket.transaction_type);
+  el.sdSymbol.textContent = ticket.symbol;
+  el.sdStrategy.innerHTML = originChipHtml(ticket);
+  el.sdSignalDate.textContent = ticket.signal_date ? `signal ${fmtDate(ticket.signal_date)}` : "";
+  el.sdSignalDate.hidden = !ticket.signal_date;
+
+  const mode = data?.execution_mode ?? state.executionMode;
+  el.sdModePill.innerHTML = mode === "live"
+    ? `<span class="chip live">LIVE — real money</span>`
+    : `<span class="chip dry">DRY RUN — simulated</span>`;
+
+  sdSeedPrice(ticket.symbol, ticket.instrument_token);
+  sdRenderLtp();
+
+  el.sdAsof.textContent = data?.freshness?.last_candle_date
+    ? fmtDate(data.freshness.last_candle_date) : "—";
+
+  const index = sd.queue.indexOf(ticket.id);
+  el.sdPosition.textContent = sd.queue.length > 1 && index >= 0
+    ? `${index + 1} of ${sd.queue.length}` : "";
+  const single = sd.queue.length < 2;
+  el.sdPrev.disabled = single;
+  el.sdNext.disabled = single;
+}
+
+function sdRenderLtp() {
+  if (sd.ltp == null) {
+    el.sdLtp.textContent = "—";
+    el.sdLtpChange.textContent = computeMarketStatus() === "open" ? "waiting for a tick" : "market closed";
+    el.sdLtpChange.className = "sd-ltp-change muted-note";
+    return;
+  }
+  el.sdLtp.textContent = inr(sd.ltp);
+  if (sd.prevClose) {
+    const pct = ((sd.ltp - sd.prevClose) / sd.prevClose) * 100;
+    el.sdLtpChange.textContent = `${pct >= 0 ? "+" : ""}${fmt(pct, 2)}%`;
+    el.sdLtpChange.className = `sd-ltp-change ${pnlClass(pct)}`;
+  } else {
+    el.sdLtpChange.textContent = "";
+    el.sdLtpChange.className = "sd-ltp-change";
+  }
+}
+
+// Called from the existing /ws/ticks handler — no second socket (C4).
+function sdApplyTick(tick) {
+  if (el.signalDetail.hidden || !sd.ticket) return;
+  if (tick.instrument_token !== sd.ticket.instrument_token) return;
+  sd.ltp = tick.last_price;
+  if (tick.close_price) sd.prevClose = tick.close_price;
+  sdRenderLtp();
+  sdRenderContextSection();
+}
+
+// ---- chart ----------------------------------------------------------
+
+function sdBuildChart() {
+  sdDestroyChart();
+  if (!window.LightweightCharts) {
+    el.sdChartNote.hidden = false;
+    el.sdChartNote.textContent =
+      "The charting library could not be loaded from its CDN, so the chart cannot be drawn. "
+      + "The evidence panel on the right is served by this app and is unaffected.";
+    return;
+  }
+  const data = sd.data;
+  if (!data || !data.candles.length) {
+    el.sdChartNote.hidden = false;
+    el.sdChartNote.textContent = data?.diagnostic?.message || "No candles are available for this symbol.";
+    el.sdToggles.innerHTML = "";
+    return;
+  }
+  if (data.diagnostic) {
+    el.sdChartNote.hidden = false;
+    el.sdChartNote.textContent = data.diagnostic.message;
+  }
+
+  const LWC = window.LightweightCharts;
+  const theme = sdChartTheme();
+  sd.buildCount += 1;
+  sd.theme = theme;
+  sd.chart = LWC.createChart(el.sdChart, {
+    width: el.sdChart.clientWidth,
+    height: el.sdChart.clientHeight,
+    layout: {
+      background: { color: "transparent" }, textColor: theme.text, attributionLogo: false,
+      panes: { separatorColor: theme.border, separatorHoverColor: theme.crosshair, enableResize: false },
+    },
+    grid: { vertLines: { color: theme.grid }, horzLines: { color: theme.grid } },
+    rightPriceScale: { borderColor: theme.border },
+    timeScale: { borderColor: theme.border, rightOffset: 4 },
+    crosshair: { mode: LWC.CrosshairMode ? LWC.CrosshairMode.Normal : 0 },
+    localization: { priceFormatter: (p) => p.toLocaleString("en-IN", { maximumFractionDigits: 2 }) },
+  });
+
+  const { entry: lvEntry, stop: lvStop, target: lvTarget } = data.levels;
+  sd.priceSeries = sd.chart.addSeries(LWC.CandlestickSeries, {
+    upColor: theme.up, downColor: theme.down,
+    borderUpColor: theme.up, borderDownColor: theme.down,
+    wickUpColor: theme.up, wickDownColor: theme.down,
+    // Price lines do not participate in autoscale on their own, so a target
+    // above the recent candle range would simply be cropped off the top.
+    autoscaleInfoProvider: (original) => {
+      const base = original();
+      const levels = [lvEntry, lvStop, lvTarget].filter((v) => v != null);
+      if (!base || !base.priceRange || !levels.length) return base;
+      return {
+        ...base,
+        priceRange: {
+          minValue: Math.min(base.priceRange.minValue, ...levels),
+          maxValue: Math.max(base.priceRange.maxValue, ...levels),
+        },
+      };
+    },
+  });
+  sd.priceSeries.setData(data.candles);
+
+  for (const spec of data.overlays) {
+    const api = sd.chart.addSeries(LWC.LineSeries, {
+      color: sdToken(spec.color_token), lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+      visible: !sd.hidden.has(spec.key),
+    });
+    api.setData(spec.data);
+    sd.series.set(spec.key, { api, spec });
+  }
+
+  // Subpanels are stacked into the SAME pane using their own overlay price
+  // scales and scaleMargins, rather than lightweight-charts' multi-pane API.
+  // That is not a stylistic preference: with more than one pane, v5 lays the
+  // panes out ignoring the separator and time-axis rows, overflows its own
+  // container, and stops painting the date labels entirely — a chart you are
+  // using to judge a trade needs its dates. Overlay scales are the library's
+  // own long-standing idiom for a volume subpanel and keep the axis intact.
+  const bands = SD_SCALE_BANDS[data.subpanels.length] || SD_SCALE_BANDS[1];
+  sd.priceSeries.priceScale().applyOptions({ scaleMargins: bands.price });
+
+  data.subpanels.forEach((spec, index) => {
+    const band = bands.panels[index];
+    const type = spec.kind === "histogram" ? LWC.HistogramSeries : LWC.LineSeries;
+    const api = sd.chart.addSeries(type, {
+      color: sdToken(spec.color_token), lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+      visible: !sd.hidden.has(spec.key),
+      priceScaleId: spec.key,
+      ...(spec.kind === "histogram" ? { priceFormat: { type: "volume" } } : {}),
+    });
+    api.priceScale().applyOptions({ scaleMargins: band });
+    api.setData(spec.data);
+    sd.series.set(spec.key, { api, spec });
+
+    if (spec.companion) {
+      // Shares the subpanel's scale, so the average line sits on the volume
+      // bars rather than being rescaled against the price axis.
+      const companion = sd.chart.addSeries(LWC.LineSeries, {
+        color: sdToken(spec.companion.color_token), lineWidth: 2,
+        priceLineVisible: false, lastValueVisible: false,
+        visible: !sd.hidden.has(spec.companion.key),
+        priceScaleId: spec.key,
+      });
+      companion.setData(spec.companion.data);
+      sd.series.set(spec.companion.key, { api: companion, spec: spec.companion });
+    }
+    // RSI's own thresholds ride as price lines on the RSI series itself, so
+    // they stay pinned to its scale rather than the price scale.
+    for (const guide of spec.guides || []) {
+      api.createPriceLine({
+        price: guide.value, color: sdToken(guide.color_token), lineWidth: 1,
+        lineStyle: 2, axisLabelVisible: false, title: guide.label,
+      });
+    }
+  });
+
+  sdDrawLevels();
+  sdDrawMarkers();
+  sdRenderToggles();
+  sdAttachTooltip();
+
+  // Deferred to the next frame: with autoSize the container has no measured
+  // width yet at this point, and a time scale with zero width silently
+  // discards the range, leaving the full 450-bar history on screen with the
+  // recent bars compressed into an illegible smear.
+  requestAnimationFrame(() => {
+    if (!sd.chart) return;
+    // The container has its measured size by now; the initial create used
+    // whatever clientHeight was available synchronously, which can be 0.
+    sdFitChart();
+    const total = data.candles.length;
+    // The older bars stay loaded (and scrollable) because the 200-period
+    // trend line needs them; they just don't need to be on screen.
+    const span = Math.min(total, 120);
+    sd.chart.timeScale().setVisibleLogicalRange({ from: total - span, to: total + 3 });
+    sdPositionZones();
+  });
+
+  sd.resizeObserver = new ResizeObserver(() => {
+    sdFitChart();
+    sdPositionZones();
+  });
+  sd.resizeObserver.observe(el.sdChart);
+}
+
+// lightweight-charts lays multi-pane charts out as a table whose rows are the
+// panes PLUS a separator row between each pair PLUS the time-axis row — but it
+// sizes the panes themselves from the full height it was given, ignoring those
+// extra rows. The table therefore always ends up taller than the box, and what
+// overflows the bottom is the date axis. (enableResize:false stops the
+// separators being draggable but does not shrink them.)
+//
+// So: give the chart its container height, measure how far the table actually
+// overshot, and hand back a height reduced by exactly that much. One
+// corrective pass is enough — the excess is a function of pane count, not of
+// the height. This does not loop with the ResizeObserver above, which watches
+// the container, not the chart's own internal table.
+function sdFitChart() {
+  if (!sd.chart) return;
+  const box = el.sdChart;
+  if (!box.clientWidth || !box.clientHeight) return;
+  sd.chart.resize(box.clientWidth, box.clientHeight);
+  const table = box.querySelector("table");
+  if (!table) return;
+  const excess = Math.round(table.getBoundingClientRect().height) - box.clientHeight;
+  if (excess > 1) sd.chart.resize(box.clientWidth, box.clientHeight - excess);
+}
+
+function sdDrawLevels() {
+  sd.priceLines = [];
+  const { entry, stop, target } = sd.data.levels;
+  const lines = [
+    { price: entry, color: sdToken("--accent"), style: 2, title: `Entry ${inr(entry)}` },
+    { price: stop, color: sdToken("--pnl-negative"), style: 0, title: `Stop ${inr(stop)}` },
+    { price: target, color: sdToken("--pnl-positive"), style: 0, title: `Target ${inr(target)}` },
+  ];
+  for (const line of lines) {
+    if (line.price == null) continue;
+    sd.priceSeries.createPriceLine({
+      price: line.price, color: line.color, lineWidth: 2, lineStyle: line.style,
+      axisLabelVisible: true, title: line.title,
+    });
+    sd.priceLines.push({ title: line.title, price: line.price, color: line.color });
+  }
+  // Risk and reward as shaded bands. lightweight-charts has no band
+  // primitive, so these are absolutely-positioned elements kept in sync with
+  // the price scale — which makes the R:R proportion visible at a glance
+  // instead of something the user has to compute from three numbers.
+  el.sdChart.querySelectorAll(".sd-zone").forEach((n) => n.remove());
+  for (const kind of ["risk", "reward"]) {
+    const zone = document.createElement("div");
+    zone.className = `sd-zone sd-zone-${kind}`;
+    el.sdChart.appendChild(zone);
+  }
+  sdPositionZones();
+  sd.chart.timeScale().subscribeVisibleLogicalRangeChange(sdPositionZones);
+}
+
+function sdPositionZones() {
+  if (!sd.priceSeries || !sd.data) return;
+  const { entry, stop, target } = sd.data.levels;
+  const y = (price) => (price == null ? null : sd.priceSeries.priceToCoordinate(price));
+  const place = (selector, a, b) => {
+    const node = el.sdChart.querySelector(selector);
+    if (!node) return;
+    const top = y(a), bottom = y(b);
+    if (top == null || bottom == null) { node.style.display = "none"; return; }
+    const paneHeight = sd.chart?.panes?.()[0]?.getHeight?.() ?? el.sdChart.clientHeight;
+    const hi = Math.max(Math.min(top, bottom), 0);
+    const lo = Math.min(Math.max(top, bottom), paneHeight);
+    if (lo <= hi) { node.style.display = "none"; return; }
+    node.style.display = "block";
+    node.style.top = `${hi}px`;
+    node.style.height = `${lo - hi}px`;
+  };
+  place(".sd-zone-risk", entry, stop);
+  place(".sd-zone-reward", entry, target);
+}
+
+function sdDrawMarkers() {
+  const markers = (sd.data.markers || []).filter((m) => m.date);
+  if (!markers.length || !window.LightweightCharts?.createSeriesMarkers) return;
+  window.LightweightCharts.createSeriesMarkers(sd.priceSeries, markers.map((m) => ({
+    time: m.date,
+    position: m.kind === "swing_low" || m.kind === "pullback" ? "belowBar" : "aboveBar",
+    color: sdToken(SD_MARKER_COLOURS[m.kind] || "--accent"),
+    shape: m.kind === "swing_low" || m.kind === "pullback" ? "arrowUp" : "arrowDown",
+    text: SD_MARKER_TEXT[m.kind] || m.label,
+  })));
+}
+
+function sdAttachTooltip() {
+  const tip = document.createElement("div");
+  tip.className = "sd-tooltip";
+  tip.hidden = true;
+  el.sdChart.appendChild(tip);
+
+  const markerByDate = new Map((sd.data.markers || []).filter((m) => m.date).map((m) => [m.date, m]));
+  const candleByDate = new Map(sd.data.candles.map((c) => [c.time, c]));
+
+  sd.chart.subscribeCrosshairMove((param) => {
+    const time = param.time;
+    if (!time || !param.point || !candleByDate.has(time)) { tip.hidden = true; return; }
+    const candle = candleByDate.get(time);
+    const rows = [
+      `<div class="sd-tip-head">${esc(fmtDate(time))}</div>`,
+      `<div class="sd-tip-ohlc">O ${inr(candle.open)} · H ${inr(candle.high)} · L ${inr(candle.low)} · C ${inr(candle.close)}</div>`,
+    ];
+    // Every visible indicator's value AT THAT BAR — the point of this view is
+    // checking the strategy's claimed numbers against the plotted ones.
+    for (const { api, spec } of sd.series.values()) {
+      if (sd.hidden.has(spec.key)) continue;
+      const point = param.seriesData.get(api);
+      if (!point || point.value == null) continue;
+      const value = spec.key === "volume" || spec.key === "avg_volume"
+        ? fmt(point.value, 0) : inr(point.value);
+      rows.push(`<div class="sd-tip-row"><span>${esc(spec.label)}</span><strong>${value}</strong></div>`);
+    }
+    const marker = markerByDate.get(time);
+    if (marker) {
+      rows.push(`<div class="sd-tip-marker"><strong>${esc(marker.label)}</strong>${
+        marker.detail ? `<div>${esc(marker.detail)}</div>` : ""}</div>`);
+    }
+    tip.innerHTML = rows.join("");
+    tip.hidden = false;
+    const box = el.sdChart.getBoundingClientRect();
+    const left = Math.min(Math.max(param.point.x + 16, 8), box.width - tip.offsetWidth - 8);
+    tip.style.left = `${left}px`;
+    tip.style.top = `${Math.min(param.point.y + 16, box.height - tip.offsetHeight - 8)}px`;
+  });
+}
+
+function sdRenderToggles() {
+  const specs = [...sd.series.values()].map(({ spec }) => spec);
+  el.sdToggles.innerHTML = specs.map((spec) => `
+    <label class="sd-toggle" title="${esc(spec.description || spec.label)}">
+      <input type="checkbox" data-sd-series="${esc(spec.key)}" ${sd.hidden.has(spec.key) ? "" : "checked"}>
+      <span class="sd-swatch" style="background:${esc(sdToken(spec.color_token))}"></span>
+      ${esc(spec.label)}
+    </label>`).join("");
+}
+
+el.sdToggles.addEventListener("change", (event) => {
+  const key = event.target.dataset?.sdSeries;
+  if (!key) return;
+  const entry = sd.series.get(key);
+  if (!entry) return;
+  if (event.target.checked) sd.hidden.delete(key);
+  else sd.hidden.add(key);
+  entry.api.applyOptions({ visible: event.target.checked });
+});
+
+// ---- evidence panel (D1–D6) -----------------------------------------
+
+function sdSection(id, title, body, { collapsed = false } = {}) {
+  return `<details class="sd-section" id="sd-sec-${id}"${collapsed ? "" : " open"}>
+    <summary><h3>${esc(title)}</h3></summary>
+    <div class="sd-section-body">${body}</div>
+  </details>`;
+}
+
+function sdConditionRowHtml(c) {
+  const icon = c.passed ? "✓" : "✗";
+  return `<div class="sd-cond ${c.passed ? "passed" : "failed"}">
+    <div class="sd-cond-head"><span class="icon">${icon}</span><span class="sd-cond-name">${esc(c.name)}</span>
+      <span class="sd-cond-verdict">${c.passed ? "PASS" : "FAIL"}</span></div>
+    <div class="sd-cond-values"><strong>${esc(c.value_label)}</strong>
+      <span class="sd-cond-op">${esc(c.operator)}</span>
+      <strong>${esc(c.threshold_label)}</strong></div>
+    ${c.detail ? `<div class="sd-cond-detail">${esc(c.detail)}</div>` : ""}
+    <p class="sd-cond-rule">${esc(c.description)}</p>
+  </div>`;
+}
+
+function sdSizingRowHtml(step) {
+  let value = "—";
+  if (step.value != null) {
+    if (step.unit === "inr") value = inr(step.value, step.value % 1 === 0 ? 0 : 2);
+    else if (step.unit === "ratio") value = `1 : ${fmt(step.value, 2)}`;
+    else value = fmt(step.value, 0);
+  }
+  return `<div class="sd-calc-row">
+    <span class="sd-calc-label">${esc(step.label)}</span>
+    <span class="sd-calc-formula">${esc(step.formula)}</span>
+    <strong class="sd-calc-value">${esc(value)}</strong>
+    ${step.note ? `<div class="sd-calc-note">${esc(step.note)}</div>` : ""}
+  </div>`;
+}
+
+function sdRankLine(rank) {
+  if (!rank || rank.position == null) return "";
+  const qualified = rank.qualified_count;
+  const cap = rank.max_signals_per_day;
+  // "Ranked 1 of 2 kept, from 1 candidate" is a confusing way to say the
+  // strategy found exactly one setup — the cap never came into play.
+  if (qualified != null && qualified <= 1) {
+    return `<p class="sd-rank">The only candidate this strategy found that day
+      (it may keep up to ${cap}).</p>`;
+  }
+  const kept = Math.min(cap, qualified ?? cap);
+  const barely = qualified != null && qualified > cap && rank.position === cap;
+  return `<p class="sd-rank${barely ? " warn" : ""}">Ranked <strong>${rank.position}</strong> of
+    ${kept} kept${qualified != null ? `, out of ${qualified} candidates that qualified` : ""} that day.${
+    barely ? " This one only just made the cut." : ""}</p>`;
+}
+
+function sdRenderEvidence() {
+  const d = sd.data;
+  const t = sd.ticket;
+  const sections = [];
+
+  // D1 — STRATEGY. Description is served by the backend strategy module, so
+  // a fourth strategy appears here without this file changing.
+  sections.push(sdSection("strategy", "Strategy", `
+    <div class="sd-strategy-name">${esc(d.strategy_label || "Manual ticket")}</div>
+    ${d.strategy_description ? `<p class="sd-strategy-desc">${esc(d.strategy_description)}</p>` : ""}
+    ${sdRankLine(d.rank)}
+    ${d.rationale ? `<p class="sd-rationale">${esc(d.rationale)}</p>` : ""}`));
+
+  // D2 — ENTRY CONDITIONS: the "why this stock" answer.
+  sections.push(sdSection("conditions", "Entry conditions", d.conditions.length
+    ? d.conditions.map(sdConditionRowHtml).join("")
+    : `<p class="muted-note">This ticket was not produced by a strategy scan, so there are no
+       entry conditions to show.</p>`));
+
+  // D3 — RISK CHECKS, expanded from the card's "6/6" badge, rendered through
+  // the same rows the confirm dialog uses.
+  sections.push(sdSection("risk", "Risk checks",
+    riskCheckSectionHtml(t.risk_check_results, "Checks", { withLinks: true })
+    || `<p class="muted-note">No risk-check record on this ticket.</p>`));
+
+  // D4 — POSITION SIZING: the derivation, not just the answer.
+  const sizing = d.sizing || {};
+  const adjustments = (sizing.adjustments || []).map((a) =>
+    `<div class="sd-adjust">${esc(a.label)} ${inr(a.from)} → <strong>${inr(a.to)}</strong> — ${esc(a.reason)}</div>`).join("");
+  sections.push(sdSection("sizing", "Position sizing",
+    (sizing.steps || []).map(sdSizingRowHtml).join("")
+    + (adjustments || (sizing.tick_size
+      ? `<div class="sd-adjust muted-note">All three levels already sit exactly on the
+         ₹${esc(sizing.tick_size)} tick grid — no snapping was needed.</div>` : ""))));
+
+  // D5 — EXIT PLAN.
+  const plan = d.exit_plan || {};
+  sections.push(sdSection("exit", "Exit plan", `
+    <p class="sd-exit-trailing">${esc(plan.trailing || "")}</p>
+    ${(plan.shared_rules || []).map((r) => `<div class="sd-exit-rule">
+        <strong>${esc(r.name)}</strong><p>${esc(r.detail)}</p></div>`).join("")}`));
+
+  // D6 — CONTEXT / WARNINGS.
+  sections.push(sdSection("context", "Context & warnings", `<div id="sd-context-body"></div>`));
+
+  el.sdEvidenceInner.innerHTML = sections.join("");
+  sdRenderContextSection();
+}
+
+function sdRenderContextSection() {
+  const body = document.getElementById("sd-context-body");
+  if (!body || !sd.data) return;
+  const d = sd.data;
+  const entry = d.levels.entry;
+  const items = [];
+
+  // Execution mode, prominently — a Live approval must never be mistaken for
+  // a Dry Run one.
+  items.push(d.execution_mode === "live"
+    ? `<div class="sd-warn live"><strong>LIVE mode.</strong> Approving this places a real order with
+       real money at your broker.</div>`
+    : `<div class="sd-warn info"><strong>Dry Run mode.</strong> Approving this simulates the trade;
+       nothing is sent to the broker.</div>`);
+
+  // Distance from the limit price to where the stock is actually trading.
+  if (sd.ltp != null && entry) {
+    const driftPct = ((sd.ltp - entry) / entry) * 100;
+    const away = driftPct > 0.75;
+    items.push(`<div class="sd-warn ${away ? "warn" : "info"}">
+      Last price ${inr(sd.ltp)} is <strong>${driftPct >= 0 ? "+" : ""}${fmt(driftPct, 2)}%</strong>
+      from the ${inr(entry)} limit.${away
+        ? " Price has run past the limit — a LIMIT order at this level may not fill."
+        : ""}</div>`);
+  } else {
+    items.push(`<div class="sd-warn info">No live price yet, so the distance to the
+      ${inr(entry)} limit can't be shown.</div>`);
+  }
+
+  // An existing position in the same symbol.
+  const open = (state.tickets || []).filter((x) =>
+    x.symbol === d.symbol && x.status === "executed" && !x.closed_at && x.transaction_type === "BUY");
+  if (open.length) {
+    items.push(`<div class="sd-warn warn">You already hold an open position in
+      <strong>${esc(d.symbol)}</strong> (${open.map((x) => `${fmt(x.quantity, 0)} @ ${inr(x.entry_price)}`).join(", ")}).
+      Approving this adds to it.</div>`);
+  }
+
+  if (d.freshness?.warning) {
+    items.push(`<div class="sd-warn warn">${esc(d.freshness.warning)}</div>`);
+  } else if (d.freshness?.signal_age_sessions >= 1) {
+    items.push(`<div class="sd-warn info">Signal candle is ${d.freshness.signal_age_sessions} session(s)
+      behind the last completed session (limit ${d.freshness.max_staleness_days} days).</div>`);
+  }
+
+  body.innerHTML = items.join("");
+}
+
+// ---- actions (D7) ---------------------------------------------------
+
+function sdRenderActions() {
+  const t = sd.ticket;
+  const decidable = t.status === "pending_confirmation" || t.status === "draft";
+  el.sdApprove.hidden = !decidable;
+  el.sdReject.hidden = !decidable;
+  const note = executionNote(t);
+  el.sdExecNote.className = `exec-note${note.live ? " live" : ""}`;
+  el.sdExecNote.textContent = decidable ? note.text : `This ticket is ${t.status.replace(/_/g, " ")}.`;
+  el.sdApprove.textContent = note.live ? "Approve & place (LIVE)" : "Approve & place";
+  el.sdApprove.className = `btn ${note.live ? "btn-danger" : "btn-success"}`;
+
+  const options = sd.data?.kite_chart?.options || [];
+  const primary = options.find((o) => o.key === "kite_tvc");
+  el.sdKiteOpen.textContent = "Open in Kite";
+  el.sdKiteOpen.disabled = !(primary && primary.enabled);
+  el.sdKiteOpen.title = primary && primary.enabled
+    ? "Needs an existing Kite web session. The Kite chart will NOT carry the entry/stop/target lines — "
+      + "those exist only on the in-app chart above."
+    : (primary?.reason || "No Kite chart link could be resolved.");
+  el.sdKiteNote.textContent = primary && primary.enabled
+    ? "Kite opens in a new tab and shows no entry/stop/target lines."
+    : (primary?.reason || "");
+
+  el.sdKiteMenu.innerHTML = options.map((o) => `
+    <button type="button" class="sd-kite-item" role="menuitem" data-sd-kite="${esc(o.key)}"
+            ${o.enabled ? "" : "disabled"} title="${esc(o.reason || o.note || "")}">
+      <span>${esc(o.label)}</span><small>${esc(o.note || o.reason || "")}</small>
+    </button>`).join("");
+}
+
+function sdOpenKite(key) {
+  const option = (sd.data?.kite_chart?.options || []).find((o) => o.key === key);
+  if (!option || !option.enabled) return;
+  if (option.key === "copy_symbol") {
+    navigator.clipboard?.writeText(sd.data.symbol)
+      .then(() => toast(`Copied “${sd.data.symbol}” to the clipboard.`, { type: "success" }))
+      .catch(() => toast("Could not access the clipboard.", { type: "error" }));
+    return;
+  }
+  window.open(option.url, "_blank", "noopener");
+}
+
+// ---- wiring ---------------------------------------------------------
+
+el.sdClose.addEventListener("click", closeSignalDetail);
+
+el.sdKiteOpen.addEventListener("click", () => sdOpenKite("kite_tvc"));
+
+el.sdKiteMore.addEventListener("click", () => {
+  const open = el.sdKiteMenu.hidden;
+  el.sdKiteMenu.hidden = !open;
+  el.sdKiteMore.setAttribute("aria-expanded", String(open));
+});
+
+el.sdKiteMenu.addEventListener("click", (event) => {
+  const key = event.target.closest("[data-sd-kite]")?.dataset.sdKite;
+  if (!key) return;
+  el.sdKiteMenu.hidden = true;
+  el.sdKiteMore.setAttribute("aria-expanded", "false");
+  sdOpenKite(key);
+});
+
+document.addEventListener("click", (event) => {
+  if (el.signalDetail.hidden || el.sdKiteMenu.hidden) return;
+  if (!event.target.closest(".sd-kite")) {
+    el.sdKiteMenu.hidden = true;
+    el.sdKiteMore.setAttribute("aria-expanded", "false");
+  }
+});
+
+// The Settings → Sector mappings link inside a skipped risk check.
+el.sdEvidenceInner.addEventListener("click", (event) => {
+  if (event.target.closest("[data-sd-close]")) closeSignalDetail();
+});
+
+// Approve / Reject reuse the EXACT handlers the Approvals card uses, so the
+// confirmation dialog still appears and there is one execution path.
+el.sdApprove.addEventListener("click", async () => {
+  const t = sd.ticket;
+  if (!t) return;
+  const live = state.executionMode === "live";
+  const ok = await confirmAction({
+    title: live ? `Place a real ${t.transaction_type} order?` : "Approve this trade (dry run)?",
+    html: approvalConfirmHtml(t),
+    okLabel: live ? "Place order" : "Approve",
+    okClass: live ? "btn-danger" : "btn-success",
+  });
+  if (!ok) return;
+  el.sdApprove.disabled = true;
+  try {
+    await approveTicket(t.id);
+  } finally {
+    el.sdApprove.disabled = false;
+  }
+  closeSignalDetail();
+});
+
+el.sdReject.addEventListener("click", async () => {
+  const t = sd.ticket;
+  if (!t) return;
+  await rejectTicketById(t.id, "Rejected from the Signal Detail view");
+  closeSignalDetail();
+});
+
+// D9 — Escape closes; ←/→ move between pending signals without closing.
+function sdStep(delta) {
+  if (sd.queue.length < 2 || !sd.ticket) return;
+  const index = sd.queue.indexOf(sd.ticket.id);
+  if (index < 0) return;
+  const nextId = sd.queue[(index + delta + sd.queue.length) % sd.queue.length];
+  const next = (state.approvals?.entries ?? []).find((t) => t.id === nextId);
+  if (next) openSignalDetail(next);
+}
+
+el.sdPrev.addEventListener("click", () => sdStep(-1));
+el.sdNext.addEventListener("click", () => sdStep(1));
+
+document.addEventListener("keydown", (event) => {
+  if (el.signalDetail.hidden) return;
+  // Never steal keys from the confirmation dialog layered on top of this view.
+  if (document.querySelector("dialog[open]")) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeSignalDetail();
+  } else if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    sdStep(-1);
+  } else if (event.key === "ArrowRight") {
+    event.preventDefault();
+    sdStep(1);
+  }
+});
+
+// D8 — react to tickets_changed: if this signal was approved, rejected or
+// auto-expired elsewhere, never leave an armed Approve button on screen.
+function sdOnTicketsChanged() {
+  if (el.signalDetail.hidden || !sd.ticket) return;
+  const entries = state.approvals?.entries ?? [];
+  const fresh = entries.find((t) => t.id === sd.ticket.id);
+  if (!fresh) {
+    toast("This signal is no longer pending — it was approved, rejected or expired elsewhere.",
+      { type: "info", title: "Signal closed" });
+    closeSignalDetail();
+    return;
+  }
+  sd.ticket = fresh;
+  sd.queue = sdPendingQueue();
+  sdRenderHeader(fresh, sd.data);
+  sdRenderActions();
+}
+
+// Chart colours are read from CSS custom properties, so a theme flip means
+// rebuilding the chart against the newly-current tokens (C3).
+function sdOnThemeChange() {
+  if (el.signalDetail.hidden || !sd.data) return;
+  sdBuildChart();
+}
 
 async function loadAutomationStatus() {
   if (state.accountType !== "trading") return;
@@ -3983,8 +4859,11 @@ const THEME_ICONS = {
 function applyTheme(theme) {
   const t = theme === "light" ? "light" : "dark";
   document.documentElement.dataset.theme = t;
-  el.themeToggleBtn.innerHTML = THEME_ICONS[t];
-  el.themeToggleBtn.title = t === "dark" ? "Switch to light theme" : "Switch to dark theme";
+  const label = t === "dark" ? "Switch to light theme" : "Switch to dark theme";
+  for (const button of [el.themeToggleBtn, el.sdTheme]) {
+    button.innerHTML = THEME_ICONS[t];
+    button.title = label;
+  }
   try {
     localStorage.setItem("kt-theme", t);
   } catch (e) {
@@ -3993,11 +4872,15 @@ function applyTheme(theme) {
 }
 applyTheme(document.documentElement.dataset.theme);
 
-el.themeToggleBtn.addEventListener("click", () => {
+function toggleTheme() {
   const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
   applyTheme(next);
+  sdOnThemeChange();
   API.saveUiPrefs({ theme: next }).catch(() => {});
-});
+}
+
+el.themeToggleBtn.addEventListener("click", toggleTheme);
+el.sdTheme.addEventListener("click", toggleTheme);
 
 async function init() {
   const params = new URLSearchParams(location.search);

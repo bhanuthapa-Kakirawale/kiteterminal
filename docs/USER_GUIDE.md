@@ -34,6 +34,7 @@ Zerodha.
    ```
 4. **Start the server** from the project root:
    ```
+   .venv\Scripts\activate
    uvicorn backend.main:app --reload
    ```
 5. **Open the app** at `http://127.0.0.1:8000` (or whatever port you chose).
@@ -112,6 +113,63 @@ Clicking **Approve** on a signal opens a confirmation dialog showing the
 exact order that will be placed, the risk-check breakdown, and expected
 capital/risk. Nothing executes until you click confirm in that dialog.
 
+### Investigating a signal before you approve it
+
+Every entry signal card carries two extra links:
+
+- **Chart** — opens a full-screen **Signal Detail** view inside the app.
+- **Kite** — opens that symbol's chart on kite.zerodha.com in a new tab.
+  This needs an active Kite web session in the same browser, and it will
+  **not** show your entry/stop/target lines — those exist only on the in-app
+  chart. If the symbol couldn't be resolved to a Kite instrument the button
+  is disabled and tells you why rather than opening a dead link.
+
+The **Signal Detail** view exists to answer one question — *do I trust this
+enough to click Approve?* — without leaving the app or taking a green
+checkmark on faith. On the left is an annotated chart; on the right is the
+evidence trail.
+
+The chart shows the daily candles the signal was actually computed from
+(read from the app's own stored history, never re-fetched, so what you see
+is what the strategy saw), plus the indicators that strategy uses — each
+one individually toggleable. Your **entry, stop and target** are drawn as
+labelled horizontal lines, with the risk shaded red below the entry and the
+reward shaded green above it, so the risk/reward proportion is obvious at a
+glance. The specific bars the strategy keyed off (the pullback bar, the
+breakout bar, the swing low) are marked; hovering any bar shows its OHLC
+and every plotted indicator's value on that day. For RSI Mean Reversion an
+RSI-14 subpanel is drawn with both the 35 (entry) and 55 (exit) lines.
+
+The **"Why this signal"** panel on the right has six sections:
+
+1. **Strategy** — which strategy fired, its rule in plain English, and
+   where this signal ranked among that day's candidates (so you can tell a
+   standout setup from one that only just made the daily cap).
+2. **Entry conditions** — every rule the strategy checked, each with the
+   actual value, the threshold it was compared against, and pass/fail. This
+   is the "why this stock" answer.
+3. **Risk checks** — the "6/6" badge expanded into the six named checks
+   with real numbers against your limits. A check that was *skipped*
+   because the symbol has no sector mapped says so explicitly and links to
+   Settings → Sector mappings; it is never shown as a pass.
+4. **Position sizing** — the full derivation, not just the answer: risk per
+   share, risk budget, the division and the rounding-down that produced the
+   share count, the capital committed, and the resulting R:R. Anywhere
+   tick-grid snapping or whole-share rounding changed a number, it says so.
+5. **Exit plan** — the trailing rule in plain language plus the shared exit
+   checks that will apply once the position is open.
+6. **Context & warnings** — how far the current price has moved from your
+   limit (and whether it may no longer fill), whether you already hold this
+   symbol, whether the signal is close to auto-expiring, and — prominently
+   — whether you are in Dry Run or Live.
+
+**Approve & place** and **Reject** sit in a footer and go through exactly
+the same confirmation dialog and the same code path as the buttons on the
+card. Press **Escape** or the **×** to close; **←** and **→** move to the
+previous/next pending signal without closing. If a signal is approved,
+rejected or auto-expires in another tab while you have it open, the view
+updates or closes itself rather than leaving an armed Approve button.
+
 ## 7. Placing a Manual Trade
 
 Go to **New Ticket**:
@@ -155,15 +213,28 @@ Go to **Strategies** to:
 
 ### The three built-in strategies, in plain terms
 
-- **Momentum Breakout** — buys stocks breaking out to a new 20-day high on
-  above-average volume, while in a long-term uptrend. Uses a wider stop and
-  trails it as the trade moves in your favor.
+- **Momentum Breakout** — buys stocks breaking out to a new 30-day high on
+  heavy volume (3× their normal), while in a long-term uptrend. Uses a wide
+  stop and trails it as the trade moves in your favor.
 - **Trend Pullback** — buys uptrending stocks that dipped briefly to their
-  20-day average and are now turning back up. Uses a tighter stop.
+  20-day average and are now turning back up on heavy volume.
 - **RSI Mean Reversion** — buys uptrending stocks that got temporarily
-  oversold (RSI below 35) and are starting to turn up. Takes profit at a
-  fixed target or once RSI recovers to neutral — this one does not use a
-  trailing stop.
+  oversold (RSI below 35) and are starting to turn up. **Disabled by
+  default** — see the note below.
+
+> **Why these settings changed.** In September 2026 all three strategies were
+> re-tested over two years of history *including brokerage, STT and
+> slippage*, which the original settings had never accounted for. All three
+> were losing money. The heavy-volume requirements and wider stops above are
+> the result: both remaining strategies now test profitable, in both halves
+> of the sample and under pessimistic cost assumptions. RSI Mean Reversion
+> could not be made to work at any setting, so it is switched off — you can
+> re-enable it from Strategies to experiment, but nothing in the testing
+> supports trading it.
+>
+> These are backtested results on the symbols you currently follow, not a
+> promise. Stay in **Dry Run** until your own Journal shows a positive
+> expectancy over 30 or more trades.
 
 ## 9. Kill Switch — Emergency Controls
 

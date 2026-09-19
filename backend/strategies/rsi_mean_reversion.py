@@ -1,10 +1,20 @@
 import pandas as pd
 
 from backend import config, indicators
+from backend.strategies import conditions as cond
 from backend.strategies.shared import last_value, shared_exit_checks
 
 STRATEGY_NAME = "rsi_mean_reversion"
 EXIT_STRATEGY_NAME = "rsi_mean_reversion_exit"
+STRATEGY_LABEL = "RSI mean reversion"
+# See momentum_breakout.STRATEGY_DESCRIPTION for why this lives server-side.
+STRATEGY_DESCRIPTION = (
+    "Buys a stock that is still in a long-term uptrend but has become temporarily oversold, "
+    "betting on a snap back to normal rather than on a new trend. The trend filter is a hard "
+    "requirement precisely because the same oversold reading in a genuine downtrend is a "
+    "falling knife. Trades are short: it takes profit at a fixed target or as soon as RSI "
+    "recovers to neutral, and uses no trailing stop."
+)
 
 DEFAULT_PARAMS = {
     "trend_filter_period": 200,
@@ -38,7 +48,7 @@ def evaluate_entry(df: pd.DataFrame, params: dict) -> dict:
     gets, specifically to avoid buying a falling knife in a genuine
     downtrend (per the spec's explicit requirement)."""
     if len(df) < 2:
-        return {"passed": False, "insufficient_history": True, "checklist": {}}
+        return {"passed": False, "insufficient_history": True, "checklist": {}, "conditions": [], "markers": []}
 
     close = df["close"]
     trend_period = params["trend_filter_period"]
@@ -69,6 +79,58 @@ def evaluate_entry(df: pd.DataFrame, params: dict) -> dict:
             "oversold_pass": bool(oversold_ok), "turning_pass": bool(turning_ok),
         },
     }
+    # Flat record shared by the card's one-liner and the Signal Detail panel
+    # (see strategies/conditions.py). The swing low is looked up here rather
+    # than in compute_entry_levels so the bar it came from can be marked on
+    # the chart — it is the stop level this strategy may end up using.
+    signal_date = df["date"].iloc[-1]
+    swing_window = df.tail(params["swing_low_lookback_days"])
+    swing_low_value = float(swing_window["low"].min())
+    swing_low_date = str(swing_window.loc[swing_window["low"].idxmin(), "date"])[:10]
+
+    entry_conditions = [
+        cond.condition(
+            "Uptrend filter (hard)",
+            f"Close must be above the {trend_period}-day SMA. This one is never bypassed no "
+            f"matter how oversold RSI gets — it is what stops this strategy buying a falling "
+            f"knife in a genuine downtrend",
+            actual_value=last_close, threshold=last_sma, operator=">", passed=trend_ok,
+            value_label=f"close {cond.inr(last_close)}",
+            threshold_label=f"SMA-{trend_period} {cond.inr(last_sma)}",
+        ),
+        cond.condition(
+            "RSI oversold",
+            f"RSI-{_RSI_PERIOD} (Wilder's) must be below {threshold} — temporarily oversold "
+            f"inside an intact uptrend",
+            actual_value=last_rsi, threshold=threshold, operator="<", passed=oversold_ok,
+            value_label=f"RSI-{_RSI_PERIOD} {cond.num(last_rsi, 1)}",
+            threshold_label=cond.num(threshold, 1),
+        ),
+        cond.condition(
+            "RSI turning up",
+            f"RSI-{_RSI_PERIOD} must be higher than the previous day's, so the fall is already "
+            f"reversing rather than still accelerating"
+            + ("" if params["rsi_turn_confirmation"]
+               else " — DISABLED in this strategy's parameters, so this check is not enforced"),
+            actual_value=last_rsi, threshold=prev_rsi, operator=">", passed=turning_ok,
+            value_label=f"RSI-{_RSI_PERIOD} {cond.num(last_rsi, 1)}",
+            threshold_label=f"prev {cond.num(prev_rsi, 1)}",
+            detail=None if params["rsi_turn_confirmation"] else "confirmation not required",
+        ),
+    ]
+    markers = [
+        cond.marker(
+            "signal", signal_date, last_close, "Signal bar",
+            f"RSI-{_RSI_PERIOD} {cond.num(last_rsi, 1)}, up from {cond.num(prev_rsi, 1)}",
+        ),
+        cond.marker(
+            "swing_low", swing_low_date, swing_low_value,
+            f"{params['swing_low_lookback_days']}-day swing low",
+            f"{cond.inr(swing_low_value)} — the stop is the tighter of this and "
+            f"entry − {params['atr_stop_multiple']}×ATR-14",
+        ),
+    ]
+
     return {
         # Trend filter is evaluated and reported even when it fails, but a
         # failing trend filter unconditionally blocks the signal — the
@@ -78,10 +140,12 @@ def evaluate_entry(df: pd.DataFrame, params: dict) -> dict:
         # hard-reject intent is unambiguous to a future reader.
         "passed": bool(trend_ok and rsi_ok),
         "checklist": checklist,
-        "date": df["date"].iloc[-1],
+        "conditions": entry_conditions,
+        "markers": markers,
+        "date": signal_date,
         "close": last_close,
         "atr_14": last_atr,
-        "swing_low": float(df["low"].tail(params["swing_low_lookback_days"]).min()),
+        "swing_low": swing_low_value,
     }
 
 
@@ -113,14 +177,10 @@ def compute_entry_levels(candidate: dict, params: dict) -> dict | None:
 
 
 def build_entry_rationale(candidate: dict, params: dict) -> str:
-    rsi_info = candidate["checklist"]["rsi_condition"]
-    trend_period = params["trend_filter_period"]
-    sma_level = candidate["checklist"]["trend_filter"][f"sma_{trend_period}"]
-    return (
-        f"RSI mean-reversion: RSI-14 at {rsi_info['rsi_14']:.1f} is oversold (below {rsi_info['oversold_threshold']}) "
-        f"and turning up from {rsi_info['prev_rsi_14']:.1f}, with price still above the {trend_period}-day "
-        f"SMA ₹{sma_level:.2f} (uptrend intact)."
-    )
+    """Rendered from the candidate's own `conditions` record — see
+    momentum_breakout.build_entry_rationale for the rationale behind this
+    being generic rather than per-module prose."""
+    return cond.build_rationale(STRATEGY_LABEL, candidate["conditions"])
 
 
 def evaluate_exit(position: dict, df: pd.DataFrame, params: dict) -> dict:

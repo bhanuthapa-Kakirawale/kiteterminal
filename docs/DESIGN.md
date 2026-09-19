@@ -69,8 +69,14 @@ On `shutdown`: stops the ticker and cancels all five background tasks.
 
 SQLite in WAL mode with foreign keys enabled. 24 tables; the central one is
 `trade_tickets`, with `ticket_events` as its full audit trail. `init_db()` is
-idempotent — safe to call on every startup — and runs ~15 migration functions
-including three full-table-rebuild migrations for `CHECK` constraint changes.
+idempotent — safe to call on every startup — and runs ~18 migration functions
+including four full-table-rebuild migrations for `CHECK` constraint changes.
+The most recent additions are `_ensure_entry_evaluation_column` and
+`_ensure_kite_chart_columns` (plain `ALTER TABLE`s adding
+`trade_tickets.entry_evaluation`, `.kite_chart_url` and `.kite_chart_status`)
+plus `_ensure_kite_chart_event_type`, a `system_events` rebuild admitting the
+`kite_chart_unresolved` event type — a rebuild only because SQLite cannot
+alter that table's `CHECK` allow-list in place.
 It also seeds a default account from `KITE_API_KEY`/`KITE_API_SECRET`,
 default execution settings (`dry_run`), default risk settings, default
 dashboard panels, and disabled strategy configs.
@@ -109,6 +115,8 @@ reconciliation cadence. See §8 of this document for the values.
 | `automation.py` | "Autopilot" — runs the full post-close pipeline (sync data → scan strategies → queue tickets) once per completed session, with retry/backoff. |
 | `journal.py` | Single source of truth for realized P&L; trade statistics (win rate, expectancy, profit factor, drawdown). |
 | `backtest.py` / `backtest_analytics.py` | Historical simulation reusing the exact live-scan entry/exit functions; risk/reward analytics (Sharpe, Sortino, Monte Carlo). |
+| `signal_chart.py` | Read-only assembly of the Signal Detail payload: candles from `ohlc_daily`, indicator series via `indicators.py`, the ticket's own levels, markers, freshness/expiry state, sizing derivation and exit plan. Never calls Kite. |
+| `kite_chart.py` | Resolves a symbol to its kite.zerodha.com chart URL (TradingView and ChartIQ variants) plus the public-TradingView and copy-symbol fallbacks; records the resolution outcome so a dead link can be disabled with a reason. |
 | `watchlist.py` | CRUD for the symbol watchlist. |
 | `sector_mapping.py` | Hardcoded sector lookup (~65 large-caps, 11 sectors) used for sector-exposure risk checks. |
 | `todays_actions.py` | Read-only pre-market briefing aggregator (buy/exit candidates, pending adjustments, near-breakout watch list). |
@@ -138,8 +146,24 @@ draft/pending ──risk checks──► pending_confirmation ──human confir
   faster, pre-filled front door onto the identical pipeline, not a separate
   execution path.
 - **Risk gate**: `risk_engine.run_risk_checks_and_transition` moves the
-  ticket to `pending_confirmation` (all checks pass) or `risk_rejected`
-  (persisting the full check breakdown as JSON for the UI to display).
+  ticket to `pending_confirmation` (all checks pass) or `risk_rejected`.
+  The full check breakdown is persisted as JSON in `risk_check_results`
+  either way — not only on rejection — which is what lets the Signal Detail
+  view expand a passing ticket's "6/6" badge into six named checks.
+- **Entry-evaluation record**: a strategy-generated entry ticket also
+  persists `entry_evaluation` (JSON) — the ordered list of conditions the
+  strategy evaluated, each as
+  `{name, description, actual_value, threshold, operator, passed}`, plus the
+  bars it keyed off, its rank within that scan's candidate set, the params
+  snapshot it was judged by, and the pre-tick-snap levels and sizing inputs.
+  See §6.
+- **Kite chart link**: resolved server-side at ticket-creation time (not at
+  click time) via `kite_chart.resolve_and_log` and stored as
+  `kite_chart_url`/`kite_chart_status`, so a resolution failure surfaces
+  when the signal is generated rather than when the user tries to act on
+  it. A failure is logged as a `kite_chart_unresolved` `system_events` row.
+  Tickets predating this feature are resolved lazily on first view of the
+  chart endpoint and written back.
 - **Confirmation**: `POST /api/tickets/{id}/confirm` is the single shared
   path used by manual approval, strategy-signal approval, and Emergency Exit
   All. It calls `execution.execute_ticket`, which dispatches to dry-run
@@ -215,6 +239,8 @@ and ticket construction — and delegates only the market-logic decision to a
 per-strategy module via a small, uniform interface:
 
 - `evaluate_entry(symbol, indicators, params) -> signal | None`
+  (the returned dict carries both the original nested `checklist` and a flat
+  `conditions` list + `markers`, built by `strategies/conditions.py`)
 - `evaluate_exit(position, indicators, params) -> exit signal | None`
 - `compute_entry_levels(...)` — stop/target/trailing-distance calculation
 - `rank_key(...)` — used to prioritize signals when more candidates pass than
@@ -231,12 +257,84 @@ exited immediately) and a time-based exit (position held longer than
 
 | Strategy | Entry condition | Stop / Target | Notes |
 |---|---|---|---|
-| **`momentum_breakout`** | Close > SMA-200 AND close > 20-day Donchian high (excl. today) AND volume > 1.5× avg-20 volume | Stop = entry − 2×ATR14; target = entry + 2×risk; trailing = 1.5×ATR14 | Max 3 signals/day; ranked by how decisively price broke the level. |
-| **`trend_pullback`** | Uptrend (close > SMA-200) AND price pulled back to within 1.5% of its 20-EMA within the last 3 days AND is now recovering (close > prev close AND close > EMA) | Stop = entry − 1.5×ATR14 (tighter); target = entry + 2×risk | Max 2 signals/day; ranked by recovery strength above the EMA. |
+| **`momentum_breakout`** | Close > SMA-200 AND close > 30-day Donchian high (excl. today) AND volume > 3.0× avg-20 volume | Stop = entry − 3×ATR14; target = entry + 3×risk; trailing = 1.5×ATR14 | Max 3 signals/day; ranked by how decisively price broke the level. |
+| **`trend_pullback`** | Uptrend (close > SMA-200) AND price pulled back to within 1.5% of its 20-EMA within the last 3 days AND is now recovering (close > prev close AND close > EMA) AND volume > 3.0× avg-20 volume | Stop = entry − 3.5×ATR14; target = entry + 4×risk | Max 2 signals/day; ranked by recovery strength above the EMA. |
 | **`rsi_mean_reversion`** | Hard trend filter (close > SMA-200, never bypassed) AND RSI-14 < 35 AND (optionally) RSI turning up vs. previous day | Stop = max(10-day swing low, entry − 1.0×ATR14) — deliberately the tighter of the two; target = entry + 1.5×risk; **no trailing** | Exit checks RSI ≥ 55 (recovered to neutral) first, then falls back to shared checks; max 2 signals/day. |
 
+### The entry-evaluation record
+
+`strategies/conditions.py` defines one flat, uniform row shape that every
+module's `evaluate_entry` emits alongside its existing nested `checklist`:
+
+```
+{name, description, actual_value, threshold, operator, passed,
+ value_label, threshold_label, detail, summary}
+```
+
+This exists because the nested checklist's keys are strategy-specific
+(`checklist["pullback"]["ema_20_at_touch"]`), so no UI could render it
+generically — which is why each module also carried its own hand-written
+`build_entry_rationale` with those key names baked in, giving the Approvals
+card's one-line description and any richer explanation two sources of truth
+that could disagree. Both now render from this one record:
+`conditions.build_rationale()` produces the card's sentence, and the Signal
+Detail panel itemises the same rows. The nested `checklist` is deliberately
+left in place — it is also written by exit and alert-action tickets, and
+`backtest.py` reads its keys to classify exit reasons.
+
+Each module also exposes `STRATEGY_LABEL` and `STRATEGY_DESCRIPTION` (the
+rule in plain English). Both are served to the frontend rather than
+hardcoded there, so adding a fourth strategy requires no change to
+`app.js`.
+
+`run_entry_scan` additionally records, per surviving candidate, its rank
+position, the size of the candidate field it beat, and the day's
+`max_signals_per_day` — none of which is recoverable once the candidate
+list has been truncated, and all of which bear on whether a signal is worth
+approving.
+
+### Parameter revision, September 2026
+
+The three strategies originally shipped with parameters that had never been
+tested against transaction costs. A cost-aware study over 63 NSE series
+(2024-07 to 2026-09, split in half for out-of-sample checking, 0.40%
+round-trip cost) found all three deeply unprofitable: −100R, −295R and −45R
+net respectively.
+
+Four independent parameter sweeps pointed the same way — the strategies were
+entering on marginal participation and being stopped out too tightly — and
+the revised defaults above follow from that. Each value sits in the middle of
+a plateau that stayed profitable in both halves and at cost assumptions up to
+0.70%, rather than on the single best point of a grid:
+
+| Strategy | Before (net R) | After (net R) | Trades | Win % | Profit factor | Max DD |
+|---|---:|---:|---:|---:|---:|---:|
+| `momentum_breakout` | −100.3 | **+16.9** | 137 | 49.6 | 1.43 | 6.7R |
+| `trend_pullback` | −295.3 | **+15.2** | 165 | 46.7 | 1.43 | 5.2R |
+| `rsi_mean_reversion` | −45.4 | no viable configuration found | — | — | — | — |
+
+Two structural findings are recorded here because they are easy to re-propose
+and were tested and rejected:
+
+- **A market-regime gate adds nothing.** Only entering while market breadth
+  is healthy improves the *unfiltered* strategy, but is neutral-to-negative
+  once the volume filter is applied — the volume filter already captures the
+  same information.
+- **A 52-week-high breakout is not a separate strategy.** Running
+  `momentum_breakout` at `donchian_lookback` 250 is profitable on its own,
+  but 74% of its entries are the identical symbol on the identical day as the
+  30-day version. Running both concentrates risk rather than diversifying it.
+
+`rsi_mean_reversion` remains registered and fully functional but is disabled
+by default: no parameter combination tested reached breakeven net of costs,
+and its best variants had too few trades to judge.
+
 Strategy parameters are validated server-side per strategy via Pydantic
-models in `backend/models.py`. Configuration changes are versioned
+models in `backend/models.py`. Because a stored params blob predates any
+parameter added later, `strategy_engine.params_with_defaults` backfills
+missing keys from the module's own defaults on read — a module can therefore
+gain a parameter without a schema migration, and an older saved config
+cannot crash a live scan with a `KeyError`. Configuration changes are versioned
 (`strategy_config_versions`) — a version bump happens only on a genuine
 parameter change, not on enable/disable toggling.
 
@@ -296,6 +394,11 @@ instructions); the routers are: `auth`, `portfolio`, `ws`, `tickets`,
 `orders`, `instruments`, `risk`, `ui_prefs`, `dashboard_panels`, `watchlist`,
 `strategies`, `journal`, `kill_switch`, `reconciliation`, `automation`.
 
+`tickets` gained `GET /api/tickets/{ticket_id}/chart`, which returns the
+whole Signal Detail payload — candles, indicator series, levels, markers,
+entry conditions, sizing derivation, exit plan, freshness and the Kite chart
+link options — in one response, read entirely from local storage.
+
 Nearly every route depends on `require_kite` / `require_trading_account`
 (FastAPI dependencies) for a hard server-side auth/permission gate,
 independent of any frontend state.
@@ -304,7 +407,9 @@ independent of any frontend state.
 
 Single-page vanilla JS app (`frontend/app.js`, no framework, no build step),
 served same-origin. Dark/light theme persisted to `localStorage`.
-`Sortable.js` (CDN) provides drag-to-reorder for the dashboard panel grid.
+`Sortable.js` (CDN) provides drag-to-reorder for the dashboard panel grid,
+and `lightweight-charts` (CDN) draws the Signal Detail view's annotated
+chart. Both arrive as plain script tags — there is still no bundler.
 Hash-based routing across 11 sidebar sections: Dashboard, Approvals, Today's
 Actions, Trade Queue, Orders & Trades, New Ticket, Watchlist, Strategies,
 Journal, Ticket History, Settings.
@@ -324,6 +429,7 @@ reactively instead of polling.
 | `python-dotenv` | 1.0.1 | `.env` loading |
 | `cryptography` | 50.0.1 | Fernet encryption of stored credentials |
 | `pandas` | 2.2.3 | OHLC/indicator data handling |
+| `lightweight-charts` (CDN) | 5.2.1 | TradingView's charting library (Apache-2.0), used only by the Signal Detail view. Loaded from jsDelivr as a script tag — it is not published on cdnjs. Pinned exactly: its series API changed between v4 and v5. |
 | `pytest`, `httpx`, `playwright` (dev) | 9.1.1 / 0.28.1 / 1.62.0 | Testing |
 
 Note: `numpy` is used directly in `journal.py` but is not pinned explicitly

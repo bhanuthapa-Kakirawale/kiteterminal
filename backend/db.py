@@ -641,6 +641,86 @@ def _ensure_rule_checklist_column(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE trade_tickets ADD COLUMN rule_checklist TEXT")
 
 
+def _ensure_entry_evaluation_column(conn: sqlite3.Connection) -> None:
+    # Structured entry-evaluation record for a strategy-sourced entry signal:
+    # the ordered list of conditions the strategy actually checked, each with
+    # its own actual value / threshold / operator / pass-fail, plus the bars
+    # it keyed off and where the signal ranked among that scan's candidates.
+    # Same transparency philosophy as risk_check_results and rule_checklist.
+    #
+    # Deliberately a SIBLING of rule_checklist rather than a replacement:
+    # rule_checklist is also written by exit tickets and alert-action tickets,
+    # and backend/backtest.py reads its nested keys to classify exit reasons,
+    # so repurposing it would reach well beyond entry signals. Nullable, no
+    # CHECK constraint — a plain ALTER TABLE suffices, no table rebuild.
+    if not _column_exists(conn, "trade_tickets", "entry_evaluation"):
+        conn.execute("ALTER TABLE trade_tickets ADD COLUMN entry_evaluation TEXT")
+
+
+def _ensure_kite_chart_event_type(conn: sqlite3.Connection) -> None:
+    # Same rebuild rationale as _ensure_archived_event_type: SQLite cannot
+    # ALTER a CHECK constraint, and system_events.event_type carries an
+    # allow-list. A chart link that could not be resolved is worth recording
+    # at the account level (it is a symptom of a stale or incomplete
+    # instrument cache, not a property of one ticket), so it needs its own
+    # event_type rather than being squeezed into an existing one.
+    #
+    # This is the ONLY table rebuild in this feature — the two new
+    # trade_tickets columns above are plain ALTER TABLEs, per the rule that
+    # tables are not rebuilt unless a CHECK constraint actually requires it.
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='system_events'"
+    ).fetchone()
+    if row is None or "'kite_chart_unresolved'" in row["sql"]:
+        return
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        """
+        CREATE TABLE system_events_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id  INTEGER NOT NULL REFERENCES accounts(id),
+            event_type  TEXT NOT NULL CHECK (event_type IN (
+                            'mode_switched', 'cancel_all_pending', 'strategy_disabled', 'strategy_enabled',
+                            'emergency_exit_all', 'gtt_cancelled_manually', 'order_cancelled_manually',
+                            'kite_chart_unresolved'
+                        )),
+            detail      TEXT,
+            triggered_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO system_events_new (id, account_id, event_type, detail, triggered_at) "
+        "SELECT id, account_id, event_type, detail, triggered_at FROM system_events"
+    )
+    conn.execute("DROP TABLE system_events")
+    conn.execute("ALTER TABLE system_events_new RENAME TO system_events")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_system_events_account ON system_events(account_id)")
+
+    violations = conn.execute("PRAGMA foreign_key_check(system_events)").fetchall()
+    if violations:
+        raise RuntimeError(f"system_events rebuild left foreign key violations: {[dict(v) for v in violations]}")
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _ensure_kite_chart_columns(conn: sqlite3.Connection) -> None:
+    # The symbol's chart URL on kite.zerodha.com, resolved SERVER-SIDE when
+    # the ticket is created rather than when the link is clicked: a resolution
+    # failure then surfaces at 18:22 when the signal is generated, not at
+    # 09:15 when the user is trying to act on it.
+    #
+    # kite_chart_status records the OUTCOME of that resolution ('ok',
+    # 'stale_cache', 'unresolved') so the UI can disable a dead link with a
+    # reason instead of rendering one that 404s. The ChartIQ and public
+    # TradingView variants are pure string transforms of the same
+    # (exchange, symbol, token) triple and are derived on read — storing them
+    # would be three columns that can disagree with each other.
+    for column in ("kite_chart_url", "kite_chart_status"):
+        if not _column_exists(conn, "trade_tickets", column):
+            conn.execute(f"ALTER TABLE trade_tickets ADD COLUMN {column} TEXT")
+
+
 def _ensure_archived_event_type(conn: sqlite3.Connection) -> None:
     # Same rebuild rationale as _ensure_risk_rejected_event_type — adds
     # 'archived' as its own event_type rather than overloading 'closed'
@@ -737,11 +817,11 @@ def _seed_risk_settings(conn: sqlite3.Connection) -> None:
 # strategy_engine.py's copy is the one actually used to evaluate signals,
 # this is only the one-time seed value for a brand-new account's row.
 _DEFAULT_MOMENTUM_BREAKOUT_PARAMS = {
-    "donchian_lookback": 20,
-    "volume_multiple": 1.5,
+    "donchian_lookback": 30,
+    "volume_multiple": 3.0,
     "trend_filter_period": 200,
-    "atr_stop_multiple": 2,
-    "target_r_multiple": 2,
+    "atr_stop_multiple": 3,
+    "target_r_multiple": 3,
     "trailing_atr_multiple": 1.5,
     "thesis_invalidation_ma": 50,
     "time_exit_days": 15,
@@ -757,8 +837,9 @@ _DEFAULT_TREND_PULLBACK_PARAMS = {
     "pullback_ma_period": 20,
     "pullback_band_pct": 1.5,
     "pullback_lookback_days": 3,
-    "atr_stop_multiple": 1.5,
-    "target_r_multiple": 2,
+    "volume_multiple": 3.0,
+    "atr_stop_multiple": 3.5,
+    "target_r_multiple": 4,
     "trailing_atr_multiple": 1.5,
     "thesis_invalidation_ma": 50,
     "time_exit_days": 15,
@@ -1137,6 +1218,9 @@ def init_db() -> None:
         _ensure_archived_column(conn)
         _ensure_archived_event_type(conn)
         _ensure_rule_checklist_column(conn)
+        _ensure_entry_evaluation_column(conn)
+        _ensure_kite_chart_columns(conn)
+        _ensure_kite_chart_event_type(conn)
         _ensure_stop_adjusted_breakeven_event_type(conn)
         _ensure_starting_capital_column(conn)
         _ensure_strategy_version_column(conn)

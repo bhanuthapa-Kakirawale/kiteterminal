@@ -117,6 +117,7 @@ class TrendPullbackParams(BaseModel):
     pullback_ma_period: int = Field(gt=0)
     pullback_band_pct: float = Field(gt=0)
     pullback_lookback_days: int = Field(gt=0)
+    volume_multiple: float = Field(gt=0)
     atr_stop_multiple: float = Field(gt=0)
     target_r_multiple: float = Field(gt=0)
     trailing_atr_multiple: float = Field(gt=0)

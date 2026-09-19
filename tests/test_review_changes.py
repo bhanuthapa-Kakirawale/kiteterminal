@@ -515,3 +515,104 @@ def test_autopilot_run_now_endpoint(env, monkeypatch):
     monkeypatch.setattr(automation, "run_pipeline", fake_pipeline)
     r = env.client.post("/api/automation/run-now")
     assert r.status_code == 202 and r.json()["data"]["started"] is True
+
+
+# ---------------------------------------------------------------- 2026-09 strategy parameter revision
+
+def test_strategy_params_backfill_a_key_the_module_gained_later(env):
+    """A config saved before a parameter existed must not crash the scanner.
+
+    Strategy params are persisted as a JSON blob. When trend_pullback gained
+    `volume_multiple`, every config already in the database lacked the key and
+    the module's `params["volume_multiple"]` would have raised KeyError — on
+    the nightly autopilot run, not at startup, which is the worst place to
+    find out. get_config backfills missing keys from the module's own
+    defaults, so an older row keeps working.
+    """
+    from backend import strategy_engine
+    from backend.strategies import trend_pullback
+
+    legacy = {k: v for k, v in trend_pullback.DEFAULT_PARAMS.items() if k != "volume_multiple"}
+    merged = strategy_engine.params_with_defaults("trend_pullback", legacy)
+    assert merged["volume_multiple"] == trend_pullback.DEFAULT_PARAMS["volume_multiple"]
+
+    # A value the caller DID store always wins over the module default.
+    stored = {**legacy, "atr_stop_multiple": 9.75}
+    assert strategy_engine.params_with_defaults("trend_pullback", stored)["atr_stop_multiple"] == 9.75
+
+    # An unknown strategy is passed through rather than exploding.
+    assert strategy_engine.params_with_defaults("no_such_strategy", {"a": 1}) == {"a": 1}
+
+
+def test_scan_survives_a_config_saved_before_the_new_parameter_existed(env):
+    """End to end: write a legacy params blob straight into strategy_configs,
+    then run a real scan. Before the backfill this raised KeyError."""
+    import json as _json
+
+    from backend.strategies import trend_pullback
+
+    legacy = {k: v for k, v in trend_pullback.DEFAULT_PARAMS.items() if k != "volume_multiple"}
+    conn = env.db.get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO strategy_configs (account_id, strategy_name, enabled, params, current_version) "
+            "VALUES (?, 'trend_pullback', 1, ?, 1) "
+            "ON CONFLICT(account_id, strategy_name) DO UPDATE SET enabled = 1, params = excluded.params",
+            (account_id(env.db), _json.dumps(legacy)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    seed_ohlc(env.db, 2953217, "TCS", _breakout_candles())
+    add_watch(env.db, "TCS", 2953217)
+    r = env.client.post("/api/strategies/scan-now")
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["by_strategy"]["trend_pullback"]["diagnostics"]["evaluated"] == 1
+
+
+def test_revised_defaults_match_the_documented_research(env):
+    """Pins the 2026-09 cost-aware parameter revision.
+
+    These are not arbitrary numbers — each was chosen from the middle of a
+    plateau that stayed profitable in both halves of the sample and at cost
+    assumptions up to 0.70%. A silent edit back to the old, loss-making values
+    (volume 1.5 / stop 2.0 / target 2.0) should fail loudly here and be
+    argued for with fresh evidence.
+    """
+    from backend import db as db_module
+    from backend.strategies import momentum_breakout, trend_pullback
+
+    mb = momentum_breakout.DEFAULT_PARAMS
+    assert (mb["volume_multiple"], mb["atr_stop_multiple"],
+            mb["target_r_multiple"], mb["donchian_lookback"]) == (3.0, 3, 3, 30)
+
+    tp = trend_pullback.DEFAULT_PARAMS
+    assert (tp["volume_multiple"], tp["atr_stop_multiple"], tp["target_r_multiple"]) == (3.0, 3.5, 4)
+
+    # backend/db.py keeps its own copy of these defaults to avoid a circular
+    # import; the two must not drift apart or a fresh install seeds different
+    # parameters from the ones the modules actually use.
+    assert db_module._DEFAULT_MOMENTUM_BREAKOUT_PARAMS == mb
+    assert db_module._DEFAULT_TREND_PULLBACK_PARAMS == tp
+
+
+def test_trend_pullback_volume_filter_blocks_a_quiet_recovery(env):
+    """The participation filter is the change that made this strategy viable:
+    it cut 1511 trades to 165. A textbook pullback on thin volume must now be
+    rejected."""
+    from backend.strategies import trend_pullback
+    from test_signal_detail import _frame, _pullback_candles
+
+    params = dict(trend_pullback.DEFAULT_PARAMS)
+    candles = _pullback_candles()
+    assert trend_pullback.evaluate_entry(_frame(candles), params)["passed"] is True
+
+    # Same price action, ordinary volume on the recovery bar.
+    quiet = [dict(c) for c in candles]
+    quiet[-1]["volume"] = int(sum(c["volume"] for c in quiet[-21:-1]) / 20)
+    result = trend_pullback.evaluate_entry(_frame(quiet), params)
+    by_name = {c["name"]: c for c in result["conditions"]}
+    assert by_name["Volume surge"]["passed"] is False
+    assert by_name["Recovery confirmed"]["passed"] is True, "only the volume condition should fail"
+    assert result["passed"] is False

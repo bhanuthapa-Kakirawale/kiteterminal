@@ -60,7 +60,7 @@ def main() -> None:
         nav("approvals")
         page.wait_for_selector("#ap-entries .approval-card")
         entries = page.locator("#ap-entries .approval-card").count()
-        check("inbox lists entry signals", entries == 2, entries)
+        check("inbox lists entry signals", entries >= 3, entries)
         check("inbox lists the exit signal", page.locator("#ap-exits .approval-card").count() == 1)
         check("inbox lists the stop adjustment", page.locator("#ap-adjustments .approval-card").count() == 1)
         check("risk-blocked signal listed separately", page.locator("#ap-blocked .approval-card").count() == 1)
@@ -77,11 +77,13 @@ def main() -> None:
         page.wait_for_selector(".toast.success", timeout=15000)
         check("approval reports its outcome in a toast", symbol in page.inner_text(".toast.success"),
               page.inner_text(".toast.success"))
-        page.wait_for_function("document.querySelectorAll('#ap-entries .approval-card').length === 1", timeout=15000)
+        page.wait_for_function(
+            f"document.querySelectorAll('#ap-entries .approval-card').length === {entries - 1}", timeout=15000)
         check("approved signal leaves the inbox", True)
 
         page.locator('#ap-entries button[data-action="reject"]').first.click()
-        page.wait_for_function("document.querySelectorAll('#ap-entries .approval-card').length === 0", timeout=15000)
+        page.wait_for_function(
+            f"document.querySelectorAll('#ap-entries .approval-card').length === {entries - 2}", timeout=15000)
         check("rejected signal leaves the inbox", True)
 
         page.locator('#ap-adjustments button[data-action="approve-adj"]').click()
@@ -89,6 +91,71 @@ def main() -> None:
         page.click("#app-confirm-ok")
         page.wait_for_function("document.querySelectorAll('#ap-adjustments .approval-card').length === 0", timeout=15000)
         check("stop adjustment approved from the inbox", True)
+
+        # ---- Signal Detail view ----------------------------------------
+        detail_card = page.locator("#ap-entries .approval-card").first
+        detail_symbol = detail_card.locator(".ac-symbol").inner_text()
+        detail_card.locator('button[data-action="chart"]').click()
+        page.wait_for_selector("#signal-detail:not([hidden])", timeout=15000)
+        page.wait_for_function("document.querySelectorAll('#sd-chart canvas').length > 0", timeout=15000)
+        page.wait_for_timeout(1200)
+        check("signal detail opens from an approvals card", detail_symbol in page.inner_text("#sd-symbol"),
+              page.inner_text("#sd-symbol"))
+        check("chart canvas renders", page.locator("#sd-chart canvas").count() > 0,
+              page.locator("#sd-chart canvas").count())
+
+        # Price lines are painted into the canvas, so they are asserted through
+        # the view's own record of what it drew (window.__signalDetail).
+        titles = page.evaluate("window.__signalDetail.priceLines.map(l => l.title)")
+        check("entry, stop and target price lines drawn", len(titles) == 3
+              and any(x.startswith("Entry") for x in titles)
+              and any(x.startswith("Stop") for x in titles)
+              and any(x.startswith("Target") for x in titles), titles)
+
+        risk_rows = page.locator("#sd-sec-risk .risk-check-row").count()
+        check("six named risk checks shown in the evidence panel", risk_rows == 6, risk_rows)
+        conds = page.locator("#sd-sec-conditions .sd-cond").count()
+        check("entry conditions itemised", conds >= 3, conds)
+        check("position sizing shows its derivation",
+              "Risk per share" in page.inner_text("#sd-sec-sizing"))
+        check("exit plan states the trailing rule", len(page.inner_text("#sd-sec-exit")) > 40)
+        check("execution mode called out in context",
+              "Dry Run" in page.inner_text("#sd-sec-context"), page.inner_text("#sd-sec-context")[:80])
+        page.screenshot(path=str(out / "14-signal-detail.png"))
+
+        # Chart colours come from CSS custom properties, so a theme flip must
+        # rebuild the chart rather than leave dark-theme colours on a light page.
+        builds_before = page.evaluate("window.__signalDetail.buildCount")
+        text_before = page.evaluate("window.__signalDetail.theme.text")
+        page.click("#sd-theme")
+        page.wait_for_timeout(900)
+        builds_after = page.evaluate("window.__signalDetail.buildCount")
+        text_after = page.evaluate("window.__signalDetail.theme.text")
+        check("chart re-themes on the theme toggle",
+              builds_after > builds_before and text_after != text_before,
+              f"{text_before} -> {text_after}")
+        page.screenshot(path=str(out / "15-signal-detail-light.png"))
+        page.click("#sd-theme")
+        page.wait_for_timeout(700)
+
+        # ←/→ move between pending signals without closing the view (D9).
+        if entries - 2 > 1:
+            page.keyboard.press("ArrowRight")
+            page.wait_for_timeout(1200)
+            check("arrow keys move to the next pending signal without closing",
+                  not page.is_hidden("#signal-detail"))
+
+        page.set_viewport_size({"width": 820, "height": 1000})
+        page.wait_for_timeout(700)
+        sd_overflow = page.evaluate("document.documentElement.scrollWidth > window.innerWidth + 1")
+        check("signal detail has no horizontal overflow at 820px", not sd_overflow)
+        page.screenshot(path=str(out / "16-signal-detail-narrow.png"))
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.wait_for_timeout(400)
+
+        page.keyboard.press("Escape")
+        page.wait_for_selector("#signal-detail[hidden]", state="attached", timeout=8000)
+        check("Escape closes the signal detail view", page.is_hidden("#signal-detail"))
 
         page.locator('#ap-exits button[data-action="details"]').click()
         page.wait_for_selector("#ticket-confirm-dialog[open]")
