@@ -1,8 +1,10 @@
 class SessionExpiredError extends Error {}
 class ApiError extends Error {
-  constructor(message, errorCode) {
+  constructor(message, errorCode, failures = null) {
     super(message);
     this.errorCode = errorCode;
+    // PK-12: every account-safety reason a refusal found ({code, message}).
+    this.failures = failures;
   }
 }
 
@@ -32,7 +34,7 @@ async function fetchJsonMutate(url, method, body) {
   const parsed = await res.json().catch(() => null);
   if (!res.ok) {
     const detail = parsed?.detail;
-    throw new ApiError(detail?.message || `Request failed: ${res.status}`, detail?.error_code);
+    throw new ApiError(detail?.message || `Request failed: ${res.status}`, detail?.error_code, detail?.failures || null);
   }
   return parsed.data;
 }
@@ -70,8 +72,9 @@ const API = {
   deleteTicket: (id) => fetchJsonMutate(`/api/tickets/${id}`, "DELETE"),
   // PK-11: a new entry carries the execution mode the user was shown; the
   // server refuses (409) if it is missing or no longer current.
-  confirmTicket: (id, expectedMode) => fetchJsonMutate(`/api/tickets/${id}/confirm`, "POST",
-    expectedMode ? { expected_mode: expectedMode } : undefined),
+  // PK-12H: allow_amo is sent only when the user ticked "Send as AMO".
+  confirmTicket: (id, expectedMode, allowAmo = false) => fetchJsonMutate(`/api/tickets/${id}/confirm`, "POST",
+    expectedMode ? { expected_mode: expectedMode, ...(allowAmo ? { allow_amo: true } : {}) } : undefined),
   rejectTicket: (id, reason) => fetchJsonMutate(`/api/tickets/${id}/reject`, "POST", { reason }),
   revertRejection: (id) => fetchJsonMutate(`/api/tickets/${id}/revert-rejection`, "POST"),
   startTrailing: (id) => fetchJsonMutate(`/api/tickets/${id}/start_trailing`, "POST"),
@@ -122,6 +125,11 @@ const API = {
   getJournalStats: (mode) => fetchJson(`/api/journal/stats?mode=${encodeURIComponent(mode)}`),
   getTodaysActions: () => fetchJson("/api/todays-actions"),
 
+  // PK-12: account-level safety
+  accountSafetyStatus: () => fetchJson("/api/account-safety/status"),
+  setTradingLock: (locked, reason) => fetchJsonMutate("/api/account-safety/trading-lock", "POST", { locked, reason }),
+  resetBreaker: (reason) => fetchJsonMutate("/api/account-safety/breaker/reset", "POST", { reason }),
+
   // Phase 8: kill switch
   cancelAllPending: () => fetchJsonMutate("/api/tickets/cancel-all-pending", "POST"),
   cancelOrder: (orderId, variety) => fetchJsonMutate(`/api/orders/${encodeURIComponent(orderId)}/cancel?variety=${encodeURIComponent(variety || "regular")}`, "POST"),
@@ -166,6 +174,15 @@ const el = {
   modeBanner: document.getElementById("mode-banner"),
   modeBannerText: document.getElementById("mode-banner-text"),
   modeToggleCheckbox: document.getElementById("mode-toggle-checkbox"),
+  // PK-12 account safety
+  accountSafetyBar: document.getElementById("account-safety-bar"),
+  tradingLockPill: document.getElementById("trading-lock-pill"),
+  breakerPill: document.getElementById("breaker-pill"),
+  accountSafetySummary: document.getElementById("account-safety-summary"),
+  tradingLockBtn: document.getElementById("trading-lock-btn"),
+  breakerResetBtn: document.getElementById("breaker-reset-btn"),
+  ticketConfirmAmo: document.getElementById("ticket-confirm-amo"),
+  ticketConfirmAmoCheckbox: document.getElementById("ticket-confirm-amo-checkbox"),
 
   ticketForm: document.getElementById("ticket-form"),
   ticketSymbolInput: document.getElementById("ticket-symbol"),
@@ -438,6 +455,7 @@ const state = {
   accountType: null,
   tickets: [],
   executionMode: "dry_run",
+  accountSafety: null,  // PK-12: /api/account-safety/status — display only
   trailingHeartbeat: null, // { last_run_at, active_ticket_count }
   trailingErrorAlerts: [],
   currentAlerts: [],
@@ -2250,6 +2268,92 @@ function renderModeBanner() {
   }
 }
 
+// ---- PK-12: account-level safety (display + explicit requests only) ----
+
+function inr(v) {
+  return `₹${Number(v).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
+}
+
+async function loadAccountSafety() {
+  try {
+    state.accountSafety = await API.accountSafetyStatus();
+  } catch (e) {
+    return;  // keep the last known state; the server still enforces every control
+  }
+  renderAccountSafety();
+}
+
+function renderAccountSafety() {
+  const s = state.accountSafety;
+  if (!s) return;
+  el.accountSafetyBar.hidden = false;
+  el.tradingLockPill.hidden = !s.trading_locked;
+  el.tradingLockPill.textContent = s.trading_locked
+    ? `TRADING LOCKED — no new entries${s.trading_lock_reason ? ` (${s.trading_lock_reason})` : ""}` : "";
+  el.tradingLockBtn.textContent = s.trading_locked ? "Unlock trading" : "Lock trading";
+  el.breakerPill.hidden = !s.breaker_open;
+  el.breakerPill.textContent = s.breaker_open ? "BROKER CIRCUIT BREAKER OPEN — new entries blocked" : "";
+  el.breakerPill.title = s.breaker_reason || "";
+  el.breakerResetBtn.hidden = !s.breaker_open;
+
+  const lossLimits = [];
+  if (s.max_daily_loss_amount != null) lossLimits.push(inr(s.max_daily_loss_amount));
+  if (s.max_daily_loss_pct != null) lossLimits.push(`${s.max_daily_loss_pct}% of portfolio`);
+  const parts = [
+    `Entries today ${s.entries_today}/${s.max_new_entries_per_day ?? "∞"}`,
+    `Realized live P&L today ${inr(s.realized_live_pnl_today)}`
+      + (lossLimits.length ? ` (loss limit ${lossLimits.join(" or ")}${s.daily_loss_limit_hit ? " — HIT" : ""})`
+        : " (daily loss limit NOT SET)"),
+    s.max_order_notional != null ? `Max order ${inr(s.max_order_notional)}` : "Max order value NOT SET",
+    s.market_open ? "Market open" : "Market closed — live entries need explicit AMO",
+  ];
+  if (!s.breaker_open && s.breaker_recent_failures) parts.push(`Broker failures ${s.breaker_recent_failures}/${s.breaker_threshold ?? "off"}`);
+  el.accountSafetySummary.textContent = parts.join(" · ");
+  el.accountSafetyBar.classList.toggle("blocked", s.trading_locked || s.breaker_open || s.daily_loss_limit_hit);
+}
+
+el.tradingLockBtn.addEventListener("click", async () => {
+  const locking = !state.accountSafety?.trading_locked;
+  const ok = await confirmAction({
+    title: locking ? "Lock trading?" : "Unlock trading?",
+    html: locking
+      ? `<p>No new entry can be approved — manual, strategy or pending — until trading is unlocked. Exits,
+         Emergency Exit, GTT protection and order monitoring keep working.</p>
+         <label class="field">Reason<input id="trading-lock-reason" type="text" maxlength="500" placeholder="e.g. broker incident" /></label>`
+      : "<p>New entries can be approved again. Every other account-safety limit still applies.</p>",
+    okLabel: locking ? "Lock trading" : "Unlock",
+    danger: locking,
+  });
+  if (!ok) return;
+  const reason = locking ? (document.getElementById("trading-lock-reason")?.value || "").trim() : "";
+  try {
+    state.accountSafety = await API.setTradingLock(locking, reason || null);
+    renderAccountSafety();
+    toast(locking ? "Trading locked — no new entries." : "Trading unlocked.", { type: locking ? "warning" : "success" });
+  } catch (e) {
+    toast(e.message, { type: "error", title: "Trading lock not changed" });
+  }
+});
+
+el.breakerResetBtn.addEventListener("click", async () => {
+  const ok = await confirmAction({
+    title: "Reset the broker circuit breaker?",
+    html: `<p>${esc(state.accountSafety?.breaker_reason || "")}</p>
+           <p>Only reset once the broker is responding normally. The reset is logged.</p>
+           <label class="field">Reason<input id="breaker-reset-reason" type="text" maxlength="500" /></label>`,
+    okLabel: "Reset breaker",
+  });
+  if (!ok) return;
+  const reason = (document.getElementById("breaker-reset-reason")?.value || "").trim();
+  try {
+    state.accountSafety = await API.resetBreaker(reason || null);
+    renderAccountSafety();
+    toast("Broker circuit breaker reset.", { type: "success" });
+  } catch (e) {
+    toast(e.message, { type: "error", title: "Breaker not reset" });
+  }
+});
+
 // ---- Phase 8: kill switch ----
 
 el.cancelAllPendingBtn.addEventListener("click", async () => {
@@ -2565,6 +2669,10 @@ function connectTickWs() {
     }
     if (msg.type === "tickets_changed") {
       scheduleRefresh();
+      loadAccountSafety();  // entries-today / P&L may have moved
+    }
+    if (msg.type === "account_safety_changed") {
+      loadAccountSafety();
     }
     if (msg.type === "mode_changed" && msg.mode !== state.executionMode) {
       // PK-11: another session switched the execution mode. Show the new
@@ -2667,6 +2775,17 @@ function ticketConfirmHtml(t) {
 // global toggle must not be shown as its mode. A new entry awaiting approval
 // always follows the global toggle: the server claims it in the global mode,
 // even if an earlier, refused claim left a stale mode stamped on it (PK-11).
+// Mirrors execution.is_closing_sell on the server: a SELL that exits or
+// reduces a position. Everything else is a NEW entry (PK-12 applies).
+function isClosingSell(t) {
+  return t.transaction_type === "SELL" && (t.closes_ticket_id != null || t.source === "alert_action");
+}
+
+// PK-12H: a live NEW entry while the market is closed needs explicit AMO consent.
+function needsAmoConsent(t) {
+  return ticketExecMode(t) === "live" && !isClosingSell(t) && computeMarketStatus() !== "open";
+}
+
 function ticketExecMode(t) {
   if (t && isNewEntryAwaitingApproval(t)) return state.executionMode;
   return t?.mode || state.executionMode;
@@ -2698,7 +2817,13 @@ async function resyncExecutionMode() {
 function executionNote(t) {
   const live = ticketExecMode(t) === "live";
   if (!live) return { live, text: "DRY RUN — approving simulates the trade; nothing is sent to the broker." };
-  const how = computeMarketStatus() === "open"
+  const open = computeMarketStatus() === "open";
+  if (!open && !isClosingSell(t)) {
+    // PK-12H: never an AMO by default — only with the checkbox below.
+    return { live, text: "LIVE — the market is closed. Tick \"Send as AMO\" to queue a real order for the next session "
+      + "(followed by a protective GTT); without it the server refuses the approval. This uses real money." };
+  }
+  const how = open
     ? "a regular order"
     : "an After-Market Order (market closed — it queues for the next session)";
   const gtt = t.closes_ticket_id == null && t.use_gtt ? ", followed by a protective GTT" : "";
@@ -2758,6 +2883,9 @@ function openConfirmDialog(ticket) {
   el.ticketConfirmExecNote.hidden = rejectedMode;
   el.ticketConfirmExecNote.className = `exec-note${note.live ? " live" : ""}`;
   el.ticketConfirmExecNote.textContent = note.text;
+  // PK-12H: always starts unticked — consent is given per approval.
+  el.ticketConfirmAmo.hidden = rejectedMode || !needsAmoConsent(ticket);
+  el.ticketConfirmAmoCheckbox.checked = false;
   renderRiskCheckSection(ticket.risk_check_results);
   el.ticketRejectBtn.hidden = rejectedMode;
   el.ticketConfirmBtn.hidden = rejectedMode;
@@ -2769,9 +2897,24 @@ function openConfirmDialog(ticket) {
 // Shared by the confirm dialog and the Approvals inbox. Execution failures
 // come back as data on the ticket (not thrown); a thrown error means the
 // request itself failed (network/auth/state).
-async function approveTicket(id, expectedMode) {
+const ACCOUNT_SAFETY_TITLES = {
+  TRADING_LOCKED: "Trading is locked",
+  DAILY_LOSS_LIMIT: "Daily loss limit reached",
+  DAILY_ENTRY_LIMIT: "Daily entry limit reached",
+  MAX_NOTIONAL_EXCEEDED: "Order value above the absolute cap",
+  STALE_SIGNAL: "Signal is stale",
+  PRICE_DEVIATION_EXCEEDED: "Price moved too far from the plan",
+  STOP_ALREADY_INVALID: "Stop already crossed",
+  BROKER_CIRCUIT_OPEN: "Broker circuit breaker is open",
+  AMO_CONFIRMATION_REQUIRED: "Market closed — AMO needs your explicit consent",
+  AMO_DISABLED: "Market closed — AMO disabled",
+  ACCOUNT_SAFETY_UNAVAILABLE: "Account safety could not be checked",
+};
+
+// allowAmo is true only when the user ticked "Send as AMO" in the dialog.
+async function approveTicket(id, expectedMode, allowAmo = false) {
   try {
-    reportExecution(await API.confirmTicket(id, expectedMode));
+    reportExecution(await API.confirmTicket(id, expectedMode, allowAmo));
   } catch (e) {
     if (e instanceof ApiError && MODE_BINDING_ERRORS.includes(e.errorCode)) {
       // PK-11: the mode shown is not the server's mode. Nothing was
@@ -2779,10 +2922,22 @@ async function approveTicket(id, expectedMode) {
       // never retry, never approve in the new mode automatically.
       await resyncExecutionMode();
       toast(e.message, { type: "warning", title: "Execution mode changed. Review the ticket again before approving.", timeout: 0 });
+    } else if (e instanceof ApiError && ACCOUNT_SAFETY_TITLES[e.errorCode]) {
+      // PK-12: refused by the account safety layer — nothing was sent. Show
+      // every reason; never retry. An AMO refusal reopens the dialog, where
+      // the user can tick "Send as AMO" themselves.
+      const reasons = (e.failures || [{ code: e.errorCode, message: e.message }]).map((f) => f.message).join("\n");
+      toast(reasons, { type: "warning", title: `${ACCOUNT_SAFETY_TITLES[e.errorCode]} — nothing was sent`, timeout: 0 });
+      if (e.errorCode === "AMO_CONFIRMATION_REQUIRED" && !allowAmo) {
+        try {
+          openConfirmDialog(await API.getTicket(id));
+        } catch (ignored) { /* the toast already explains */ }
+      }
     } else {
       toast(e.message, { type: "error", title: "Approval failed" });
     }
   }
+  loadAccountSafety();
   await refreshTicketViews();
   refreshOrderBooks();
 }
@@ -2841,12 +2996,15 @@ el.ticketRejectBtn.addEventListener("click", async () => {
 el.ticketConfirmBtn.addEventListener("click", async () => {
   if (activeConfirmTicketId == null) return;
   el.ticketConfirmBtn.disabled = true;
+  // Read before the dialog closes; only a visible, ticked box is consent.
+  const allowAmo = !el.ticketConfirmAmo.hidden && el.ticketConfirmAmoCheckbox.checked;
+  const id = activeConfirmTicketId;
+  el.ticketConfirmDialog.close();
   try {
-    await approveTicket(activeConfirmTicketId, state.activeConfirmShownMode);
+    await approveTicket(id, state.activeConfirmShownMode, allowAmo);
   } finally {
     el.ticketConfirmBtn.disabled = false;
   }
-  el.ticketConfirmDialog.close();
 });
 
 el.ticketModifyBtn.addEventListener("click", async () => {
@@ -3318,6 +3476,7 @@ async function loadTicketingData() {
   } catch (e) {
     // ticketing is secondary to the core dashboard — don't block on it
   }
+  loadAccountSafety();
 }
 
 function renderRiskSettingsForm() {
@@ -3331,7 +3490,16 @@ function renderRiskSettingsForm() {
   form.querySelector('[name="max_sector_exposure_pct"]').value = s.max_sector_exposure_pct;
   form.querySelector('[name="max_total_portfolio_risk_pct"]').value = s.max_total_portfolio_risk_pct;
   form.querySelector('[name="min_risk_reward"]').value = s.min_risk_reward;
+  // PK-12: empty = disabled (null).
+  for (const name of ACCOUNT_SAFETY_FIELDS) {
+    form.querySelector(`[name="${name}"]`).value = s[name] ?? "";
+  }
 }
+
+const ACCOUNT_SAFETY_FIELDS = [
+  "max_order_notional", "max_new_entries_per_day", "max_entry_price_deviation_pct",
+  "max_daily_loss_amount", "max_daily_loss_pct", "broker_breaker_threshold", "broker_breaker_window_minutes",
+];
 
 function renderSectorMappingsTable() {
   el.sectorMappingsBody.innerHTML = "";
@@ -3474,9 +3642,15 @@ el.riskSettingsForm.addEventListener("submit", async (event) => {
     // Not editable here — resend the stored value so saving never wipes it.
     starting_capital: state.riskSettings?.starting_capital ?? null,
   };
+  // PK-12: sent explicitly every time; an empty field disables that limit.
+  for (const name of ACCOUNT_SAFETY_FIELDS) {
+    const raw = String(formData.get(name) ?? "").trim();
+    body[name] = raw === "" ? null : Number(raw);
+  }
   try {
     state.riskSettings = await API.saveRiskSettings(body);
     renderRiskSettingsForm();
+    loadAccountSafety();
     toast("Risk settings saved — every new ticket is checked against them.", { type: "success" });
     el.riskSettingsSaved.hidden = false;
     setTimeout(() => { el.riskSettingsSaved.hidden = true; }, 2000);
@@ -3980,6 +4154,11 @@ el.viewApprovals.addEventListener("click", async (event) => {
   } else if (action === "details") {
     openConfirmDialog(ticket);
   } else if (action === "approve") {
+    if (needsAmoConsent(ticket)) {
+      // PK-12H: the only place to consent to an AMO is the dialog's checkbox.
+      openConfirmDialog(ticket);
+      return;
+    }
     const live = ticketExecMode(ticket) === "live";
     const shownMode = shownModeFor(ticket);  // the mode the dialog below shows
     const ok = await confirmAction({
@@ -4754,6 +4933,12 @@ el.sdEvidenceInner.addEventListener("click", (event) => {
 el.sdApprove.addEventListener("click", async () => {
   const t = sd.ticket;
   if (!t) return;
+  if (needsAmoConsent(t)) {
+    // PK-12H: AMO consent is only ever given in the ticket dialog.
+    closeSignalDetail();
+    openConfirmDialog(t);
+    return;
+  }
   const live = ticketExecMode(t) === "live";
   const shownMode = shownModeFor(t);  // the mode the dialog below shows
   const ok = await confirmAction({

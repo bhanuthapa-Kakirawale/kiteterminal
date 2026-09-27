@@ -123,6 +123,17 @@ def env(tmp_path, monkeypatch):
     return SimpleNamespace(client=client, kite=fake, db=db, broadcasts=broadcasts, tmp_path=tmp_path)
 
 
+@pytest.fixture
+def market_open(monkeypatch):
+    """Pins the NSE clock to 'open'. Since PK-12H a live NEW entry outside
+    market hours is refused unless the approver explicitly asks for an AMO,
+    so a test that places a live entry and is not about market hours pins
+    the clock instead of depending on when the suite runs. Modules that
+    define their own market_open/market_closed fixtures keep theirs."""
+    from backend import market
+    monkeypatch.setattr(market, "is_market_open", lambda at=None: True)
+
+
 def account_id(db) -> int:
     conn = db.get_connection()
     try:

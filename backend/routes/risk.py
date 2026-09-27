@@ -5,7 +5,7 @@ from backend import risk_engine, sector_mapping
 from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
-from backend.models import RiskSettingsUpdateRequest, SectorMappingUpsertRequest
+from backend.models import ACCOUNT_SAFETY_SETTING_FIELDS, RiskSettingsUpdateRequest, SectorMappingUpsertRequest
 
 router = APIRouter()
 
@@ -23,9 +23,21 @@ def get_settings(kite: KiteConnect = Depends(require_trading_account)):
 @router.post("/api/risk/settings")
 def save_settings(req: RiskSettingsUpdateRequest, kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
+    fields = req.model_dump()
+    # PK-12: an account-safety limit is written only when the client sent it
+    # (null = disable). An omitted one keeps its current value.
+    for name in ACCOUNT_SAFETY_SETTING_FIELDS:
+        if name not in req.model_fields_set:
+            fields.pop(name)
+    if "broker_breaker_window_minutes" in fields and fields["broker_breaker_window_minutes"] is None:
+        raise HTTPException(422, {
+            "error_code": "VALIDATION_ERROR",
+            "message": "broker_breaker_window_minutes cannot be empty — disable the breaker with "
+                       "broker_breaker_threshold = null instead.",
+        })
     conn = get_connection()
     try:
-        updated = risk_engine.update_settings(conn, account["id"], **req.model_dump())
+        updated = risk_engine.update_settings(conn, account["id"], **fields)
         return {"data": dict(updated)}
     finally:
         conn.close()

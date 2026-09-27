@@ -163,7 +163,7 @@ def test_confirm_dry_run_places_nothing(env):
     assert env.kite.calls_to("place_order") == [] and env.kite.calls_to("place_gtt") == []
 
 
-def test_confirm_live_places_order_and_oco_gtt(env):
+def test_confirm_live_places_order_and_oco_gtt(env, market_open):
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
     r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
@@ -176,7 +176,7 @@ def test_confirm_live_places_order_and_oco_gtt(env):
     assert all(leg["transaction_type"] == "SELL" for leg in gtt["orders"])
 
 
-def test_confirm_live_trailing_uses_single_gtt(env):
+def test_confirm_live_trailing_uses_single_gtt(env, market_open):
     set_mode(env.db, "live")
     body = _manual_ticket(trailing_enabled=True, trailing_trigger="after_target_1", trailing_distance=50.0)
     t = env.client.post("/api/tickets", json=body).json()["data"]
@@ -185,7 +185,7 @@ def test_confirm_live_trailing_uses_single_gtt(env):
     assert gtt["trigger_type"] == "single" and gtt["trigger_values"] == [2900.0]
 
 
-def test_confirm_live_order_rejected(env):
+def test_confirm_live_order_rejected(env, market_open):
     set_mode(env.db, "live")
     env.kite.fail_next["place_order"] = OrderException("Insufficient funds")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
@@ -194,7 +194,7 @@ def test_confirm_live_order_rejected(env):
     assert "Insufficient funds" in r["execution_message"]
 
 
-def test_confirm_live_protection_failed(env):
+def test_confirm_live_protection_failed(env, market_open):
     set_mode(env.db, "live")
     env.kite.fail_next["place_gtt"] = InputException("bad trigger")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
@@ -268,7 +268,7 @@ def test_execution_mode_switch(env):
 
 # ---------------------------------------------------------------- orders / GTT books
 
-def test_order_and_gtt_books_and_cancel(env):
+def test_order_and_gtt_books_and_cancel(env, market_open):
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
     done = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]

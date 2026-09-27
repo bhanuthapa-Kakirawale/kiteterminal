@@ -71,7 +71,9 @@ def test_live_entry_off_grid_prices_are_snapped_and_sent_as_amo(env, market_clos
     set_mode(env.db, "live")
     body = _manual_ticket(entry_price=3001.37, stop_loss=2900.03, target_1=3300.02)
     t = env.client.post("/api/tickets", json=body).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    # PK-12H: an after-hours live entry is an AMO only with explicit consent.
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm",
+                        json={**displayed_mode(env.db), "allow_amo": True}).json()["data"]
     assert r["status"] == "executed" and r["order_variety"] == "amo" and r["entry_fill_status"] == "pending"
     assert "AMO" in r["execution_message"]
     order = env.kite.calls_to("place_order")[0]
@@ -112,7 +114,7 @@ def _confirm_live_entry(env, auto_fill: bool) -> dict:
     return env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
 
 
-def test_order_monitor_records_entry_fill(env):
+def test_order_monitor_records_entry_fill(env, market_open):
     from backend import order_monitor
     done = _confirm_live_entry(env, auto_fill=True)
     env.kite.order_book[done["kite_order_id"]]["average_price"] = 2999.5
@@ -124,7 +126,7 @@ def test_order_monitor_records_entry_fill(env):
     assert order_monitor.check_pending_orders(env.kite)["checked"] == 0
 
 
-def test_order_monitor_rejected_entry_cancels_ticket_and_gtt(env):
+def test_order_monitor_rejected_entry_cancels_ticket_and_gtt(env, market_open):
     from backend import order_monitor
     done = _confirm_live_entry(env, auto_fill=False)
     env.kite.set_order_state(done["kite_order_id"], "REJECTED", status_message="RMS: insufficient margin")
@@ -138,7 +140,7 @@ def test_order_monitor_rejected_entry_cancels_ticket_and_gtt(env):
     assert env.client.get("/api/kill-switch/emergency-exit-preview").json()["data"] == []
 
 
-def test_order_monitor_leaves_open_orders_alone(env):
+def test_order_monitor_leaves_open_orders_alone(env, market_open):
     from backend import order_monitor
     done = _confirm_live_entry(env, auto_fill=False)
     assert order_monitor.check_pending_orders(env.kite)["updated"] == 0
@@ -189,7 +191,7 @@ def test_order_monitor_rejected_exit_keeps_position_open_and_protected(env):
     assert [p["ticket_id"] for p in env.client.get("/api/kill-switch/emergency-exit-preview").json()["data"]] == [buy_id]
 
 
-def test_kill_switch_cancels_unfilled_entry_instead_of_selling(env):
+def test_kill_switch_cancels_unfilled_entry_instead_of_selling(env, market_open):
     from backend import order_monitor
     done = _confirm_live_entry(env, auto_fill=False)
     r = env.client.post("/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "EXIT ALL"}).json()["data"]

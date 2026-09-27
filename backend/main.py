@@ -29,6 +29,7 @@ from backend.accounts import get_default_account
 from backend.db import init_db
 from backend.security import TerminalOriginGuard
 from backend.routes import (
+    account_safety as account_safety_routes,
     auth,
     automation as automation_routes,
     dashboard_panels,
@@ -111,6 +112,7 @@ app.include_router(journal_routes.router)
 app.include_router(kill_switch.router)
 app.include_router(reconciliation_routes.router)
 app.include_router(automation_routes.router)
+app.include_router(account_safety_routes.router)
 
 # Rejects cross-origin writes and WebSocket handshakes before routing (P0-8).
 app.add_middleware(TerminalOriginGuard)

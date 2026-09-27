@@ -370,6 +370,38 @@ CREATE TABLE IF NOT EXISTS system_events (
 );
 CREATE INDEX IF NOT EXISTS idx_system_events_account ON system_events(account_id);
 
+-- PK-12: account-level safety state of the execution-enabled trading
+-- account — one row per account, never process memory, so a trading lock or
+-- an open broker circuit breaker survives a restart. The limits themselves
+-- live in risk_settings (history-tracked); this table holds only state.
+CREATE TABLE IF NOT EXISTS account_safety_state (
+    account_id          INTEGER PRIMARY KEY REFERENCES accounts(id),
+    trading_locked      INTEGER NOT NULL DEFAULT 0 CHECK (trading_locked IN (0, 1)),
+    trading_locked_at   TEXT,
+    trading_lock_reason TEXT,
+    breaker_open        INTEGER NOT NULL DEFAULT 0 CHECK (breaker_open IN (0, 1)),
+    breaker_opened_at   TEXT,
+    breaker_reason      TEXT,
+    last_success_at     TEXT,
+    last_reset_at       TEXT,
+    -- broker_failure_log.id at the last broker success / manual reset:
+    -- only failures after it count toward the breaker (exact, unlike a
+    -- same-second timestamp comparison).
+    failure_watermark_id INTEGER NOT NULL DEFAULT 0,
+    updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- PK-12G: broker/transport failures seen on the order path (never
+-- validation errors or risk refusals). Read only for the breaker's window.
+CREATE TABLE IF NOT EXISTS broker_failure_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id  INTEGER NOT NULL REFERENCES accounts(id),
+    occurred_at TEXT NOT NULL DEFAULT (datetime('now')),
+    source      TEXT NOT NULL,
+    detail      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_broker_failure_log_account ON broker_failure_log(account_id, occurred_at);
+
 -- Phase 8: order/position reconciliation findings. Only MISMATCHES are
 -- persisted (not a running log of every clean check) — see backend/
 -- reconciliation.py. Never auto-resolved; resolved=1 only via the
@@ -903,10 +935,96 @@ def _ensure_single_exit_owner_index(conn: sqlite3.Connection) -> None:
     )
 
 
+_ACCOUNT_SAFETY_EVENT_TYPES = (
+    "'mode_switched', 'cancel_all_pending', 'strategy_disabled', 'strategy_enabled', "
+    "'emergency_exit_all', 'gtt_cancelled_manually', 'order_cancelled_manually', "
+    "'kite_chart_unresolved', "
+    "'trading_locked', 'trading_unlocked', 'account_safety_refusal', "
+    "'broker_breaker_tripped', 'broker_breaker_reset', 'amo_entry_approved'"
+)
+
+
+def _ensure_account_safety_event_types(conn: sqlite3.Connection) -> None:
+    # PK-12: same rebuild rationale as _ensure_kite_chart_event_type — the
+    # account-safety audit trail (lock on/off, refusals, breaker trips and
+    # resets, explicit AMO approvals) is account-level, so it belongs in
+    # system_events, whose event_type is a CHECK allow-list. Must run after
+    # _ensure_kite_chart_event_type (it keeps that type).
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='system_events'"
+    ).fetchone()
+    if row is None or "'broker_breaker_tripped'" in row["sql"]:
+        return
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        f"""
+        CREATE TABLE system_events_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id  INTEGER NOT NULL REFERENCES accounts(id),
+            event_type  TEXT NOT NULL CHECK (event_type IN ({_ACCOUNT_SAFETY_EVENT_TYPES})),
+            detail      TEXT,
+            triggered_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO system_events_new (id, account_id, event_type, detail, triggered_at) "
+        "SELECT id, account_id, event_type, detail, triggered_at FROM system_events"
+    )
+    conn.execute("DROP TABLE system_events")
+    conn.execute("ALTER TABLE system_events_new RENAME TO system_events")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_system_events_account ON system_events(account_id)")
+
+    violations = conn.execute("PRAGMA foreign_key_check(system_events)").fetchall()
+    if violations:
+        raise RuntimeError(f"system_events rebuild left foreign key violations: {[dict(v) for v in violations]}")
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
+# PK-12: account-level limits, per account in risk_settings so they are
+# history-tracked by risk_engine.update_settings like every other limit.
+# NULL always means "disabled". No rupee amount is defaulted: the absolute
+# notional cap and the daily loss limits start disabled until the user sets
+# them. Plain ALTER TABLE ADD COLUMN (a CHECK on a new column is allowed; the
+# defaults satisfy it for existing rows).
+_RISK_SETTINGS_ACCOUNT_SAFETY_COLUMNS = [
+    ("max_order_notional", "REAL CHECK (max_order_notional IS NULL OR max_order_notional > 0)"),
+    ("max_new_entries_per_day",
+     "INTEGER DEFAULT 3 CHECK (max_new_entries_per_day IS NULL OR max_new_entries_per_day > 0)"),
+    ("max_entry_price_deviation_pct",
+     "REAL DEFAULT 3 CHECK (max_entry_price_deviation_pct IS NULL "
+     "OR (max_entry_price_deviation_pct > 0 AND max_entry_price_deviation_pct <= 100))"),
+    ("max_daily_loss_amount", "REAL CHECK (max_daily_loss_amount IS NULL OR max_daily_loss_amount > 0)"),
+    ("max_daily_loss_pct",
+     "REAL CHECK (max_daily_loss_pct IS NULL OR (max_daily_loss_pct > 0 AND max_daily_loss_pct <= 100))"),
+    ("broker_breaker_threshold",
+     "INTEGER DEFAULT 3 CHECK (broker_breaker_threshold IS NULL OR broker_breaker_threshold > 0)"),
+    ("broker_breaker_window_minutes",
+     "INTEGER NOT NULL DEFAULT 10 CHECK (broker_breaker_window_minutes > 0)"),
+]
+
+
+def _ensure_account_safety_settings_columns(conn: sqlite3.Connection) -> None:
+    for column, sql_type in _RISK_SETTINGS_ACCOUNT_SAFETY_COLUMNS:
+        if not _column_exists(conn, "risk_settings", column):
+            conn.execute(f"ALTER TABLE risk_settings ADD COLUMN {column} {sql_type}")
+
+
 def _seed_risk_settings(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         INSERT OR IGNORE INTO risk_settings (account_id)
+        SELECT id FROM accounts WHERE account_type = 'trading'
+        """
+    )
+
+
+def _seed_account_safety_state(conn: sqlite3.Connection) -> None:
+    # PK-12: unlocked, breaker closed — only for the trading account(s).
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO account_safety_state (account_id)
         SELECT id FROM accounts WHERE account_type = 'trading'
         """
     )
@@ -1323,7 +1441,9 @@ def init_db() -> None:
         _ensure_kite_chart_event_type(conn)
         _ensure_stop_adjusted_breakeven_event_type(conn)
         _ensure_submission_unknown_event_type(conn)
+        _ensure_account_safety_event_types(conn)
         _ensure_starting_capital_column(conn)
+        _ensure_account_safety_settings_columns(conn)
         _ensure_strategy_version_column(conn)
         _ensure_closed_trades_strategy_version_column(conn)
         _ensure_strategy_configs_versioning_columns(conn)
@@ -1340,6 +1460,7 @@ def init_db() -> None:
         _ensure_trading_account_type(conn)
         _seed_execution_settings(conn)
         _seed_risk_settings(conn)
+        _seed_account_safety_state(conn)
         _seed_dashboard_panels(conn)
         _ensure_watchlist_summary_panel(conn)
         _ensure_watchlist_panels(conn)

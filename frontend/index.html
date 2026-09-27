@@ -56,6 +56,16 @@
       </label>
     </div>
   </div>
+  <!-- PK-12: account-level safety. Informational — the server enforces. -->
+  <div id="account-safety-bar" class="account-safety-bar" hidden>
+    <span id="trading-lock-pill" class="safety-pill safety-locked" hidden></span>
+    <span id="breaker-pill" class="safety-pill safety-breaker" hidden></span>
+    <span id="account-safety-summary" class="account-safety-summary"></span>
+    <span class="account-safety-actions">
+      <button id="breaker-reset-btn" class="btn btn-small btn-ghost" hidden title="Close the broker circuit breaker (logged)">Reset breaker</button>
+      <button id="trading-lock-btn" class="btn btn-small btn-outline-danger" title="Block every new entry; exits stay allowed">Lock trading</button>
+    </span>
+  </div>
   <div id="alert-banner" class="alert-banner" hidden></div>
 
   <dialog id="cancel-all-pending-dialog" class="ticket-dialog">
@@ -570,6 +580,36 @@
           <div class="field">
             <label for="rs-min-rr">Min Risk:Reward</label>
             <input id="rs-min-rr" name="min_risk_reward" type="number" step="any" min="0.01" required />
+          </div>
+          <!-- PK-12: account-level limits. Empty = disabled. -->
+          <h3 class="field field-wide form-subhead">Account safety (new live entries only — exits are never blocked)</h3>
+          <div class="field">
+            <label for="rs-max-order-notional">Max Order Value (₹)</label>
+            <input id="rs-max-order-notional" name="max_order_notional" type="number" step="any" min="0.01" placeholder="not set" />
+          </div>
+          <div class="field">
+            <label for="rs-max-entries-day">Max New Entries / Day</label>
+            <input id="rs-max-entries-day" name="max_new_entries_per_day" type="number" step="1" min="1" placeholder="no limit" />
+          </div>
+          <div class="field">
+            <label for="rs-max-deviation">Max Entry Price Deviation</label>
+            <div class="pct-input"><input id="rs-max-deviation" name="max_entry_price_deviation_pct" type="number" step="any" min="0.01" max="100" placeholder="off" /><span>%</span></div>
+          </div>
+          <div class="field">
+            <label for="rs-max-daily-loss">Max Daily Loss (₹)</label>
+            <input id="rs-max-daily-loss" name="max_daily_loss_amount" type="number" step="any" min="0.01" placeholder="not set" />
+          </div>
+          <div class="field">
+            <label for="rs-max-daily-loss-pct">Max Daily Loss</label>
+            <div class="pct-input"><input id="rs-max-daily-loss-pct" name="max_daily_loss_pct" type="number" step="any" min="0.01" max="100" placeholder="not set" /><span>%</span></div>
+          </div>
+          <div class="field">
+            <label for="rs-breaker-threshold">Broker Breaker: failures</label>
+            <input id="rs-breaker-threshold" name="broker_breaker_threshold" type="number" step="1" min="1" placeholder="off" />
+          </div>
+          <div class="field">
+            <label for="rs-breaker-window">Broker Breaker: window (min)</label>
+            <input id="rs-breaker-window" name="broker_breaker_window_minutes" type="number" step="1" min="1" required />
           </div>
           <div class="field field-wide form-actions">
             <button type="submit" class="btn btn-primary">Save Settings</button>
@@ -1174,6 +1214,11 @@
     <h2 id="ticket-confirm-title">Confirm Trade Ticket</h2>
     <div id="ticket-confirm-body" class="ticket-confirm-body"></div>
     <div id="ticket-confirm-exec-note" class="exec-note" hidden></div>
+    <!-- PK-12H: an after-hours live entry is an AMO only with explicit consent. -->
+    <label id="ticket-confirm-amo" class="amo-consent" hidden>
+      <input type="checkbox" id="ticket-confirm-amo-checkbox" />
+      <span>Send as AMO — the market is closed; queue this order for the next session</span>
+    </label>
     <div id="ticket-risk-check-body" class="risk-check-section"></div>
     <div class="dialog-actions">
       <button id="ticket-reject-btn" class="btn btn-outline-danger" autofocus>Reject</button>

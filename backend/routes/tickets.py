@@ -2,11 +2,14 @@ import json
 import logging
 import sqlite3
 
+import requests
 from fastapi import APIRouter, Depends, HTTPException
 from kiteconnect import KiteConnect
+from kiteconnect.exceptions import KiteException
 
 from backend import (
-    execution, instruments, journal, kite_chart, reconciliation, risk_engine, signal_chart, system_events,
+    account_safety, execution, instruments, journal, kite_chart, reconciliation, risk_engine, signal_chart,
+    system_events,
 )
 from backend.accounts import get_trading_account
 from backend.db import get_connection
@@ -38,20 +41,24 @@ def _log_event(conn: sqlite3.Connection, ticket_id: int, event_type: str, detail
 
 def _transition(
     conn: sqlite3.Connection, ticket_id: int, account_id: int,
-    from_statuses: tuple[str, ...], to_status: str, **columns,
+    from_statuses: tuple[str, ...], to_status: str,
+    extra_condition: tuple[str, tuple] | None = None, **columns,
 ) -> bool:
     """Compare-and-set status change: moves the ticket to to_status only if it
     is still in one of from_statuses. The UPDATE's WHERE clause is the lock —
     SQLite serialises writers, so of two requests racing for the same ticket
     exactly one gets rowcount 1. True means this caller won the transition and
     owns whatever follows it (placing the order, writing the event). Column
-    names come from code, never from request input."""
+    names come from code, never from request input. extra_condition is one
+    more (sql, params) predicate evaluated in the same UPDATE — used by the
+    live-entry claim for the PK-12C daily entry limit."""
     assignments = ", ".join(["status = ?", *(f"{name} = ?" for name in columns)])
     placeholders = ", ".join("?" * len(from_statuses))
+    extra_sql, extra_params = (f" AND {extra_condition[0]}", extra_condition[1]) if extra_condition else ("", ())
     cursor = conn.execute(
         f"UPDATE trade_tickets SET {assignments} "
-        f"WHERE id = ? AND account_id = ? AND status IN ({placeholders})",
-        (to_status, *columns.values(), ticket_id, account_id, *from_statuses),
+        f"WHERE id = ? AND account_id = ? AND status IN ({placeholders}){extra_sql}",
+        (to_status, *columns.values(), ticket_id, account_id, *from_statuses, *extra_params),
     )
     return cursor.rowcount == 1
 
@@ -598,15 +605,19 @@ _NOT_SUBMITTED = dict(order_tag=None, submission_state=None, submitted_at=None)
 
 
 def _revalidate_at_confirm(conn: sqlite3.Connection, account: sqlite3.Row, kite: KiteConnect,
-                           ticket: sqlite3.Row) -> None:
+                           ticket: sqlite3.Row) -> risk_engine.PortfolioContext | None:
     """Confirmation is a fresh execution gate (PK-4): the risk checks saved
     when the ticket was created may no longer hold — another approval may
     have used the room this ticket counted on. Re-runs every check against
     the broker's portfolio as it is now. Returns only if the ticket may
     execute; otherwise the ticket leaves 'confirmed' for a terminal state and
-    an HTTPException is raised. The broker is never called on a refusal."""
+    an HTTPException is raised. The broker is never called on a refusal.
+
+    Returns the portfolio context the checks used (None for a closing sell),
+    so the account safety gate reuses it instead of fetching it again."""
     try:
-        report = risk_engine.run_checks(conn, account, ticket, kite)
+        ctx = None if execution.is_closing_sell(ticket) else risk_engine.build_portfolio_context(kite)
+        report = risk_engine.run_checks(conn, account, ticket, kite, ctx=ctx)
     except Exception as e:
         # The checks were never evaluated, so this is not a risk rejection —
         # but without them nothing may be placed. Fail closed. 'rejected'
@@ -614,6 +625,8 @@ def _revalidate_at_confirm(conn: sqlite3.Connection, account: sqlite3.Row, kite:
         # broker is reachable again; the ticket is never reopened by itself.
         reason = e.message if isinstance(e, risk_engine.RiskCheckUnavailableError) else f"{type(e).__name__}: {e}"
         message = f"Risk could not be revalidated ({reason}); no order was sent."
+        if ticket["mode"] == "live" and _is_broker_failure(e):
+            account_safety.record_broker_failure(account["id"], "risk_revalidation", reason)
         _end_claim(conn, ticket, account["id"], "rejected", "rejected", message)
         raise HTTPException(503, {"error_code": "RISK_REVALIDATION_UNAVAILABLE", "message": message})
 
@@ -626,7 +639,7 @@ def _revalidate_at_confirm(conn: sqlite3.Connection, account: sqlite3.Row, kite:
                    f"Risk re-validated at confirmation against the current portfolio: all {len(report.checks)} "
                    f"check(s) passed.")
         conn.commit()
-        return
+        return ctx
 
     failed = [c for c in report.checks if not c.passed]
     message = ("Passed creation-time risk checks but failed confirmation-time revalidation: "
@@ -657,8 +670,111 @@ def _raise_lost_claim(conn: sqlite3.Connection, ticket: sqlite3.Row, account_id:
     })
 
 
+def _is_broker_failure(e: BaseException) -> bool:
+    """PK-12G: a broker/transport failure (network, timeout, token/session,
+    5xx, unparseable reply) — not a definite validation/RMS rejection."""
+    if isinstance(e, risk_engine.RiskCheckUnavailableError):
+        return True
+    if isinstance(e, execution.DEFINITE_REJECTIONS):
+        return False
+    return isinstance(e, (KiteException, requests.RequestException))
+
+
+def _raise_account_safety(failures: list) -> None:
+    status = 503 if any(f.http_status == 503 for f in failures) else 409
+    raise HTTPException(status, {
+        "error_code": failures[0].code,
+        "message": " ".join(f.message for f in failures),
+        "failures": [{"code": f.code, "message": f.message} for f in failures],
+    })
+
+
+def _account_safety_precheck(conn: sqlite3.Connection, account: sqlite3.Row, ticket: sqlite3.Row, mode: str,
+                             allow_amo: bool) -> str | None:
+    """PK-12, before the claim: DB/request-only account checks for a NEW
+    entry. A refusal leaves the ticket approvable ('pending_confirmation') —
+    nothing is claimed, nothing sent — except a stale strategy signal, which
+    can never become valid again and is rejected. Returns the order variety a
+    live entry will be sent as."""
+    decision = account_safety.precheck(conn, account["id"], ticket, mode, allow_amo)
+    if decision.passed:
+        return decision.variety
+    account_safety.log_refusal(conn, account["id"], ticket, mode, "before claim", decision.failures)
+    permanent = [f for f in decision.failures if f.permanent]
+    rejected = False
+    if permanent:
+        rejected = _transition(conn, ticket["id"], account["id"], _CONFIRMABLE_STATUSES, "rejected")
+        if rejected:
+            _log_event(conn, ticket["id"], "rejected",
+                       f"Refused by account safety at confirmation ({permanent[0].code}): {permanent[0].message}")
+    conn.commit()
+    if rejected:
+        _notify("rejected", ticket_id=ticket["id"])
+    _raise_account_safety(decision.failures)
+
+
+def _account_safety_final_gate(conn: sqlite3.Connection, account: sqlite3.Row, kite: KiteConnect,
+                               ticket: sqlite3.Row, ctx: risk_engine.PortfolioContext | None) -> None:
+    """PK-12, after the claim and risk revalidation, immediately before the
+    broker call. A refusal withdraws the claim (nothing was sent): the ticket
+    returns to 'pending_confirmation' so it can be approved once the
+    condition clears — or is rejected if the market has already crossed its
+    stop."""
+    decision = account_safety.final_gate(conn, account["id"], ticket, kite,
+                                         ctx.portfolio_value if ctx is not None else None)
+    if decision.passed:
+        return
+    reasons = "; ".join(f"{f.code}: {f.message}" for f in decision.failures)
+    if any(f.permanent for f in decision.failures):
+        status, event_type = "rejected", "rejected"
+        detail = f"Refused by account safety before the broker call — {reasons} No order was sent."
+    else:
+        status, event_type = "pending_confirmation", "modified"
+        detail = (f"Refused by account safety before the broker call — {reasons} No order was sent; the ticket "
+                  f"is awaiting approval again.")
+    account_safety.log_refusal(conn, account["id"], ticket, ticket["mode"], "before broker call", decision.failures)
+    _end_claim(conn, ticket, account["id"], status, event_type, detail)
+    _raise_account_safety(decision.failures)
+
+
+def _refuse_daily_entry_limit(conn: sqlite3.Connection, account: sqlite3.Row, ticket: sqlite3.Row) -> None:
+    """The live-entry claim lost only to its PK-12C predicate: today's entry
+    slots are taken (possibly by an approval racing this one)."""
+    settings = risk_engine.get_settings(conn, account["id"])
+    used = account_safety.entries_today(conn, account["id"], account_safety.now_ist(), ticket["id"])
+    failure = account_safety.daily_entry_limit_failure(settings, used)
+    account_safety.log_refusal(conn, account["id"], ticket, "live", "claim", [failure])
+    conn.commit()
+    _raise_account_safety([failure])
+
+
+def _account_safety_bookkeeping(account: sqlite3.Row, ticket: sqlite3.Row, result: execution.ExecutionResult,
+                                variety: str | None) -> None:
+    """PK-12G/H, after the broker call. Never changes the recorded outcome."""
+    if ticket["mode"] != "live":
+        return
+    if result.event_type == "submission_unknown":
+        account_safety.record_broker_failure(account["id"], "order_submission", result.message)
+    elif result.kite_order_id is not None:
+        account_safety.record_broker_success(account["id"])
+        if variety == account_safety.VARIETY_AMO:
+            try:
+                conn = get_connection()
+                try:
+                    system_events.log_event(
+                        conn, account["id"], "amo_entry_approved",
+                        f"Ticket {ticket['id']} {ticket['transaction_type']} {ticket['quantity']} {ticket['symbol']} "
+                        f"sent as an After-Market Order with the approver's explicit consent "
+                        f"(order {result.kite_order_id}).")
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception:
+                logger.exception("Could not log the AMO approval of ticket %d", ticket["id"])
+
+
 def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, kite: KiteConnect, ticket_id: int,
-                               expected_mode: str | None = None) -> dict:
+                               expected_mode: str | None = None, allow_amo: bool = False) -> dict:
     """Shared confirm-and-execute body: transitions a pending_confirmation
     ticket to 'confirmed', calls the execution engine, updates status from the
     result, and records a closed_trades row for exit tickets. Used by both
@@ -666,12 +782,18 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
     batch flow, so there is exactly one code path for "how a ticket
     actually executes" regardless of how it got confirmed. expected_mode is
     the mode the user was shown; it binds a new entry (PK-11) and is ignored
-    for an exit."""
+    for an exit. allow_amo is the approver's explicit consent to send a live
+    new entry as an AMO while the market is closed (PK-12H).
+
+    A NEW entry (not a closing sell) also passes the PK-12 account safety
+    gate: a pre-claim check, the daily entry limit inside the claim, and a
+    final check right before the broker call. Exits never do."""
     ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
     if ticket["status"] not in _CONFIRMABLE_STATUSES:
         _raise_invalid_state(conn, ticket_id, account["id"], "confirm")
 
     mode, mode_note = _claim_mode(conn, ticket, account["id"])
+    new_entry = not execution.is_closing_sell(ticket)
     if ticket["closes_ticket_id"] is None:
         # PK-11: refused before the claim if the user saw a different mode.
         _require_displayed_mode(ticket, mode, expected_mode)
@@ -679,6 +801,14 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
         # PK-4: the position may have been closed, or another exit may own
         # it, since this exit was created. Refused before the claim.
         _refuse_stale_exit(conn, ticket, account["id"])
+    variety = None
+    entry_limit = None
+    if new_entry:
+        # PK-12: refused before the claim — nothing written, nothing sent.
+        variety = _account_safety_precheck(conn, account, ticket, mode, allow_amo)
+        if mode == "live":
+            entry_limit = account_safety.daily_entry_claim_condition(
+                risk_engine.get_settings(conn, account["id"]), account["id"], ticket_id, account_safety.now_ist())
     # A live claim also records the order tag and 'submitting' in the same
     # write, before any broker call: if this process dies mid-submission, the
     # database alone tells order_monitor what to look for (PK-2).
@@ -694,9 +824,11 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
     # of pending_confirmation. The loser never reaches the broker. The
     # 'confirmed' event is written in the same transaction, so it exists
     # exactly when the transition happened.
+    # A live NEW entry's claim is also its PK-12C daily-entry reservation: the
+    # same UPDATE counts today's live entries and takes the slot.
     try:
         claimed = _transition(conn, ticket_id, account["id"], _CONFIRMABLE_STATUSES, "confirmed",
-                              mode=mode, **submission)
+                              extra_condition=entry_limit, mode=mode, **submission)
     except sqlite3.IntegrityError:
         # Storage backstop (db._ensure_single_exit_owner_index): another exit
         # of the same position was claimed between the check above and here.
@@ -708,17 +840,23 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
         })
     if not claimed:
         conn.rollback()
+        if entry_limit is not None and _get_ticket_or_404(conn, ticket_id, account["id"])["status"] in _CONFIRMABLE_STATUSES:
+            _refuse_daily_entry_limit(conn, account, ticket)
         _raise_invalid_state(conn, ticket_id, account["id"], "confirm")
     _log_event(conn, ticket_id, "confirmed", f"Confirmed in {mode} mode{mode_note}")
     conn.commit()
 
     ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
+    ctx = None
     if ticket["closes_ticket_id"] is None:
         # PK-4: this ticket won the claim; now re-check it against the
         # portfolio as it is NOW. Only if it still passes may it execute.
-        _revalidate_at_confirm(conn, account, kite, ticket)
+        ctx = _revalidate_at_confirm(conn, account, kite, ticket)
+    if new_entry:
+        # PK-12: the account safety gate has the last word before the broker.
+        _account_safety_final_gate(conn, account, kite, ticket, ctx)
     try:
-        result = execution.execute_ticket(kite, ticket)
+        result = execution.execute_ticket(kite, ticket, entry_variety=variety)
     except Exception as e:
         if ticket["mode"] != "live":
             raise
@@ -736,6 +874,7 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
         # needs_review). Its state is newer, so it is never overwritten.
         conn.rollback()
         _reconcile_late_result(conn, ticket, result)
+    _account_safety_bookkeeping(account, ticket, result, variety)
 
     ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
     # PK-8: an exit closes its position only once its fill is proven. A live
@@ -841,7 +980,8 @@ def confirm_ticket(ticket_id: int, req: TicketConfirmRequest | None = None,
     conn = get_connection()
     try:
         data = confirm_and_execute_ticket(conn, account, kite, ticket_id,
-                                          expected_mode=req.expected_mode if req is not None else None)
+                                          expected_mode=req.expected_mode if req is not None else None,
+                                          allow_amo=req.allow_amo if req is not None else False)
         return {"data": data}
     finally:
         conn.close()

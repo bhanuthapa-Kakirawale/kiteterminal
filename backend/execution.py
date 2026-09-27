@@ -250,12 +250,26 @@ def is_closing_sell(ticket_row) -> bool:
     )
 
 
-def execute_ticket(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
+def execute_ticket(kite: KiteConnect, ticket: sqlite3.Row, entry_variety: str | None = None) -> ExecutionResult:
+    """entry_variety ('regular' | 'amo') is the order variety the account
+    safety gate decided for a live NEW entry (PK-12H) — an AMO only with the
+    approver's explicit consent. It is never re-derived from the clock here.
+    Exits keep resolving their own variety (AMO outside market hours)."""
     if ticket["mode"] == "dry_run":
         return _simulate(ticket)
     if is_closing_sell(ticket):
         return _execute_exit(kite, ticket)
-    return _execute_live(kite, ticket)
+    return _execute_live(kite, ticket, _entry_variety(kite, entry_variety))
+
+
+def _entry_variety(kite: KiteConnect, entry_variety: str | None) -> str:
+    if entry_variety == "regular":
+        return kite.VARIETY_REGULAR
+    if entry_variety == "amo":
+        return kite.VARIETY_AMO
+    # Backstop: every live entry is confirmed through the account safety
+    # gate, which always decides the variety. Refuse before any broker call.
+    raise ValueError(f"No order variety was decided for this live entry ({entry_variety!r}); nothing was sent")
 
 
 def _order_tag(ticket: sqlite3.Row) -> str:
@@ -296,6 +310,10 @@ def resolve_exit_side(transaction_type: str) -> str:
 
 
 def resolve_order_variety(kite: KiteConnect, at: datetime | None = None) -> str:
+    # Exits only (PK-12H): an exit approved outside market hours still goes
+    # out as an AMO — reducing risk stays possible, and PK-8 keeps the
+    # position's protective GTT until the exit fills. New entries never come
+    # here; their variety is decided by the account safety gate.
     if config.USE_AMO_WHEN_MARKET_CLOSED and not market.is_market_open(at):
         return kite.VARIETY_AMO
     return kite.VARIETY_REGULAR
@@ -319,14 +337,13 @@ def _variety_note(kite: KiteConnect, variety: str) -> str:
     return " as AMO (market closed — queued for the next session)" if variety == kite.VARIETY_AMO else ""
 
 
-def _execute_live(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
+def _execute_live(kite: KiteConnect, ticket: sqlite3.Row, variety: str) -> ExecutionResult:
     exchange, symbol = ticket["exchange"], ticket["symbol"]
     transaction_type, quantity, product = ticket["transaction_type"], ticket["quantity"], ticket["product_type"]
     exit_side = resolve_exit_side(transaction_type)
     tick = instruments.get_tick_size(symbol, exchange)
     stop = market.round_to_tick(ticket["stop_loss"], tick)
     target = market.round_to_tick(ticket["target_1"], tick)
-    variety = resolve_order_variety(kite)
 
     # 1. Entry order — common to both trailing and non-trailing branches. A
     # GTT alone cannot open a position, so both branches place a real order first.
