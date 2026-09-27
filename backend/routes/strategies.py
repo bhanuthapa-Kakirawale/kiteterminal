@@ -68,7 +68,7 @@ def list_stop_adjustments(status: str = "pending", kite: KiteConnect = Depends(r
     try:
         rows = conn.execute(
             """
-            SELECT sap.*, t.symbol, t.quantity, t.transaction_type, t.entry_price
+            SELECT sap.*, t.symbol, t.quantity, t.transaction_type, t.entry_price, t.mode
             FROM stop_adjustment_proposals sap
             JOIN trade_tickets t ON t.id = sap.ticket_id
             WHERE t.account_id = ? AND sap.status = ?

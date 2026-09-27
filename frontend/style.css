@@ -643,6 +643,16 @@ th.num, td.num { text-align: right; }
 .status-badge.executed { background: var(--pnl-positive-bg); color: var(--pnl-positive); }
 .status-badge.rejected, .status-badge.cancelled { background: var(--surface-3); color: var(--text-muted); }
 .status-badge.failed, .status-badge.protection_failed, .status-badge.risk_rejected { background: var(--pnl-negative-bg); color: var(--pnl-negative); }
+/* PK-8: exit order at the broker, not filled — must not look like executed/closed. */
+.status-badge.exiting {
+  background: var(--accent-amber-bg); color: var(--accent-amber);
+  border: 1.5px solid var(--accent-amber); font-weight: 700; text-transform: none;
+}
+/* PK-2: broker outcome unknown — must not look like rejected/cancelled/failed. */
+.status-badge.submission_unknown {
+  background: transparent; color: var(--accent-amber);
+  border: 1.5px dashed var(--accent-amber); font-weight: 700; text-transform: none;
+}
 
 .badge-muted {
   font-size: 10.5px;

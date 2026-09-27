@@ -69,8 +69,9 @@
 
   <dialog id="emergency-exit-dialog" class="ticket-dialog emergency-exit-dialog">
     <h2>Emergency Exit All Open Positions</h2>
-    <p>Every open position below will be closed with a MARKET SELL order (an unfilled entry is cancelled instead),
-       respecting the current <strong id="emergency-exit-mode-label">Dry Run</strong> mode.</p>
+    <p>Every open <strong>live</strong> position below will be closed with a real MARKET SELL order (an unfilled
+       entry is cancelled instead). Existing positions are exited in their own execution mode — the Dry Run / Live
+       toggle does not apply here. Simulated (dry-run) positions are not included.</p>
     <div class="table-wrap">
       <table id="emergency-exit-preview-table">
         <thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">Stop</th><th>Strategy</th></tr></thead>

@@ -186,7 +186,22 @@ def _same_day_ist_cutoff_utc() -> str:
     return midnight_ist.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _symbol_exposure(conn: sqlite3.Connection, account_id: int, symbol: str, ctx: PortfolioContext) -> float:
+# Entries claimed for execution whose broker outcome is not yet recorded as
+# 'executed': in flight, UNKNOWN or needs_review (PK-2). Such an order may
+# already be live at the broker, so every limit counts it as if it were open
+# (PK-4) — otherwise two approvals racing each other, or an approval while an
+# earlier one is unresolved, could each see room that only one of them has.
+# The ticket being checked is excluded: it is 'confirmed' itself while it is
+# re-validated at confirmation, and each check adds it once on its own.
+_IN_FLIGHT_ENTRY_WHERE = """
+    account_id = ? AND status = 'confirmed' AND mode = 'live' AND closes_ticket_id IS NULL
+      AND NOT (transaction_type = 'SELL' AND source = 'alert_action')
+      AND id != ?
+"""
+
+
+def _symbol_exposure(conn: sqlite3.Connection, account_id: int, symbol: str, ctx: PortfolioContext,
+                     exclude_ticket_id: int = 0) -> float:
     # Existing holdings (any age) + same-day-executed *live* open tickets for
     # this symbol. Only same-day tickets are added on top of holdings —
     # summing ALL open tickets regardless of age would double-count every
@@ -210,17 +225,28 @@ def _symbol_exposure(conn: sqlite3.Connection, account_id: int, symbol: str, ctx
         """,
         (account_id, symbol, cutoff),
     ).fetchone()
-    return holdings_value + row["total"]
+    in_flight = conn.execute(
+        f"""
+        SELECT COALESCE(SUM(entry_price * quantity), 0) AS total FROM trade_tickets
+        WHERE {_IN_FLIGHT_ENTRY_WHERE} AND symbol = ? AND COALESCE(submitted_at, created_at) >= ?
+        """,
+        (account_id, exclude_ticket_id, symbol, cutoff),
+    ).fetchone()
+    return holdings_value + row["total"] + in_flight["total"]
 
 
 # Single source of truth for "what counts as an open position" — used by
 # both the max_open_positions check below and Phase 5's exit scanner
 # (list_open_positions), so the two can never define "open" differently.
-# Only an EXECUTED exit closes a position: a pending, rejected, failed or
-# cancelled exit ticket leaves it open (it used to hide the position from
-# every scanner, the kill switch and the position-count limit forever).
+# Only an exit whose FILL is proven closes a position: a pending, rejected,
+# failed or cancelled exit ticket leaves it open (it used to hide the
+# position from every scanner, the kill switch and the position-count limit
+# forever), and so does an EXITING one — accepted by Kite, not yet filled —
+# or a partially filled one (PK-8). Such a position still counts for max
+# open positions, portfolio risk, Emergency Exit and reconciliation.
 _CLOSED_BY_EXECUTED_EXIT = (
-    "SELECT closes_ticket_id FROM trade_tickets WHERE closes_ticket_id IS NOT NULL AND status = 'executed'"
+    "SELECT closes_ticket_id FROM trade_tickets WHERE closes_ticket_id IS NOT NULL AND status = 'executed' "
+    f"AND {execution.EXIT_FILL_PROVEN_SQL}"
 )
 _OPEN_POSITION_WHERE = f"""
     account_id = ? AND status = 'executed' AND mode = 'live' AND transaction_type = 'BUY'
@@ -229,9 +255,13 @@ _OPEN_POSITION_WHERE = f"""
 """
 
 
-def _open_position_count(conn: sqlite3.Connection, account_id: int) -> int:
+def _open_position_count(conn: sqlite3.Connection, account_id: int, exclude_ticket_id: int = 0) -> int:
     row = conn.execute(
-        f"SELECT COUNT(*) AS n FROM trade_tickets WHERE {_OPEN_POSITION_WHERE}", (account_id,)
+        f"""
+        SELECT (SELECT COUNT(*) FROM trade_tickets WHERE {_OPEN_POSITION_WHERE})
+             + (SELECT COUNT(*) FROM trade_tickets WHERE {_IN_FLIGHT_ENTRY_WHERE} AND transaction_type = 'BUY') AS n
+        """,
+        (account_id, account_id, exclude_ticket_id),
     ).fetchone()
     return row["n"]
 
@@ -245,17 +275,18 @@ def list_open_positions(conn: sqlite3.Connection, account_id: int) -> list:
     ).fetchall()
 
 
-def _open_risk_sum(conn: sqlite3.Connection, account_id: int) -> float:
+def _open_risk_sum(conn: sqlite3.Connection, account_id: int, exclude_ticket_id: int = 0) -> float:
     # Exit tickets carry a risk_amount only to satisfy the schema; counting
     # them made every executed exit add phantom risk forever.
     row = conn.execute(
         f"""
-        SELECT COALESCE(SUM(risk_amount), 0) AS total FROM trade_tickets
-        WHERE account_id = ? AND status = 'executed' AND mode = 'live' AND closed_at IS NULL
-          AND closes_ticket_id IS NULL
-          AND id NOT IN ({_CLOSED_BY_EXECUTED_EXIT})
+        SELECT (SELECT COALESCE(SUM(risk_amount), 0) FROM trade_tickets
+                WHERE account_id = ? AND status = 'executed' AND mode = 'live' AND closed_at IS NULL
+                  AND closes_ticket_id IS NULL
+                  AND id NOT IN ({_CLOSED_BY_EXECUTED_EXIT}))
+             + (SELECT COALESCE(SUM(risk_amount), 0) FROM trade_tickets WHERE {_IN_FLIGHT_ENTRY_WHERE}) AS total
         """,
-        (account_id,),
+        (account_id, account_id, exclude_ticket_id),
     ).fetchone()
     return row["total"]
 
@@ -282,7 +313,7 @@ def _check_capital_per_trade(ticket_row: sqlite3.Row, ctx: PortfolioContext, set
 
 def _check_single_stock_exposure(conn: sqlite3.Connection, ticket_row: sqlite3.Row, ctx: PortfolioContext, settings: sqlite3.Row) -> CheckResult:
     capital = ticket_row["entry_price"] * ticket_row["quantity"]
-    existing = _symbol_exposure(conn, ticket_row["account_id"], ticket_row["symbol"], ctx)
+    existing = _symbol_exposure(conn, ticket_row["account_id"], ticket_row["symbol"], ctx, ticket_row["id"])
     pct = ((existing + capital) / ctx.portfolio_value * 100) if ctx.portfolio_value else 0
     limit = settings["max_single_stock_exposure_pct"]
     passed = pct <= limit
@@ -299,7 +330,7 @@ def _check_sector_exposure(conn: sqlite3.Connection, ticket_row: sqlite3.Row, ct
 
     capital = ticket_row["entry_price"] * ticket_row["quantity"]
     symbols = sector_mapping.symbols_in_sector(sector)
-    existing = sum(_symbol_exposure(conn, ticket_row["account_id"], s, ctx) for s in symbols)
+    existing = sum(_symbol_exposure(conn, ticket_row["account_id"], s, ctx, ticket_row["id"]) for s in symbols)
     pct = ((existing + capital) / ctx.portfolio_value * 100) if ctx.portfolio_value else 0
     passed = pct <= limit
     message = f"{sector} sector exposure would be {pct:.1f}% of portfolio, limit is {limit}%"
@@ -307,7 +338,7 @@ def _check_sector_exposure(conn: sqlite3.Connection, ticket_row: sqlite3.Row, ct
 
 
 def _check_open_positions(conn: sqlite3.Connection, ticket_row: sqlite3.Row, settings: sqlite3.Row) -> CheckResult:
-    count = _open_position_count(conn, ticket_row["account_id"])
+    count = _open_position_count(conn, ticket_row["account_id"], ticket_row["id"])
     # Only a new BUY ticket would itself become an open position (per the
     # spec's own definition of "open" — executed BUY tickets not yet closed);
     # a SELL ticket doesn't add to this count.
@@ -319,7 +350,7 @@ def _check_open_positions(conn: sqlite3.Connection, ticket_row: sqlite3.Row, set
 
 
 def _check_total_portfolio_risk(conn: sqlite3.Connection, ticket_row: sqlite3.Row, ctx: PortfolioContext, settings: sqlite3.Row) -> CheckResult:
-    existing_risk = _open_risk_sum(conn, ticket_row["account_id"])
+    existing_risk = _open_risk_sum(conn, ticket_row["account_id"], ticket_row["id"])
     this_risk = abs(ticket_row["entry_price"] - ticket_row["stop_loss"]) * ticket_row["quantity"]
     pct = ((existing_risk + this_risk) / ctx.portfolio_value * 100) if ctx.portfolio_value else 0
     limit = settings["max_total_portfolio_risk_pct"]
@@ -345,6 +376,80 @@ def get_held_quantity(kite: KiteConnect, symbol: str) -> int:
     return qty
 
 
+@dataclass
+class ExitProblem:
+    code: str
+    message: str
+    # False only while another exit of the same position is claimed and its
+    # outcome is unresolved — this exit may become valid again if that one
+    # ends failed/not_found. Every other problem can never go away.
+    permanent: bool
+
+
+def linked_exit_problem(conn: sqlite3.Connection, ticket_row) -> ExitProblem | None:
+    """Why an exit ticket (closes_ticket_id set) cannot close its position
+    right now, or None if it can (PK-4). Re-reads the position — never
+    trusts what was true when the exit was created: the position may since
+    have been closed by a GTT, Emergency Exit or another exit ticket, or
+    another exit may already own it. DB-only, no broker call. Mode is not
+    checked here: confirmation checks it first (routes/tickets._claim_mode).
+
+    Quantity: the exit must equal the position's quantity — the best
+    representation of the open quantity available until partial fills are
+    modelled (PK-13). A larger exit would oversell; a smaller one is not
+    modelled either (its fill would delete the whole position's GTT and
+    journal the full quantity as closed)."""
+    position_id = ticket_row["closes_ticket_id"]
+    position = conn.execute(
+        "SELECT * FROM trade_tickets WHERE id = ? AND account_id = ?", (position_id, ticket_row["account_id"])
+    ).fetchone()
+    if (position is None or position["transaction_type"] != "BUY" or position["closes_ticket_id"] is not None
+            or position["status"] != "executed"):
+        state = "does not exist for this account" if position is None else (
+            f"is a {position['transaction_type']} ticket in status '{position['status']}'"
+            + (" that itself closes a position" if position["closes_ticket_id"] is not None else ""))
+        return ExitProblem("EXIT_POSITION_INVALID",
+                           f"Exit ticket {ticket_row['id']} references ticket {position_id}, which {state} — "
+                           f"not an open executed BUY position.", True)
+
+    owner = conn.execute(
+        """
+        SELECT id, status, submission_state, entry_fill_status FROM trade_tickets
+        WHERE closes_ticket_id = ? AND id != ? AND status IN ('confirmed', 'executed')
+        ORDER BY status = 'executed' DESC, id LIMIT 1
+        """,
+        (position_id, ticket_row["id"]),
+    ).fetchone()
+    owner_filled = owner is not None and owner["status"] == "executed" and owner["entry_fill_status"] in (None, "filled")
+    if owner_filled:
+        return ExitProblem("EXIT_POSITION_CLOSED",
+                           f"Position {position_id} was already exited by ticket {owner['id']}.", True)
+    if position["closed_at"] is not None:
+        return ExitProblem("EXIT_POSITION_CLOSED",
+                           f"Position {position_id} is already closed (at {position['closed_at']}).", True)
+    if owner is not None and owner["status"] == "executed":
+        # PK-8: EXITING (or partially filled) — the owning exit is at the
+        # broker but its fill is not proven. Not permanent: if it is rejected
+        # or cancelled unfilled, this exit may close the position after all.
+        state = ("awaiting its broker fill (EXITING)" if owner["entry_fill_status"] == "pending"
+                 else f"{owner['entry_fill_status']} — needs review")
+        return ExitProblem("EXIT_ALREADY_IN_PROGRESS",
+                           f"Exit ticket {owner['id']} for position {position_id} is already at the broker, "
+                           f"{state}. DO NOT RESUBMIT.", False)
+    if owner is not None:
+        return ExitProblem("EXIT_ALREADY_IN_PROGRESS",
+                           f"Exit ticket {owner['id']} for position {position_id} is already being executed "
+                           f"(submission {owner['submission_state'] or 'in progress'}) — its broker outcome must be "
+                           f"resolved first. DO NOT RESUBMIT.", False)
+    if ticket_row["quantity"] != position["quantity"]:
+        return ExitProblem("EXIT_QUANTITY_MISMATCH",
+                           f"Exit quantity {ticket_row['quantity']} does not match the {position['quantity']} shares "
+                           f"of position {position_id}"
+                           + (" — it would sell more than the position holds." if ticket_row["quantity"] > position["quantity"]
+                              else " — partial exits of a tracked position are not supported."), True)
+    return None
+
+
 def _check_exit_or_reduction(conn: sqlite3.Connection, ticket_row: sqlite3.Row, kite: KiteConnect) -> CheckResult:
     """Runs instead of the six position-opening checks for any ticket
     execution.is_closing_sell() considers a closing sell. Two ways a SELL
@@ -357,20 +462,13 @@ def _check_exit_or_reduction(conn: sqlite3.Connection, ticket_row: sqlite3.Row, 
         real holdings were never opened via a trade_ticket in this app at
         all (pre-existing positions, or bought directly in Kite)."""
     if ticket_row["closes_ticket_id"] is not None:
-        referenced = conn.execute(
-            "SELECT * FROM trade_tickets WHERE id = ? AND account_id = ?",
-            (ticket_row["closes_ticket_id"], ticket_row["account_id"]),
-        ).fetchone()
-        valid = (
-            referenced is not None
-            and referenced["transaction_type"] == "BUY"
-            and referenced["status"] == "executed"
-            and referenced["closed_at"] is None
-        )
+        # The same validation confirmation re-runs (PK-4), so a ticket is
+        # never approvable here yet refused there for a reason already true.
+        problem = linked_exit_problem(conn, ticket_row)
+        valid = problem is None
         message = (
             "Exit ticket — closes a specific tracked position, position-sizing checks not applicable"
-            if valid else
-            "Exit ticket rejected: closes_ticket_id does not reference a valid open executed BUY ticket for this account"
+            if valid else f"Exit ticket rejected: {problem.message}"
         )
     else:
         held_qty = get_held_quantity(kite, ticket_row["symbol"])
@@ -423,6 +521,33 @@ def run_checks(
     return RiskCheckReport(checks=checks)
 
 
+def _transition_from_draft(conn: sqlite3.Connection, ticket_id: int, to_status: str,
+                           risk_check_results: str | None = None) -> bool:
+    """Applies a risk-check outcome only if the ticket is still 'draft'. If
+    not, someone else moved it while the checks ran: its current state
+    stands, and one event says the result was discarded."""
+    if risk_check_results is None:
+        cursor = conn.execute(
+            "UPDATE trade_tickets SET status = ? WHERE id = ? AND status = 'draft'", (to_status, ticket_id))
+    else:
+        cursor = conn.execute(
+            "UPDATE trade_tickets SET status = ?, risk_check_results = ? WHERE id = ? AND status = 'draft'",
+            (to_status, risk_check_results, ticket_id),
+        )
+    if cursor.rowcount == 1:
+        return True
+    conn.rollback()
+    current = conn.execute("SELECT status FROM trade_tickets WHERE id = ?", (ticket_id,)).fetchone()
+    if current is not None:
+        conn.execute(
+            "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'modified', ?)",
+            (ticket_id, f"Risk check finished after the ticket had become '{current['status']}'; its result "
+                        f"({to_status}) was discarded and the ticket left unchanged."),
+        )
+        conn.commit()
+    return False
+
+
 def run_risk_checks_and_transition(
     conn: sqlite3.Connection, account: sqlite3.Row, ticket_id: int, kite: KiteConnect,
     ctx: PortfolioContext | None = None,
@@ -434,7 +559,13 @@ def run_risk_checks_and_transition(
     can never drift apart. Raises RiskCheckUnavailableError (not translated
     to an HTTP error here — this module has no FastAPI dependency; callers
     that are HTTP endpoints translate it themselves) if the risk check
-    itself couldn't run at all."""
+    itself couldn't run at all.
+
+    Both writes are compare-and-set on status='draft' (PK-4): the checks
+    call Kite and take time, and the ticket may be cancelled/rejected
+    meanwhile (Cancel All Pending, reject). A result that arrives after that
+    is discarded — it must never turn a withdrawn ticket back into an
+    approvable one."""
     ticket = conn.execute(
         "SELECT * FROM trade_tickets WHERE id = ? AND account_id = ?", (ticket_id, account["id"])
     ).fetchone()
@@ -447,19 +578,17 @@ def run_risk_checks_and_transition(
         # The risk check itself couldn't run (Kite API failure) — this is
         # not the same as the ticket failing a check. Don't leave it
         # stuck in 'draft' forever as a dead row in Ticket History.
-        conn.execute("UPDATE trade_tickets SET status = 'cancelled' WHERE id = ?", (ticket_id,))
-        conn.execute(
-            "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'rejected', ?)",
-            (ticket_id, f"Risk check could not be evaluated: {e.message}"),
-        )
-        conn.commit()
+        if _transition_from_draft(conn, ticket_id, "cancelled"):
+            conn.execute(
+                "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'rejected', ?)",
+                (ticket_id, f"Risk check could not be evaluated: {e.message}"),
+            )
+            conn.commit()
         raise
 
     new_status = "pending_confirmation" if report.passed else "risk_rejected"
-    conn.execute(
-        "UPDATE trade_tickets SET status = ?, risk_check_results = ? WHERE id = ?",
-        (new_status, json.dumps(report.as_list()), ticket_id),
-    )
+    if not _transition_from_draft(conn, ticket_id, new_status, json.dumps(report.as_list())):
+        return
     if new_status == "risk_rejected":
         detail = "; ".join(c.message for c in report.checks if not c.passed)
         conn.execute(

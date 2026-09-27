@@ -461,7 +461,9 @@ def build_payload(ticket: dict, settings=None) -> dict:
         "exit_plan": _exit_plan(ticket, module, params),
         "signal_candle_date": ticket.get("signal_date"),
         "freshness": _staleness(ticket.get("signal_date"), last_candle_date),
-        "execution_mode": execution.get_execution_mode(),
+        # The mode this ticket executes in: its own once stamped (an exit
+        # inherits its position's, PK-3), else the global one for a new entry.
+        "execution_mode": ticket.get("mode") or execution.get_execution_mode(),
         "kite_chart": {
             "url": ticket.get("kite_chart_url"),
             "status": ticket.get("kite_chart_status"),

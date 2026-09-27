@@ -402,10 +402,13 @@ def _create_entry_ticket(
 
 
 def _has_pending_exit(conn: sqlite3.Connection, position_ticket_id: int) -> bool:
+    # An executed exit whose fill is not proven (EXITING / partial, PK-8)
+    # counts too: the position is still open, but its exit is in flight.
     row = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) AS n FROM trade_tickets
-        WHERE closes_ticket_id = ? AND status IN ('pending_confirmation', 'risk_rejected', 'confirmed')
+        WHERE closes_ticket_id = ? AND (status IN ('pending_confirmation', 'risk_rejected', 'confirmed')
+                                        OR (status = 'executed' AND NOT ({execution.EXIT_FILL_PROVEN_SQL})))
         """,
         (position_ticket_id,),
     ).fetchone()
@@ -459,15 +462,16 @@ def _create_exit_ticket(
             stop_loss, target_1, target_2,
             trailing_enabled, trailing_trigger, trailing_distance,
             product_type, use_gtt, risk_amount, risk_reward_ratio,
-            rationale, status, closes_ticket_id, rule_checklist
+            rationale, status, closes_ticket_id, rule_checklist, mode
         ) VALUES (?, 'strategy', ?, ?, ?, ?, ?, 'SELL', ?, ?, 'MARKET', ?, ?, NULL,
-                  0, NULL, NULL, ?, 1, ?, ?, ?, 'draft', ?, ?)
+                  0, NULL, NULL, ?, 1, ?, ?, ?, 'draft', ?, ?, ?)
         """,
         (
             account["id"], module.EXIT_STRATEGY_NAME, strategy_version, position["symbol"], position["exchange"], position["instrument_token"],
             position["quantity"], entry_price, position["stop_loss"], position["target_1"],
             position["product_type"], metrics["risk_amount"], metrics["risk_reward_ratio"],
-            result["rationale"], position["id"], json.dumps(result["checklist"]),
+            # An exit inherits the position's mode, never the global one (PK-3).
+            result["rationale"], position["id"], json.dumps(result["checklist"]), position["mode"],
         ),
     )
     ticket_id = cursor.lastrowid
@@ -496,16 +500,25 @@ def expire_stale_signals(conn: sqlite3.Connection, account_id: int, current_sign
         """,
         (account_id, current_signal_date),
     ).fetchall()
+    expired = []
     for r in rows:
         from_date = r["signal_date"] or r["created_at"][:10]
-        conn.execute("UPDATE trade_tickets SET status = 'cancelled' WHERE id = ?", (r["id"],))
+        # Conditional (PK-4): a signal approved since the SELECT is being
+        # executed — possibly with an UNKNOWN broker outcome — and must never
+        # be overwritten with 'cancelled'.
+        if conn.execute(
+            "UPDATE trade_tickets SET status = 'cancelled' WHERE id = ? AND status IN ('draft', 'pending_confirmation')",
+            (r["id"],),
+        ).rowcount != 1:
+            continue
         conn.execute(
             "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'rejected', ?)",
             (r["id"], f"Expired automatically: entry signal from the {from_date} candle was not approved before "
                       f"the {current_signal_date} scan — its price levels are stale."),
         )
+        expired.append(r["id"])
     conn.commit()
-    return [r["id"] for r in rows]
+    return expired
 
 
 # --------------------------------------------------------------------------
@@ -587,11 +600,15 @@ def resolve_stop_adjustment(
 ) -> dict:
     """Confirm or reject a pending breakeven proposal. Confirm calls
     kite.modify_gtt with the SAME single-trigger/single-leg shape
-    trailing_engine._try_ratchet uses (respecting dry_run/live mode exactly
-    like every other order action), then logs a stop_adjusted_breakeven
+    trailing_engine._try_ratchet uses, then logs a stop_adjusted_breakeven
     ticket_event on the original ticket. Any condition that would make the
     broker reject the modification is raised as ValueError (-> HTTP 409 with
-    a readable message) instead of an unhandled 500."""
+    a readable message) instead of an unhandled 500.
+
+    The position's OWN mode decides (PK-3), never the global toggle: a live
+    position's broker GTT is always modified, so the app never shows a stop
+    the broker does not have; a dry-run position only has its recorded stop
+    moved and no broker call is made."""
     proposal = conn.execute(
         "SELECT * FROM stop_adjustment_proposals WHERE id = ?", (proposal_id,)
     ).fetchone()
@@ -611,7 +628,7 @@ def resolve_stop_adjustment(
     ticket = conn.execute("SELECT * FROM trade_tickets WHERE id = ?", (proposal["ticket_id"],)).fetchone()
     if ticket is None or ticket["status"] != "executed" or ticket["closed_at"] is not None:
         raise ValueError("The position this proposal belongs to is no longer open — reject the proposal.")
-    mode = execution.get_execution_mode()
+    mode = ticket["mode"]
     tick = instruments.get_tick_size(ticket["symbol"], ticket["exchange"])
     new_stop = market.round_to_tick(proposal["proposed_stop"], tick)
 

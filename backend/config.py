@@ -20,6 +20,18 @@ USE_AMO_WHEN_MARKET_CLOSED = True
 # How often the order monitor polls the broker's order book while any live
 # order the app placed is still waiting for a fill.
 ORDER_MONITOR_INTERVAL_SECONDS = 20
+# A live ticket still marked 'submitting' this long after its claim lost its
+# request mid-submission (crash/restart): the order monitor treats it as an
+# UNKNOWN outcome. The broker call path is at most three sequential Kite calls
+# with kiteconnect's 7 s timeout (~21 s), so 120 s never races a live request.
+SUBMISSION_STALE_SECONDS = 120
+# How long an UNKNOWN submission is searched for by its order tag before the
+# monitor may conclude that no broker order exists. Kite lists accepted, AMO
+# and RMS-rejected orders within seconds; 15 min (~45 monitor cycles) is a
+# deliberately conservative margin. The conclusion is only drawn on the same
+# IST day as the submission — once the order book has rolled over, absence
+# is not evidence and the ticket goes to manual review instead.
+UNKNOWN_ORDER_RECONCILE_WINDOW_SECONDS = 15 * 60
 
 # Historical OHLC backfill / indicators.
 # Kite's documented historical-data rate limit is 3 requests/second — the job

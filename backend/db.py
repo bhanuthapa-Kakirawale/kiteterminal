@@ -1,9 +1,12 @@
 import json
+import logging
 import os
 import sqlite3
 from pathlib import Path
 
 from backend import crypto
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent / "kite_terminal.db"
 
@@ -803,6 +806,103 @@ def _ensure_stop_adjusted_breakeven_event_type(conn: sqlite3.Connection) -> None
     conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _ensure_submission_unknown_event_type(conn: sqlite3.Connection) -> None:
+    # Same rebuild rationale again — PK-2: a broker submission whose outcome
+    # is unknown (the order may or may not exist at Kite) gets its own event
+    # type, so ticket history never reads "execution failed" for an order
+    # that may well be live.
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='ticket_events'"
+    ).fetchone()
+    if row is None or "'submission_unknown'" in row["sql"]:
+        return
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        """
+        CREATE TABLE ticket_events_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id   INTEGER NOT NULL REFERENCES trade_tickets(id),
+            event_type  TEXT NOT NULL CHECK (event_type IN (
+                            'created', 'confirmed', 'rejected', 'executed', 'execution_failed',
+                            'protection_failed', 'modified', 'trailing_adjusted', 'closed', 'risk_rejected',
+                            'archived', 'stop_adjusted_breakeven', 'submission_unknown'
+                        )),
+            detail      TEXT,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO ticket_events_new (id, ticket_id, event_type, detail, created_at) "
+        "SELECT id, ticket_id, event_type, detail, created_at FROM ticket_events"
+    )
+    conn.execute("DROP TABLE ticket_events")
+    conn.execute("ALTER TABLE ticket_events_new RENAME TO ticket_events")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ticket_events_ticket ON ticket_events(ticket_id)")
+
+    violations = conn.execute("PRAGMA foreign_key_check(ticket_events)").fetchall()
+    if violations:
+        raise RuntimeError(f"ticket_events rebuild left foreign key violations: {[dict(v) for v in violations]}")
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
+_TRADE_TICKET_SUBMISSION_COLUMNS = [
+    # PK-2. The Kite order tag sent with this ticket's order — the key the
+    # order monitor searches the broker's order book by when the outcome of
+    # a submission is unknown. See execution.order_tag_for.
+    ("order_tag", "TEXT"),
+    # NULL (never submitted / dry run / pre-PK-2) | submitting | acknowledged
+    # | rejected | unknown | adopted | not_found | needs_review — see
+    # execution.py's SUBMISSION_* constants.
+    ("submission_state", "TEXT"),
+    # UTC, written with the claim, before the broker call.
+    ("submitted_at", "TEXT"),
+]
+
+
+def _ensure_submission_tracking_columns(conn: sqlite3.Connection) -> None:
+    # Must run after _ensure_alert_action_source: that rebuild copies an
+    # explicit column list and would silently drop these on an old database.
+    for column, sql_type in _TRADE_TICKET_SUBMISSION_COLUMNS:
+        if not _column_exists(conn, "trade_tickets", column):
+            conn.execute(f"ALTER TABLE trade_tickets ADD COLUMN {column} {sql_type}")
+
+
+def _ensure_single_exit_owner_index(conn: sqlite3.Connection) -> None:
+    # PK-4 storage backstop: at most one exit ticket may OWN a position —
+    # claimed for execution ('confirmed': in flight, unknown or
+    # needs_review) or 'executed'. Two exits of one position racing through
+    # confirmation both pass the application checks; the second claim then
+    # fails here instead of sending a second SELL. Exits that no longer own
+    # the position (failed at the broker, rejected, cancelled) drop out, so
+    # a failed exit frees the position for a new one.
+    #
+    # Must run after every trade_tickets rebuild (they drop indexes). A
+    # future status that owns a position (e.g. a PK-7/PK-8 'exiting') must be
+    # added to the predicate; partial exits (PK-13) must relax it.
+    duplicates = conn.execute(
+        """
+        SELECT closes_ticket_id, COUNT(*) AS n FROM trade_tickets
+        WHERE closes_ticket_id IS NOT NULL AND status IN ('confirmed', 'executed')
+        GROUP BY closes_ticket_id HAVING n > 1
+        """
+    ).fetchall()
+    if duplicates:
+        # Existing data already violates the invariant: never block startup
+        # over it. The application-level checks still apply.
+        logger.warning(
+            "Not creating idx_trade_tickets_one_exit_owner: position(s) %s already have more than one "
+            "claimed/executed exit ticket — review them in Ticket History.",
+            [d["closes_ticket_id"] for d in duplicates],
+        )
+        return
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_tickets_one_exit_owner ON trade_tickets(closes_ticket_id) "
+        "WHERE closes_ticket_id IS NOT NULL AND status IN ('confirmed', 'executed')"
+    )
+
+
 def _seed_risk_settings(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -1222,6 +1322,7 @@ def init_db() -> None:
         _ensure_kite_chart_columns(conn)
         _ensure_kite_chart_event_type(conn)
         _ensure_stop_adjusted_breakeven_event_type(conn)
+        _ensure_submission_unknown_event_type(conn)
         _ensure_starting_capital_column(conn)
         _ensure_strategy_version_column(conn)
         _ensure_closed_trades_strategy_version_column(conn)
@@ -1229,6 +1330,8 @@ def init_db() -> None:
         _ensure_backtest_runs_rigor_columns(conn)
         _ensure_execution_tracking_columns(conn)
         _ensure_alert_action_source(conn)
+        _ensure_submission_tracking_columns(conn)
+        _ensure_single_exit_owner_index(conn)
         _ensure_instrument_tick_size_column(conn)
         _ensure_watchlist_tag_column(conn)
         _ensure_dashboard_panels_screen_column(conn)

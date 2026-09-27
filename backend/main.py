@@ -27,6 +27,7 @@ from backend import (
 )
 from backend.accounts import get_default_account
 from backend.db import init_db
+from backend.security import TerminalOriginGuard
 from backend.routes import (
     auth,
     automation as automation_routes,
@@ -111,7 +112,12 @@ app.include_router(kill_switch.router)
 app.include_router(reconciliation_routes.router)
 app.include_router(automation_routes.router)
 
+# Rejects cross-origin writes and WebSocket handshakes before routing (P0-8).
+app.add_middleware(TerminalOriginGuard)
+
 # Frontend is served same-origin from this app, so no CORS middleware is needed.
+# Its absence is part of the P0-8 defence: a cross-origin preflight for the
+# X-Kite-Terminal header gets no Access-Control-Allow-* reply and fails.
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
 

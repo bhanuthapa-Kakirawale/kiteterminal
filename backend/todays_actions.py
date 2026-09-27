@@ -50,7 +50,7 @@ def get_exit_candidates(conn: sqlite3.Connection, account_id: int) -> list[dict]
 def get_pending_adjustments(conn: sqlite3.Connection, account_id: int) -> list[dict]:
     rows = conn.execute(
         """
-        SELECT sap.*, t.symbol FROM stop_adjustment_proposals sap
+        SELECT sap.*, t.symbol, t.mode FROM stop_adjustment_proposals sap
         JOIN trade_tickets t ON t.id = sap.ticket_id
         WHERE t.account_id = ? AND sap.status = 'pending'
         ORDER BY sap.created_at DESC
