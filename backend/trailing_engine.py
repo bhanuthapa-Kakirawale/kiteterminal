@@ -4,7 +4,7 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-from kiteconnect.exceptions import GeneralException, InputException, OrderException
+from kiteconnect.exceptions import GeneralException, InputException, OrderException, TokenException
 
 from backend import config, execution, instruments, journal, kite_client, market, reconciliation
 from backend.accounts import get_default_account
@@ -18,6 +18,8 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # In-memory only (not persisted) — resets on restart, which is fine: a fresh
 # process gets a clean slate of 3 retries before escalating again.
 _consecutive_failures: dict[int, int] = {}
+# Same idea for a ticket whose whole per-cycle check raised (PK-6).
+_consecutive_errors: dict[int, int] = {}
 _last_active_count = 0
 
 
@@ -36,6 +38,32 @@ async def run_trailing_loop() -> None:
 
 
 async def _tick_once() -> None:
+    # Every Kite call in a cycle is blocking (up to the client timeout), so
+    # the cycle runs in a worker thread, like order_monitor and
+    # reconciliation — never on the event loop that serves the UI.
+    await asyncio.to_thread(_tick_sync)
+
+
+def monitored_positions(conn: sqlite3.Connection, account_id: int) -> list[sqlite3.Row]:
+    """Every live open position a protective GTT is watching — trailing or
+    not. A fixed stop + target position has an OCO GTT whose firing closes
+    it just as surely as a trailing stop does (P0-5), so eligibility does
+    not depend on trailing_enabled. 'executed' keeps out claimed and
+    unknown-outcome submissions (PK-2), and an entry still waiting for its
+    fill has no position yet: a GTT id alone is never enough."""
+    return conn.execute(
+        """
+        SELECT * FROM trade_tickets
+        WHERE account_id = ? AND mode = 'live' AND status = 'executed'
+          AND closed_at IS NULL AND kite_gtt_id IS NOT NULL
+          AND COALESCE(entry_fill_status, 'filled') != 'pending'
+        ORDER BY id
+        """,
+        (account_id,),
+    ).fetchall()
+
+
+def _tick_sync() -> None:
     global _last_active_count
     conn = get_connection()
     try:
@@ -44,16 +72,7 @@ async def _tick_once() -> None:
             _last_active_count = 0
             return
 
-        # An entry still waiting for its fill has no position to trail yet.
-        tickets = conn.execute(
-            """
-            SELECT * FROM trade_tickets
-            WHERE account_id = ? AND mode = 'live' AND status = 'executed'
-              AND trailing_enabled = 1 AND closed_at IS NULL
-              AND COALESCE(entry_fill_status, 'filled') != 'pending'
-            """,
-            (account["id"],),
-        ).fetchall()
+        tickets = monitored_positions(conn, account["id"])
         _last_active_count = len(tickets)
         if not tickets:
             return
@@ -63,24 +82,71 @@ async def _tick_once() -> None:
         except kite_client.NoActiveSessionError:
             return  # heartbeat still fires — UI can tell "ran but skipped" from "not running"
 
+        # One GTT book per cycle for every position. Without it nothing can
+        # be judged, so a failure here ends the cycle.
         gtts = kite.get_gtts()
         gtt_status = {g["id"]: g.get("status", "active") for g in gtts}
-        keys = [f"{t['exchange']}:{t['symbol']}" for t in tickets]
-        ltp_data = kite.ltp(keys)
+        ltp_data = _trailing_ltps(kite, tickets, gtt_status)
 
         for ticket in tickets:
-            _process_ticket(kite, conn, ticket, ltp_data, gtt_status)
-        conn.commit()
+            # One position's failure must not stop the others being checked:
+            # each is its own transaction, rolled back alone if it raises.
+            try:
+                _process_ticket(kite, conn, ticket, ltp_data, gtt_status)
+                conn.commit()
+                _consecutive_errors.pop(ticket["id"], None)
+            except TokenException:
+                conn.rollback()
+                raise  # the session is gone — every later call would fail too
+            except Exception as e:
+                conn.rollback()
+                logger.exception("GTT watcher failed for ticket %d (%s); continuing with the rest",
+                                 ticket["id"], ticket["symbol"])
+                _note_ticket_error(ticket, e)
     finally:
         conn.close()
+
+
+def _trailing_ltps(kite, tickets: list[sqlite3.Row], gtt_status: dict) -> dict:
+    """LTPs, in one batch, for the only positions that need one: trailing
+    positions whose GTT is still active. A failure only postpones trailing —
+    closure checks do not need an LTP."""
+    keys = sorted({
+        f"{t['exchange']}:{t['symbol']}" for t in tickets
+        if t["trailing_enabled"] and gtt_status.get(t["kite_gtt_id"]) == "active"
+    })
+    if not keys:
+        return {}
+    try:
+        return kite.ltp(keys)
+    except TokenException:
+        raise
+    except Exception:
+        logger.exception("Could not fetch LTPs for trailing; trailing skipped this cycle, GTT checks continue")
+        return {}
+
+
+def _note_ticket_error(ticket: sqlite3.Row, error: Exception) -> None:
+    count = _consecutive_errors.get(ticket["id"], 0) + 1
+    _consecutive_errors[ticket["id"]] = count
+    if count >= 3:
+        ticker_manager.broadcast({
+            "type": "trailing_error",
+            "ticket_id": ticket["id"],
+            "message": f"{ticket['symbol']}: checking its protective GTT has failed {count} times in a row: "
+                       f"{type(error).__name__}: {error}",
+        })
 
 
 def _process_ticket(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, ltp_data: dict, gtt_status: dict) -> None:
     if ticket["kite_gtt_id"] is None:
         # No GTT exists to manage (e.g. protection_failed at execution time) —
-        # nothing for the trailing engine to do until a human intervenes.
+        # nothing to watch until a human intervenes. monitored_positions()
+        # already excludes these; kept for any other caller.
         return
 
+    # GTT lifecycle first, for every monitored position; the trailing
+    # ratchet after it, for trailing positions only.
     status = gtt_status.get(ticket["kite_gtt_id"])
     if status != "active":
         # Gone from the book, or 'triggered': the stop/target fired. Any other
@@ -96,6 +162,9 @@ def _process_ticket(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, ltp_dat
         else:
             _handle_protection_lost(conn, ticket, status)
         return
+
+    if not ticket["trailing_enabled"]:
+        return  # fixed stop + target (OCO): nothing to ratchet
 
     key = f"{ticket['exchange']}:{ticket['symbol']}"
     ltp = ltp_data.get(key, {}).get("last_price")
@@ -147,6 +216,21 @@ def _handle_gtt_closure(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, fil
     explicitly exited or Kite auto-triggered the stop/target."""
     exit_side = execution.resolve_exit_side(ticket["transaction_type"])
 
+    # Earlier tickets' writes in this tick stay durable whatever happens below.
+    conn.commit()
+    owner = conn.execute(
+        "SELECT id, status, submission_state FROM trade_tickets "
+        "WHERE closes_ticket_id = ? AND status IN ('confirmed', 'executed') LIMIT 1",
+        (ticket["id"],),
+    ).fetchone()
+    if owner is not None:
+        # Another exit already owns this position (PK-4: at most one may —
+        # db._ensure_single_exit_owner_index), typically one whose broker
+        # outcome is still unknown. Recording a second exit here would be
+        # a guess; flag it for a human instead and let that exit resolve.
+        _handle_owned_closure(conn, ticket, owner["id"], owner["status"], owner["submission_state"])
+        return
+
     if fill is not None:
         fill_price = fill["average_price"]
         matched_order_id = fill["order_id"]
@@ -178,26 +262,32 @@ def _handle_gtt_closure(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, fil
         }
     })
 
-    cursor = conn.execute(
-        """
-        INSERT INTO trade_tickets (
-            account_id, source, strategy_name, symbol, exchange, instrument_token,
-            transaction_type, quantity, entry_price, entry_order_type,
-            stop_loss, target_1, target_2,
-            trailing_enabled, product_type, use_gtt, risk_amount, risk_reward_ratio,
-            rationale, status, mode, executed_at, closes_ticket_id, rule_checklist,
-            entry_fill_status, filled_price, filled_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'MARKET', ?, ?, NULL,
-                  0, ?, 1, ?, ?, ?, 'executed', ?, datetime('now'), ?, ?, ?, ?, datetime('now'))
-        """,
-        (
-            ticket["account_id"], ticket["source"], ticket["strategy_name"], ticket["symbol"],
-            ticket["exchange"], ticket["instrument_token"], exit_side, ticket["quantity"], fill_price,
-            ticket["stop_loss"], ticket["target_1"], ticket["product_type"],
-            metrics["risk_amount"], metrics["risk_reward_ratio"], rationale, ticket["mode"],
-            ticket["id"], rule_checklist, "filled" if fill is not None else "estimated", fill_price,
-        ),
-    )
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO trade_tickets (
+                account_id, source, strategy_name, symbol, exchange, instrument_token,
+                transaction_type, quantity, entry_price, entry_order_type,
+                stop_loss, target_1, target_2,
+                trailing_enabled, product_type, use_gtt, risk_amount, risk_reward_ratio,
+                rationale, status, mode, executed_at, closes_ticket_id, rule_checklist,
+                entry_fill_status, filled_price, filled_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'MARKET', ?, ?, NULL,
+                      0, ?, 1, ?, ?, ?, 'executed', ?, datetime('now'), ?, ?, ?, ?, datetime('now'))
+            """,
+            (
+                ticket["account_id"], ticket["source"], ticket["strategy_name"], ticket["symbol"],
+                ticket["exchange"], ticket["instrument_token"], exit_side, ticket["quantity"], fill_price,
+                ticket["stop_loss"], ticket["target_1"], ticket["product_type"],
+                metrics["risk_amount"], metrics["risk_reward_ratio"], rationale, ticket["mode"],
+                ticket["id"], rule_checklist, "filled" if fill is not None else "estimated", fill_price,
+            ),
+        )
+    except sqlite3.IntegrityError:
+        # An exit was claimed between the check above and this insert.
+        conn.rollback()
+        _handle_owned_closure(conn, ticket, None, "confirmed", None)
+        return
     sell_ticket_id = cursor.lastrowid
     _log_event(conn, sell_ticket_id, "created", rationale)
     _log_event(conn, sell_ticket_id, "executed", rationale)
@@ -205,6 +295,7 @@ def _handle_gtt_closure(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, fil
     conn.execute("UPDATE trade_tickets SET closed_at = datetime('now') WHERE id = ?", (ticket["id"],))
     _log_event(conn, ticket["id"], "closed",
                f"GTT no longer active on Kite; recorded as closed via ticket {sell_ticket_id}.")
+    execution.supersede_sibling_exits(conn, ticket["id"], sell_ticket_id)
     conn.commit()
 
     try:
@@ -212,6 +303,23 @@ def _handle_gtt_closure(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, fil
     except ValueError:
         logger.exception("Failed to record closed_trades row for synthesized exit ticket %d", sell_ticket_id)
     ticker_manager.broadcast({"type": "tickets_changed", "reason": "gtt_closed", "ticket_id": ticket["id"]})
+
+
+def _handle_owned_closure(conn: sqlite3.Connection, ticket: sqlite3.Row, owner_id: int | None,
+                          owner_status: str, owner_submission: str | None) -> None:
+    owner = f"exit ticket {owner_id}" if owner_id is not None else "another exit ticket"
+    detail = (
+        f"{ticket['symbol']}: protective GTT {ticket['kite_gtt_id']} is no longer active, but {owner} already owns "
+        f"this position ({owner_status}, submission {owner_submission or 'n/a'}). Not recorded as a second exit — "
+        f"POSSIBLE DOUBLE SELL. Check Kite's holdings and orders now."
+    )
+    actual = f"GTT {ticket['kite_gtt_id']} fired while {owner} owns the position"
+    if reconciliation._already_logged(conn, ticket["id"], "position_state", actual):
+        return  # already flagged; re-checked each tick until the owning exit resolves
+    reconciliation.log_mismatch(conn, ticket["id"], "position_state",
+                                expected="one exit for this position", actual=actual, detail=detail)
+    conn.commit()
+    ticker_manager.broadcast({"type": "trailing_error", "ticket_id": ticket["id"], "message": detail})
 
 
 def _handle_protection_lost(conn: sqlite3.Connection, ticket: sqlite3.Row, gtt_status: str) -> None:

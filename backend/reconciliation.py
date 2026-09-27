@@ -103,7 +103,8 @@ def _check_order_status(conn: sqlite3.Connection, kite, account) -> None:
 
 def _check_gtt_state(conn: sqlite3.Connection, kite, account) -> None:
     # One batch call, not per-ticket — deliberately duplicates part of what
-    # trailing_engine.py already detects on its own tick: a second,
+    # trailing_engine.py's GTT watcher (every live protected position,
+    # trailing or not, since PK-6) already detects on its own tick: a second,
     # independent check catching anything that loop's own cycle might have
     # missed, not wasted work. Logged under check_type='order_status' since
     # the reconciliation_log schema only distinguishes order-side vs

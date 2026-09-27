@@ -125,9 +125,9 @@ class TickerManager:
 
     def broadcast(self, message: dict) -> None:
         """Public entrypoint for broadcasters other than KiteTicker's own
-        callbacks (e.g. the trailing engine) that already run on the asyncio
-        loop — safe to call directly since call_soon_threadsafe is only
-        needed to cross from KiteTicker's background thread."""
+        callbacks — the background loops, which call it from their worker
+        threads (trailing engine, order monitor). Safe from any thread:
+        _broadcast hands every message over with call_soon_threadsafe."""
         self._broadcast(message)
 
 
