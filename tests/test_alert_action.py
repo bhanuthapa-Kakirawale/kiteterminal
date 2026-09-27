@@ -5,7 +5,7 @@ fix needed for a sell with no originating trade_ticket (closes_ticket_id
 stays NULL)."""
 import json
 
-from conftest import account_id, ticket_row
+from conftest import displayed_mode, account_id, ticket_row
 
 
 def _insert_position_ticket(db, **overrides) -> int:
@@ -174,7 +174,7 @@ def test_alert_action_sell_live_execution_no_protective_gtt_no_journal_row(env):
         "symbol": "TCS", "quantity": 10, "entry_order_type": "MARKET", "entry_price": 2600.0,
         "rationale": "cut loss", "alert_type": "breach_loss",
     }).json()["data"]
-    done = env.client.post(f"/api/tickets/{created['id']}/confirm").json()["data"]
+    done = env.client.post(f"/api/tickets/{created['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
 
     assert done["status"] == "executed"
     assert done["kite_gtt_id"] is None  # no protective GTT attempted for a closing sell
@@ -200,7 +200,7 @@ def test_alert_action_sell_rejected_order_does_not_crash_order_monitor(env):
         "symbol": "TCS", "quantity": 10, "entry_order_type": "MARKET", "entry_price": 2600.0,
         "rationale": "cut loss", "alert_type": "breach_loss",
     }).json()["data"]
-    done = env.client.post(f"/api/tickets/{created['id']}/confirm").json()["data"]
+    done = env.client.post(f"/api/tickets/{created['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
     env.kite.set_order_state(done["kite_order_id"], "REJECTED", status_message="RMS: rejected")
 
     result = order_monitor.check_pending_orders(env.kite)  # must not raise

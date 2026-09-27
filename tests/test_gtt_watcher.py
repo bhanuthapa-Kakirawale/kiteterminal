@@ -25,7 +25,7 @@ import pytest
 import requests
 from kiteconnect.exceptions import NetworkException, TokenException
 
-from conftest import set_mode, ticket_row
+from conftest import displayed_mode, set_mode, ticket_row
 from test_baseline_api import _insert_ticket
 from test_live_safety import (  # noqa: F401 — unsafe_client is a fixture
     _assert_unknown_response, _call, _closed_trades_for, _event_types, _infy_position, _live_position,
@@ -135,7 +135,7 @@ def test_rsi_mean_reversion_position_oco_closure_is_detected(env, market_open):
                   ("rsi_mean_reversion", 0, "pending_confirmation"), f"unexpected RSI ticket: {t}")
 
     set_mode(env.db, "live")
-    done = env.client.post(f"/api/tickets/{tid}/confirm").json()["data"]
+    done = env.client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db)).json()["data"]
     _precondition(done["status"] == "executed" and done["kite_gtt_id"], f"RSI entry not placed: {done}")
     order_monitor.check_pending_orders(env.kite)
     row = ticket_row(env.db, tid)

@@ -9,7 +9,7 @@ from datetime import date, timedelta
 import pytest
 from kiteconnect.exceptions import InputException, OrderException
 
-from conftest import account_id, add_watch, last_weekday, make_candles, seed_ohlc, set_mode, ticket_row
+from conftest import displayed_mode, account_id, add_watch, last_weekday, make_candles, seed_ohlc, set_mode, ticket_row
 
 
 def _manual_ticket(**overrides):
@@ -158,7 +158,7 @@ def test_edit_only_allowed_for_draft(env):
 def test_confirm_dry_run_places_nothing(env):
     set_mode(env.db, "dry_run")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm").json()["data"]
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
     assert r["status"] == "executed" and r["mode"] == "dry_run"
     assert env.kite.calls_to("place_order") == [] and env.kite.calls_to("place_gtt") == []
 
@@ -166,7 +166,7 @@ def test_confirm_dry_run_places_nothing(env):
 def test_confirm_live_places_order_and_oco_gtt(env):
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm").json()["data"]
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
     assert r["status"] == "executed" and r["kite_order_id"] and r["kite_gtt_id"]
     order = env.kite.calls_to("place_order")[0]
     assert order["transaction_type"] == "BUY" and order["quantity"] == 5 and order["order_type"] == "LIMIT"
@@ -180,7 +180,7 @@ def test_confirm_live_trailing_uses_single_gtt(env):
     set_mode(env.db, "live")
     body = _manual_ticket(trailing_enabled=True, trailing_trigger="after_target_1", trailing_distance=50.0)
     t = env.client.post("/api/tickets", json=body).json()["data"]
-    env.client.post(f"/api/tickets/{t['id']}/confirm")
+    env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
     gtt = env.kite.calls_to("place_gtt")[0]
     assert gtt["trigger_type"] == "single" and gtt["trigger_values"] == [2900.0]
 
@@ -189,7 +189,7 @@ def test_confirm_live_order_rejected(env):
     set_mode(env.db, "live")
     env.kite.fail_next["place_order"] = OrderException("Insufficient funds")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm").json()["data"]
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
     assert r["status"] == "failed" and r["success"] is False
     assert "Insufficient funds" in r["execution_message"]
 
@@ -198,7 +198,7 @@ def test_confirm_live_protection_failed(env):
     set_mode(env.db, "live")
     env.kite.fail_next["place_gtt"] = InputException("bad trigger")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm").json()["data"]
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
     assert r["status"] == "executed" and r["kite_gtt_id"] is None
     assert "UNPROTECTED" in r["execution_message"]
 
@@ -271,7 +271,7 @@ def test_execution_mode_switch(env):
 def test_order_and_gtt_books_and_cancel(env):
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    done = env.client.post(f"/api/tickets/{t['id']}/confirm").json()["data"]
+    done = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
     orders = env.client.get("/api/orders").json()["data"]
     assert orders[0]["linked_ticket_id"] == t["id"]
     gtts = env.client.get("/api/gtts").json()["data"]
@@ -280,8 +280,11 @@ def test_order_and_gtt_books_and_cancel(env):
     r = env.client.post(f"/api/gtts/{done['kite_gtt_id']}/cancel").json()["data"]
     assert r["cancelled"] is True
     assert ticket_row(env.db, t["id"])["kite_gtt_id"] is None
+    # PK-9: Kite accepting a cancel request is not a cancellation; the ticket
+    # is left for order_monitor to resolve from the broker's final state.
     r = env.client.post(f"/api/orders/{done['kite_order_id']}/cancel").json()["data"]
-    assert r["cancelled"] is True
+    assert r["cancel_requested"] is True and r["linked_ticket_id"] == t["id"]
+    assert ticket_row(env.db, t["id"])["status"] == "executed"
 
 
 # ---------------------------------------------------------------- risk / sectors / prefs / panels

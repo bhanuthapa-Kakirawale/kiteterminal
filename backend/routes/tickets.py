@@ -13,6 +13,7 @@ from backend.db import get_connection
 from backend.kite_client import require_trading_account
 from backend.models import (
     AlertActionSellRequest,
+    TicketConfirmRequest,
     TicketCreateRequest,
     TicketEditRequest,
     TicketRejectRequest,
@@ -523,6 +524,33 @@ def _claim_mode(conn: sqlite3.Connection, ticket: sqlite3.Row, account_id: int) 
     return position["mode"], f" — inherited from position #{ticket['closes_ticket_id']} ({how})"
 
 
+def _require_displayed_mode(ticket: sqlite3.Row, mode: str, expected_mode: str | None) -> None:
+    """PK-11 (P1-7): a NEW entry executes only in the mode the approving user
+    was shown. `mode` is the global mode _claim_mode read — the very value the
+    claim stamps and execute_ticket runs on — so a switch after this check
+    cannot change what executes. A stale tab (still showing DRY RUN after
+    another session switched to LIVE), or a caller that does not say which
+    mode it showed, is refused (409) before the claim: nothing is written,
+    nothing is sent, and the ticket stays pending_confirmation. Exits never
+    come here — they run in their position's own mode (PK-3)."""
+    if expected_mode is None:
+        raise HTTPException(409, {
+            "error_code": "EXECUTION_MODE_REQUIRED",
+            "message": f"Ticket {ticket['id']}: the approval did not say which execution mode was shown "
+                       f"(the server is in {mode}). Refresh and review the ticket again before approving. "
+                       f"Nothing was executed.",
+            "current_mode": mode,
+        })
+    if expected_mode != mode:
+        raise HTTPException(409, {
+            "error_code": "EXECUTION_MODE_CHANGED",
+            "message": f"Execution mode changed (you saw {expected_mode}, the server is now {mode}). Review the "
+                       f"ticket again before approving. Nothing was executed.",
+            "expected_mode": expected_mode,
+            "current_mode": mode,
+        })
+
+
 def _refuse_stale_exit(conn: sqlite3.Connection, ticket: sqlite3.Row, account_id: int) -> None:
     """Refuses (409) an exit that can no longer validly close its position —
     closed already, owned by another exit, not an open executed BUY, or a
@@ -629,19 +657,25 @@ def _raise_lost_claim(conn: sqlite3.Connection, ticket: sqlite3.Row, account_id:
     })
 
 
-def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, kite: KiteConnect, ticket_id: int) -> dict:
+def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, kite: KiteConnect, ticket_id: int,
+                               expected_mode: str | None = None) -> dict:
     """Shared confirm-and-execute body: transitions a pending_confirmation
     ticket to 'confirmed', calls the execution engine, updates status from the
     result, and records a closed_trades row for exit tickets. Used by both
     the normal one-ticket confirm endpoint and Phase 8's Emergency Exit All
     batch flow, so there is exactly one code path for "how a ticket
-    actually executes" regardless of how it got confirmed."""
+    actually executes" regardless of how it got confirmed. expected_mode is
+    the mode the user was shown; it binds a new entry (PK-11) and is ignored
+    for an exit."""
     ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
     if ticket["status"] not in _CONFIRMABLE_STATUSES:
         _raise_invalid_state(conn, ticket_id, account["id"], "confirm")
 
     mode, mode_note = _claim_mode(conn, ticket, account["id"])
-    if ticket["closes_ticket_id"] is not None:
+    if ticket["closes_ticket_id"] is None:
+        # PK-11: refused before the claim if the user saw a different mode.
+        _require_displayed_mode(ticket, mode, expected_mode)
+    else:
         # PK-4: the position may have been closed, or another exit may own
         # it, since this exit was created. Refused before the claim.
         _refuse_stale_exit(conn, ticket, account["id"])
@@ -801,11 +835,13 @@ def _reconcile_late_result(conn: sqlite3.Connection, claimed: sqlite3.Row, resul
 
 
 @router.post("/api/tickets/{ticket_id}/confirm")
-def confirm_ticket(ticket_id: int, kite: KiteConnect = Depends(require_trading_account)):
+def confirm_ticket(ticket_id: int, req: TicketConfirmRequest | None = None,
+                   kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
     conn = get_connection()
     try:
-        data = confirm_and_execute_ticket(conn, account, kite, ticket_id)
+        data = confirm_and_execute_ticket(conn, account, kite, ticket_id,
+                                          expected_mode=req.expected_mode if req is not None else None)
         return {"data": data}
     finally:
         conn.close()

@@ -55,6 +55,13 @@ class TicketRejectRequest(BaseModel):
     reason: str | None = None
 
 
+class TicketConfirmRequest(BaseModel):
+    # PK-11 (P1-7): the execution mode the user SAW when approving. Required
+    # for a new entry (the server refuses a missing or different mode); an
+    # exit ignores it and runs in its position's own mode (PK-3).
+    expected_mode: Literal["dry_run", "live"] | None = None
+
+
 class TicketEditRequest(BaseModel):
     # Same shape as TicketCreateRequest — a full replace, only ever allowed
     # server-side when the ticket's current status is 'draft'.

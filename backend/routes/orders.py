@@ -97,7 +97,16 @@ def list_gtts(kite: KiteConnect = Depends(require_trading_account)):
 @router.post("/api/orders/{order_id}/cancel")
 def cancel_order(order_id: str, variety: str = "regular", kite: KiteConnect = Depends(require_trading_account)):
     """Phase 8 Part A.4: a prominent single-click cancel for a pending
-    order — this did not exist anywhere in the app before this phase."""
+    order — this did not exist anywhere in the app before this phase.
+
+    PK-9 (P1-1): Kite accepting a cancel REQUEST is not a cancellation — the
+    order may fill in the same second, or already be partly filled. So the
+    linked ticket's state is deliberately left alone here; order_monitor.py
+    stays the only authority on the order's terminal state (CANCELLED,
+    COMPLETE, partial, REJECTED) and resolves the ticket from broker
+    evidence, exactly as for an order cancelled in Kite itself. An EXITING
+    exit therefore keeps its position open and protected until then. If the
+    broker call fails, nothing is written at all."""
     account = get_trading_account()
     _call(lambda: kite.cancel_order(variety=variety, order_id=order_id))
 
@@ -108,17 +117,25 @@ def cancel_order(order_id: str, variety: str = "regular", kite: KiteConnect = De
             (account["id"], order_id),
         ).fetchone()
         if ticket is not None:
-            conn.execute("UPDATE trade_tickets SET status = 'cancelled' WHERE id = ?", (ticket["id"],))
             conn.execute(
-                "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'rejected', ?)",
-                (ticket["id"], f"Order {order_id} cancelled manually via Orders & Trades"),
+                "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'modified', ?)",
+                (ticket["id"], f"Cancellation requested at broker for order {order_id} via Orders & Trades. Kite "
+                               f"accepting the request is not a cancellation — the order may still fill; the order "
+                               f"monitor records the broker's final state."),
             )
-        system_events.log_event(conn, account["id"], "order_cancelled_manually", f"order_id={order_id}")
+        system_events.log_event(
+            conn, account["id"], "order_cancelled_manually",
+            f"cancel requested: order_id={order_id}, ticket={ticket['id'] if ticket else None}",
+        )
         conn.commit()
     finally:
         conn.close()
 
-    return {"data": {"cancelled": True, "order_id": order_id, "linked_ticket_id": ticket["id"] if ticket else None}}
+    return {"data": {
+        "cancel_requested": True, "order_id": order_id, "linked_ticket_id": ticket["id"] if ticket else None,
+        "message": f"Cancellation requested for order {order_id}. Kite decides the outcome; the linked ticket "
+                   f"updates when the order monitor sees it.",
+    }}
 
 
 @router.post("/api/gtts/{gtt_id}/cancel")

@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 import pytest
 
-from conftest import account_id, add_watch, last_weekday, make_candles, seed_ohlc, set_mode, ticket_row
+from conftest import displayed_mode, account_id, add_watch, last_weekday, make_candles, seed_ohlc, set_mode, ticket_row
 from test_baseline_api import _breakout_candles, _insert_ticket, _manual_ticket
 
 
@@ -71,7 +71,7 @@ def test_live_entry_off_grid_prices_are_snapped_and_sent_as_amo(env, market_clos
     set_mode(env.db, "live")
     body = _manual_ticket(entry_price=3001.37, stop_loss=2900.03, target_1=3300.02)
     t = env.client.post("/api/tickets", json=body).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm").json()["data"]
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
     assert r["status"] == "executed" and r["order_variety"] == "amo" and r["entry_fill_status"] == "pending"
     assert "AMO" in r["execution_message"]
     order = env.kite.calls_to("place_order")[0]
@@ -85,20 +85,20 @@ def test_live_entry_off_grid_prices_are_snapped_and_sent_as_amo(env, market_clos
 def test_live_entry_is_regular_while_market_open(env, market_open):
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    env.client.post(f"/api/tickets/{t['id']}/confirm")
+    env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
     assert env.kite.calls_to("place_order")[0]["variety"] == "regular"
 
 
 def test_dry_run_is_marked_filled(env):
     set_mode(env.db, "dry_run")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm").json()["data"]
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
     assert r["entry_fill_status"] == "filled" and r["filled_price"] == 3000.0
 
 
 def test_confirm_broadcasts_tickets_changed(env):
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    env.client.post(f"/api/tickets/{t['id']}/confirm")
+    env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
     reasons = [m.get("reason") for m in env.broadcasts if m["type"] == "tickets_changed"]
     assert "created" in reasons and "executed" in reasons
 
@@ -109,7 +109,7 @@ def _confirm_live_entry(env, auto_fill: bool) -> dict:
     set_mode(env.db, "live")
     env.kite.auto_fill = auto_fill
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    return env.client.post(f"/api/tickets/{t['id']}/confirm").json()["data"]
+    return env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
 
 
 def test_order_monitor_records_entry_fill(env):

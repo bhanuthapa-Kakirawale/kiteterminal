@@ -7,6 +7,7 @@ from kiteconnect.exceptions import InputException, OrderException, PermissionExc
 
 from backend import config, instruments, market
 from backend.db import get_connection
+from backend.ticker import ticker_manager
 
 
 def get_execution_mode() -> str:
@@ -34,6 +35,10 @@ def set_execution_mode(mode: str, confirm_real_money: bool, account_id: int | No
         conn.commit()
     finally:
         conn.close()
+    if mode != previous_mode:
+        # PK-11: every open tab updates the mode it displays. A convenience
+        # only — a stale tab is still refused at confirm (expected_mode).
+        ticker_manager.broadcast({"type": "mode_changed", "mode": mode, "previous_mode": previous_mode})
     return mode
 
 

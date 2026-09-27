@@ -140,6 +140,18 @@ def set_mode(db, mode: str) -> None:
         conn.close()
 
 
+def displayed_mode(db) -> dict:
+    """The confirm body a freshly loaded tab sends for a NEW entry (PK-11):
+    the execution mode it is showing, i.e. the server's current mode. Read
+    straight from the database so it never touches a race test's hooks.
+    Tests of a STALE tab pass their own expected_mode instead."""
+    conn = db.get_connection()
+    try:
+        return {"expected_mode": conn.execute("SELECT mode FROM execution_settings WHERE id = 1").fetchone()["mode"]}
+    finally:
+        conn.close()
+
+
 def ticket_row(db, ticket_id: int) -> dict:
     conn = db.get_connection()
     try:
@@ -148,5 +160,5 @@ def ticket_row(db, ticket_id: int) -> dict:
         conn.close()
 
 
-__all__ = ["FakeKite", "make_candles", "seed_ohlc", "add_watch", "account_id", "set_mode", "ticket_row",
+__all__ = ["FakeKite", "make_candles", "seed_ohlc", "add_watch", "account_id", "set_mode", "displayed_mode", "ticket_row",
            "last_weekday", "IST", "TERMINAL_ORIGIN", "TERMINAL_HEADERS", "terminal_client"]

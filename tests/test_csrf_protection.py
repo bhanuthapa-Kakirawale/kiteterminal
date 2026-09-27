@@ -22,7 +22,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from conftest import TERMINAL_ORIGIN, set_mode, ticket_row
+from conftest import displayed_mode, TERMINAL_ORIGIN, set_mode, ticket_row
 from test_baseline_api import _insert_ticket, _manual_ticket
 from test_review_changes import _breakeven_proposal
 
@@ -120,7 +120,7 @@ def test_b_cross_origin_gtt_cancel_leaves_protection(env):
 def test_f_foreign_origin_with_header_is_still_rejected(env, market_open):
     set_mode(env.db, "live")
     tid = _pending_ticket(env)
-    r = _bare().post(f"/api/tickets/{tid}/confirm", headers={**APP_HEADER, "Origin": FOREIGN})
+    r = _bare().post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db), headers={**APP_HEADER, "Origin": FOREIGN})
     assert _is_csrf_reject(r)
     assert env.kite.calls_to("place_order") == []
     assert ticket_row(env.db, tid)["status"] == "pending_confirmation"
@@ -177,7 +177,7 @@ def test_cross_origin_triggers_do_not_run(env, monkeypatch, url, target):
 
 def test_c_same_origin_without_header_is_rejected(env):
     tid = _pending_ticket(env)
-    r = _bare().post(f"/api/tickets/{tid}/confirm", headers={"Origin": TERMINAL_ORIGIN})
+    r = _bare().post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db), headers={"Origin": TERMINAL_ORIGIN})
     assert _is_csrf_reject(r)
     assert ticket_row(env.db, tid)["status"] == "pending_confirmation"
 
@@ -192,7 +192,7 @@ def test_c_wrong_header_value_is_rejected(env, value):
 def test_d_same_origin_with_header_behaves_normally(env):
     set_mode(env.db, "dry_run")
     tid = _pending_ticket(env)
-    r = _bare().post(f"/api/tickets/{tid}/confirm", headers={**APP_HEADER, "Origin": TERMINAL_ORIGIN})
+    r = _bare().post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db), headers={**APP_HEADER, "Origin": TERMINAL_ORIGIN})
     assert r.status_code == 200, r.text
     assert r.json()["data"]["status"] == "executed" and r.json()["data"]["mode"] == "dry_run"
 
@@ -268,7 +268,7 @@ def test_e_is_terminal_origin(origin, scheme, host, expected):
 def test_g_no_origin_with_header_is_accepted(env):
     set_mode(env.db, "dry_run")
     tid = _pending_ticket(env)
-    r = _bare().post(f"/api/tickets/{tid}/confirm", headers=APP_HEADER)
+    r = _bare().post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db), headers=APP_HEADER)
     assert r.status_code == 200 and r.json()["data"]["status"] == "executed"
 
 

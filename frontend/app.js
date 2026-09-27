@@ -68,7 +68,10 @@ const API = {
   getPositionReduction: (symbol) => fetchJson(`/api/risk/position-reduction?symbol=${encodeURIComponent(symbol)}`),
   editTicket: (id, body) => fetchJsonMutate(`/api/tickets/${id}`, "PUT", body),
   deleteTicket: (id) => fetchJsonMutate(`/api/tickets/${id}`, "DELETE"),
-  confirmTicket: (id) => fetchJsonMutate(`/api/tickets/${id}/confirm`, "POST"),
+  // PK-11: a new entry carries the execution mode the user was shown; the
+  // server refuses (409) if it is missing or no longer current.
+  confirmTicket: (id, expectedMode) => fetchJsonMutate(`/api/tickets/${id}/confirm`, "POST",
+    expectedMode ? { expected_mode: expectedMode } : undefined),
   rejectTicket: (id, reason) => fetchJsonMutate(`/api/tickets/${id}/reject`, "POST", { reason }),
   revertRejection: (id) => fetchJsonMutate(`/api/tickets/${id}/revert-rejection`, "POST"),
   startTrailing: (id) => fetchJsonMutate(`/api/tickets/${id}/start_trailing`, "POST"),
@@ -2158,8 +2161,11 @@ el.ordersBody.addEventListener("click", async (event) => {
     okLabel: "Cancel order", danger: true,
   }))) return;
   try {
+    // PK-9: an accepted cancel request is not a cancellation — the order may
+    // still fill. The linked ticket updates when the order monitor sees it.
     await API.cancelOrder(btn.dataset.orderId, btn.dataset.variety);
-    toast(`Order ${btn.dataset.orderId} cancelled.`, { type: "success" });
+    toast(`Cancellation requested for order ${btn.dataset.orderId}. Kite decides the outcome; the ticket `
+      + "updates when the order monitor sees it.", { type: "info" });
     state.orders = await API.orders();
     renderOrdersTable();
   } catch (e) {
@@ -2311,18 +2317,19 @@ el.emergencyExitConfirmBtn.addEventListener("click", async () => {
     refreshOrderBooks();
     // PK-8: an exit order placed is not a position closed — the positions
     // stay open (EXITING) until Kite reports each fill.
-    const submitted = (result.results || []).filter((r) => r.status === "exit_submitted").length;
+    const results = result.results || [];
+    const submitted = results.filter((r) => r.status === "exit_submitted").length;
+    // PK-10: one result per position. Everything this click did NOT submit an
+    // exit order for (already exiting, UNKNOWN, refused, failed, entry cancel
+    // requested, risk check unavailable) is listed by name — never hidden
+    // inside the count, and never called "closed".
+    const others = results.filter((r) => r.status !== "exit_submitted");
     toast(`${submitted} exit order(s) placed for ${result.count} position(s). They stay open (EXITING) until `
       + "Kite reports the fills — check Orders & Trades.",
-    { type: "warning", title: "Emergency exit orders sent" });
-    // Positions that were NOT exited by this click (refused at confirmation,
-    // an exit already in flight/UNKNOWN, rejected by the broker, risk check
-    // unavailable) — never hidden inside the count.
-    const notExited = (result.results || []).filter((r) =>
-      ["refused", "exit_outcome_unknown", "already_exiting", "failed", "risk_check_unavailable"].includes(r.status));
-    if (notExited.length) {
-      toast(notExited.map((r) => `${r.symbol}: ${r.message || r.status}`).join(" · "),
-        { type: "error", title: `${notExited.length} position(s) NOT exited — check Kite`, timeout: 0 });
+    { type: "warning", title: `Emergency exit: ${submitted} submitted, ${others.length} not exited` });
+    if (others.length) {
+      toast(others.map((r) => `${r.symbol} [${r.status}]: ${r.message || r.status}`).join(" · "),
+        { type: "error", title: `${others.length} position(s) NOT exited by this click — check Kite`, timeout: 0 });
     }
   } catch (e) {
     el.emergencyExitError.textContent = e.message;
@@ -2559,6 +2566,23 @@ function connectTickWs() {
     if (msg.type === "tickets_changed") {
       scheduleRefresh();
     }
+    if (msg.type === "mode_changed" && msg.mode !== state.executionMode) {
+      // PK-11: another session switched the execution mode. Show the new
+      // mode at once and close an open approval of a NEW entry, whose
+      // execution note is now wrong. The server's expected_mode check stays
+      // the real protection; this only keeps the display honest.
+      state.executionMode = msg.mode;
+      renderModeBanner();
+      const open = state.activeConfirmTicket;
+      if (el.ticketConfirmDialog.open && open && open.closes_ticket_id == null) el.ticketConfirmDialog.close();
+      scheduleRefresh();
+      const own = state.ownModeSwitch === msg.mode;
+      state.ownModeSwitch = null;
+      if (!own) {
+        toast(`Execution mode changed to ${msg.mode === "live" ? "LIVE" : "DRY RUN"} in another session. Review tickets again before approving.`,
+          { type: "warning", title: "Execution mode changed", timeout: 0 });
+      }
+    }
     if (msg.type === "order_update") {
       const type = { success: "success", urgent: "error", warning: "warning" }[msg.severity] || "info";
       toast(msg.message, {
@@ -2640,10 +2664,34 @@ function ticketConfirmHtml(t) {
 
 // The mode approving this ticket executes in. A ticket carries its own mode
 // once stamped — an exit inherits the mode of the position it closes, so the
-// global toggle must not be shown as its mode. Only a new entry (mode still
-// unset) follows the global toggle.
+// global toggle must not be shown as its mode. A new entry awaiting approval
+// always follows the global toggle: the server claims it in the global mode,
+// even if an earlier, refused claim left a stale mode stamped on it (PK-11).
 function ticketExecMode(t) {
+  if (t && isNewEntryAwaitingApproval(t)) return state.executionMode;
   return t?.mode || state.executionMode;
+}
+
+function isNewEntryAwaitingApproval(t) {
+  return t.closes_ticket_id == null && ["draft", "pending_confirmation", "risk_rejected"].includes(t.status);
+}
+
+// PK-11: what an approval sends as expected_mode — the mode THIS view showed
+// the user, captured before they decided, never re-read at send time. Exits
+// send none: they run in their position's own mode.
+function shownModeFor(t) {
+  return t && t.closes_ticket_id == null ? ticketExecMode(t) : undefined;
+}
+
+const MODE_BINDING_ERRORS = ["EXECUTION_MODE_CHANGED", "EXECUTION_MODE_REQUIRED"];
+
+async function resyncExecutionMode() {
+  try {
+    state.executionMode = (await API.getExecutionMode()).mode;
+  } catch (e) {
+    // keep the last known mode; the server check still protects approvals
+  }
+  renderModeBanner();
 }
 
 // How an approval will be executed — shown before the user commits.
@@ -2699,6 +2747,7 @@ function renderRiskCheckSection(checks) {
 function openConfirmDialog(ticket) {
   activeConfirmTicketId = ticket.id;
   state.activeConfirmTicket = ticket;
+  state.activeConfirmShownMode = shownModeFor(ticket);  // what the exec note below shows
   const rejectedMode = ticket.status === "risk_rejected";
   el.ticketConfirmDialog.classList.toggle("risk-rejected-mode", rejectedMode);
   el.ticketConfirmTitle.textContent = rejectedMode
@@ -2720,11 +2769,19 @@ function openConfirmDialog(ticket) {
 // Shared by the confirm dialog and the Approvals inbox. Execution failures
 // come back as data on the ticket (not thrown); a thrown error means the
 // request itself failed (network/auth/state).
-async function approveTicket(id) {
+async function approveTicket(id, expectedMode) {
   try {
-    reportExecution(await API.confirmTicket(id));
+    reportExecution(await API.confirmTicket(id, expectedMode));
   } catch (e) {
-    toast(e.message, { type: "error", title: "Approval failed" });
+    if (e instanceof ApiError && MODE_BINDING_ERRORS.includes(e.errorCode)) {
+      // PK-11: the mode shown is not the server's mode. Nothing was
+      // executed; show the current mode and make the user review again —
+      // never retry, never approve in the new mode automatically.
+      await resyncExecutionMode();
+      toast(e.message, { type: "warning", title: "Execution mode changed. Review the ticket again before approving.", timeout: 0 });
+    } else {
+      toast(e.message, { type: "error", title: "Approval failed" });
+    }
   }
   await refreshTicketViews();
   refreshOrderBooks();
@@ -2785,7 +2842,7 @@ el.ticketConfirmBtn.addEventListener("click", async () => {
   if (activeConfirmTicketId == null) return;
   el.ticketConfirmBtn.disabled = true;
   try {
-    await approveTicket(activeConfirmTicketId);
+    await approveTicket(activeConfirmTicketId, state.activeConfirmShownMode);
   } finally {
     el.ticketConfirmBtn.disabled = false;
   }
@@ -3185,6 +3242,7 @@ el.modeToggleCheckbox.addEventListener("change", () => {
   if (el.modeToggleCheckbox.checked) {
     el.liveModeConfirmDialog.showModal();
   } else {
+    state.ownModeSwitch = "dry_run";  // this tab's own switch: its broadcast is not "another session"
     API.setExecutionMode("dry_run", false).then((r) => {
       state.executionMode = r.mode;
       renderModeBanner();
@@ -3192,6 +3250,8 @@ el.modeToggleCheckbox.addEventListener("change", () => {
     }).catch((e) => {
       el.modeToggleCheckbox.checked = true;
       toast(e.message, { type: "error" });
+    }).finally(() => {
+      state.ownModeSwitch = null;
     });
   }
 });
@@ -3203,6 +3263,7 @@ el.liveModeCancelBtn.addEventListener("click", () => {
 
 el.liveModeConfirmBtn.addEventListener("click", async () => {
   try {
+    state.ownModeSwitch = "live";  // this tab's own switch: its broadcast is not "another session"
     const r = await API.setExecutionMode("live", true);
     state.executionMode = r.mode;
     toast("LIVE trading enabled — approvals now place real orders.", { type: "warning" });
@@ -3210,6 +3271,7 @@ el.liveModeConfirmBtn.addEventListener("click", async () => {
     el.modeToggleCheckbox.checked = false;
     toast(e.message, { type: "error" });
   }
+  state.ownModeSwitch = null;
   renderModeBanner();
   el.liveModeConfirmDialog.close();
 });
@@ -3919,6 +3981,7 @@ el.viewApprovals.addEventListener("click", async (event) => {
     openConfirmDialog(ticket);
   } else if (action === "approve") {
     const live = ticketExecMode(ticket) === "live";
+    const shownMode = shownModeFor(ticket);  // the mode the dialog below shows
     const ok = await confirmAction({
       title: live ? `Place a real ${ticket.transaction_type} order?` : "Approve this trade (dry run)?",
       html: approvalConfirmHtml(ticket),
@@ -3927,7 +3990,7 @@ el.viewApprovals.addEventListener("click", async (event) => {
     });
     if (!ok) return;
     card.classList.add("busy");
-    await approveTicket(id);
+    await approveTicket(id, shownMode);
   } else if (action === "reject") {
     card.classList.add("busy");
     await rejectTicketById(id, "Rejected from Approvals");
@@ -4692,6 +4755,7 @@ el.sdApprove.addEventListener("click", async () => {
   const t = sd.ticket;
   if (!t) return;
   const live = ticketExecMode(t) === "live";
+  const shownMode = shownModeFor(t);  // the mode the dialog below shows
   const ok = await confirmAction({
     title: live ? `Place a real ${t.transaction_type} order?` : "Approve this trade (dry run)?",
     html: approvalConfirmHtml(t),
@@ -4701,7 +4765,7 @@ el.sdApprove.addEventListener("click", async () => {
   if (!ok) return;
   el.sdApprove.disabled = true;
   try {
-    await approveTicket(t.id);
+    await approveTicket(t.id, shownMode);
   } finally {
     el.sdApprove.disabled = false;
   }

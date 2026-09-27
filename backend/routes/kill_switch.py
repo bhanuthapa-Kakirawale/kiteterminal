@@ -1,4 +1,5 @@
 import json
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from kiteconnect import KiteConnect
@@ -8,8 +9,9 @@ from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
 from backend.models import EmergencyExitConfirmRequest
-from backend.routes.tickets import confirm_and_execute_ticket
+from backend.routes.tickets import _transition, confirm_and_execute_ticket
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # The one place in the app where extra friction is intentional — matched
@@ -60,7 +62,10 @@ def _cancel_unfilled_entry(kite: KiteConnect, conn, position) -> dict | None:
         kite.cancel_order(variety=position["order_variety"] or kite.VARIETY_REGULAR, order_id=position["kite_order_id"])
     except Exception:
         return None
-    detail = f"Emergency exit: unfilled entry order {position['kite_order_id']} cancelled"
+    # PK-9: Kite accepting the cancel request is not a cancellation — the
+    # order may still fill; order_monitor resolves the entry from Kite.
+    detail = (f"Emergency exit: cancellation requested at broker for unfilled entry order "
+              f"{position['kite_order_id']} — the order monitor records the outcome")
     conn.execute(
         "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'modified', ?)", (position["id"], detail)
     )
@@ -70,6 +75,10 @@ def _cancel_unfilled_entry(kite: KiteConnect, conn, position) -> dict | None:
 
 @router.post("/api/kill-switch/emergency-exit-confirm")
 def emergency_exit_confirm(req: EmergencyExitConfirmRequest, kite: KiteConnect = Depends(require_trading_account)):
+    """Best effort, one result per position (PK-10, P1-2): a failure to exit
+    one position — a refusal, a broker error, or an unexpected exception —
+    never stops the attempts on the others, and the emergency_exit_all
+    system event is always written. Nothing here waits for fills (PK-8)."""
     if req.confirmation_phrase.strip() != _REQUIRED_PHRASE:
         raise HTTPException(400, {
             "error_code": "CONFIRMATION_PHRASE_MISMATCH",
@@ -83,82 +92,162 @@ def emergency_exit_confirm(req: EmergencyExitConfirmRequest, kite: KiteConnect =
         # the position it closes. list_open_positions only returns LIVE
         # positions, so Emergency Exit sells real positions for real, whatever
         # the Dry Run / Live toggle says, and never touches a dry-run one.
-        positions = risk_engine.list_open_positions(conn, account["id"])
+        try:
+            positions = risk_engine.list_open_positions(conn, account["id"])
+        except Exception as e:
+            logger.exception("Emergency Exit could not list open positions")
+            conn.rollback()
+            message = (f"Emergency Exit could not list open positions ({type(e).__name__}: {e}); nothing was "
+                       f"exited. Check Kite and exit positions there.")
+            _log_summary_event(conn, account, message)
+            raise HTTPException(503, {"error_code": "EMERGENCY_EXIT_UNAVAILABLE", "message": message})
         ltp_data = _fetch_ltps(kite, positions)
 
         results = []
         for pos in positions:
-            in_flight = _exit_in_flight(conn, pos["id"])
-            if in_flight is not None and in_flight["status"] == "confirmed":
-                # An exit for this position is claimed and its broker outcome is
-                # in flight or UNKNOWN (PK-2): a second SELL now could double the
-                # exit. order_monitor resolves the first one from broker evidence.
-                results.append({
-                    "ticket_id": in_flight["id"], "symbol": pos["symbol"], "status": "exit_outcome_unknown",
-                    "message": f"An exit for {pos['symbol']} (ticket {in_flight['id']}, tag {in_flight['order_tag']}) "
-                               f"has an UNKNOWN broker outcome — not resubmitted. Check Kite.",
-                })
-                continue
-            if in_flight is not None:
-                # PK-8: an exit order is already at the broker, not yet (fully)
-                # filled. The position is still open, but selling again now
-                # could double the exit.
-                results.append({
-                    "ticket_id": in_flight["id"], "symbol": pos["symbol"], "status": "already_exiting",
-                    "message": f"{pos['symbol']}: exit ticket {in_flight['id']} (order {in_flight['kite_order_id']}) "
-                               f"is already at the broker, fill {in_flight['entry_fill_status']} — not resubmitted. "
-                               f"Check Kite.",
-                })
-                continue
-            if pos["mode"] == "live" and pos["entry_fill_status"] == "pending" and pos["kite_order_id"]:
-                cancelled = _cancel_unfilled_entry(kite, conn, pos)
-                if cancelled is not None:
-                    results.append(cancelled)
-                    continue
-
-            ticket_id = _create_emergency_exit_ticket(conn, account, pos, ltp_data)
+            attempt: dict = {}
             try:
-                risk_engine.run_risk_checks_and_transition(conn, account, ticket_id, kite)
-            except risk_engine.RiskCheckUnavailableError as e:
-                results.append({"ticket_id": ticket_id, "symbol": pos["symbol"], "status": "risk_check_unavailable", "message": e.message})
-                continue
+                results.append(_exit_one(conn, kite, account, pos, ltp_data, attempt))
+            except Exception as e:
+                # Anything unexpected for THIS position (P0-2 style broker
+                # surprises, a DB error, a bug): record it and move on to the
+                # next position — never abort the loop.
+                logger.exception("Emergency Exit of position %s (%s) raised", pos["id"], pos["symbol"])
+                conn.rollback()
+                results.append(_isolated_failure(conn, account, pos, attempt.get("ticket_id"), e))
 
-            ticket = conn.execute("SELECT status FROM trade_tickets WHERE id = ?", (ticket_id,)).fetchone()
-            if ticket["status"] != "pending_confirmation":
-                # Exit tickets skip the six position-sizing checks (Phase 5
-                # Part D.4) — only the exit-validity check can fail here,
-                # which would mean the referenced position wasn't actually
-                # a valid open executed BUY, a genuine data problem worth
-                # surfacing rather than silently executing anyway.
-                results.append({"ticket_id": ticket_id, "symbol": pos["symbol"], "status": ticket["status"]})
-                continue
-
-            try:
-                data = confirm_and_execute_ticket(conn, account, kite, ticket_id)
-            except HTTPException as e:
-                # Refused at confirmation (e.g. PK-4: another exit took the
-                # position meanwhile). Nothing was sent for this position;
-                # keep going — one refusal must not stop the other exits.
-                detail = e.detail if isinstance(e.detail, dict) else {"message": str(e.detail)}
-                results.append({"ticket_id": ticket_id, "symbol": pos["symbol"], "status": "refused",
-                                "error_code": detail.get("error_code"), "message": detail.get("message")})
-                continue
-            results.append({
-                "ticket_id": ticket_id, "symbol": pos["symbol"],
-                "status": _result_status(data), "message": data["execution_message"],
-            })
-
-        by_mode = {m: sum(p["mode"] == m for p in positions) for m in ("live", "dry_run")}
-        system_events.log_event(
-            conn, account["id"], "emergency_exit_all",
-            f"exit requested for {len(positions)} position(s), each in its own execution mode "
-            f"(live: {by_mode['live']}, dry_run: {by_mode['dry_run']}): "
-            f"{', '.join(p['symbol'] for p in positions) or '(none)'}",
-        )
-        conn.commit()
-        return {"data": {"count": len(positions), "results": results}}
+        summary = {status: sum(r["status"] == status for r in results) for status in _SUMMARY_STATUSES}
+        _log_summary_event(conn, account, _summary_detail(positions, results, summary))
+        return {"data": {"count": len(positions), "results": results, "summary": summary}}
     finally:
         conn.close()
+
+
+# Every per-position outcome, in the order the system event lists them.
+_SUMMARY_STATUSES = ("exit_submitted", "already_exiting", "exit_outcome_unknown", "refused", "failed",
+                     "entry_cancelled", "risk_check_unavailable", "closed")
+
+
+def _exit_one(conn, kite: KiteConnect, account, pos, ltp_data: dict, attempt: dict) -> dict:
+    """Requests the exit of one open position and returns its result. Any
+    exception propagates to the caller's per-position isolation; the id of an
+    exit ticket created on the way is left in attempt['ticket_id'] so the
+    failure can be reported accurately."""
+    in_flight = _exit_in_flight(conn, pos["id"])
+    if in_flight is not None and in_flight["status"] == "confirmed":
+        # An exit for this position is claimed and its broker outcome is
+        # in flight or UNKNOWN (PK-2): a second SELL now could double the
+        # exit. order_monitor resolves the first one from broker evidence.
+        return {
+            "ticket_id": in_flight["id"], "symbol": pos["symbol"], "status": "exit_outcome_unknown",
+            "message": f"An exit for {pos['symbol']} (ticket {in_flight['id']}, tag {in_flight['order_tag']}) "
+                       f"has an UNKNOWN broker outcome — not resubmitted. Check Kite.",
+        }
+    if in_flight is not None:
+        # PK-8: an exit order is already at the broker, not yet (fully)
+        # filled. The position is still open, but selling again now
+        # could double the exit.
+        return {
+            "ticket_id": in_flight["id"], "symbol": pos["symbol"], "status": "already_exiting",
+            "message": f"{pos['symbol']}: exit ticket {in_flight['id']} (order {in_flight['kite_order_id']}) "
+                       f"is already at the broker, fill {in_flight['entry_fill_status']} — not resubmitted. "
+                       f"Check Kite.",
+        }
+    if pos["mode"] == "live" and pos["entry_fill_status"] == "pending" and pos["kite_order_id"]:
+        cancelled = _cancel_unfilled_entry(kite, conn, pos)
+        if cancelled is not None:
+            return cancelled
+
+    ticket_id = _create_emergency_exit_ticket(conn, account, pos, ltp_data)
+    attempt["ticket_id"] = ticket_id
+    try:
+        risk_engine.run_risk_checks_and_transition(conn, account, ticket_id, kite)
+    except risk_engine.RiskCheckUnavailableError as e:
+        return {"ticket_id": ticket_id, "symbol": pos["symbol"], "status": "risk_check_unavailable",
+                "message": e.message}
+
+    ticket = conn.execute("SELECT status FROM trade_tickets WHERE id = ?", (ticket_id,)).fetchone()
+    if ticket["status"] != "pending_confirmation":
+        # Exit tickets skip the six position-sizing checks (Phase 5
+        # Part D.4) — only the exit-validity check can fail here,
+        # which would mean the referenced position wasn't actually
+        # a valid open executed BUY, a genuine data problem worth
+        # surfacing rather than silently executing anyway.
+        return {"ticket_id": ticket_id, "symbol": pos["symbol"], "status": "refused",
+                "error_code": "EXIT_VALIDATION_FAILED",
+                "message": f"{pos['symbol']}: the exit failed validation (ticket {ticket_id} is "
+                           f"'{ticket['status']}'); no order was sent. Check the position."}
+
+    try:
+        data = confirm_and_execute_ticket(conn, account, kite, ticket_id)
+    except HTTPException as e:
+        # Refused at confirmation (e.g. PK-4: another exit took the
+        # position meanwhile). Nothing was sent for this position;
+        # keep going — one refusal must not stop the other exits.
+        detail = e.detail if isinstance(e.detail, dict) else {"message": str(e.detail)}
+        return {"ticket_id": ticket_id, "symbol": pos["symbol"], "status": "refused",
+                "error_code": detail.get("error_code"), "message": detail.get("message")}
+    return {
+        "ticket_id": ticket_id, "symbol": pos["symbol"],
+        "status": _result_status(data), "message": data["execution_message"],
+    }
+
+
+def _isolated_failure(conn, account, pos, ticket_id: int | None, error: Exception) -> dict:
+    """The result for a position whose exit attempt raised. Never guesses:
+    if this click's exit ticket was already claimed, an order may exist, so
+    the outcome is UNKNOWN (order_monitor follows it up), never 'failed'. An
+    exit ticket that never reached the claim is withdrawn, so no stale
+    emergency SELL is left waiting for approval."""
+    reason = f"{type(error).__name__}: {error}"
+    result = {"ticket_id": ticket_id, "symbol": pos["symbol"], "status": "failed",
+              "error_code": "EMERGENCY_EXIT_ERROR",
+              "message": f"{pos['symbol']}: exit attempt failed ({reason}); no order was sent for this position. "
+                         f"The position is still OPEN — exit it in Kite."}
+    if ticket_id is None:
+        return result
+    try:
+        if _transition(conn, ticket_id, account["id"], ("draft", "pending_confirmation"), "rejected"):
+            conn.execute(
+                "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'rejected', ?)",
+                (ticket_id, f"Emergency exit attempt failed before any order was sent ({reason}); withdrawn."),
+            )
+            conn.commit()
+            return result
+        conn.rollback()
+        row = conn.execute("SELECT status, submission_state FROM trade_tickets WHERE id = ?", (ticket_id,)).fetchone()
+    except Exception:
+        logger.exception("Emergency Exit: could not inspect exit ticket %s after a failure", ticket_id)
+        conn.rollback()
+        row = None
+    if row is not None and row["status"] in ("rejected", "risk_rejected", "cancelled"):
+        return result  # never claimed: nothing was sent
+    return {"ticket_id": ticket_id, "symbol": pos["symbol"], "status": "exit_outcome_unknown",
+            "error_code": "EMERGENCY_EXIT_ERROR",
+            "message": f"{pos['symbol']}: exit ticket {ticket_id} was claimed "
+                       f"({row['status'] if row else 'state unreadable'}) but the attempt then failed ({reason}). "
+                       f"An order may exist — check Kite; the order monitor follows it up. Not resubmitted."}
+
+
+def _summary_detail(positions: list, results: list[dict], summary: dict) -> str:
+    """What the click did, per outcome — never 'exited', since an exit
+    order placed is not a position closed (PK-8)."""
+    by_mode = {m: sum(p["mode"] == m for p in positions) for m in ("live", "dry_run")}
+    counts = ", ".join(f"{status} {n}" for status, n in summary.items())
+    listed = ", ".join(f"{r['symbol']}={r['status']}" for r in results) or "(none)"
+    return (f"Emergency Exit: {len(positions)} position(s) attempted, each in its own execution mode "
+            f"(live: {by_mode['live']}, dry_run: {by_mode['dry_run']}) — {counts}: {listed}")
+
+
+def _log_summary_event(conn, account, detail: str) -> None:
+    # A failure to write the audit event must not hide the per-position
+    # results from the user — the orders were already requested.
+    try:
+        system_events.log_event(conn, account["id"], "emergency_exit_all", detail)
+        conn.commit()
+    except Exception:
+        logger.exception("Emergency Exit: could not write the emergency_exit_all system event")
+        conn.rollback()
 
 
 def _exit_in_flight(conn, position_id: int):
