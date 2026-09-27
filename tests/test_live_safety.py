@@ -506,7 +506,8 @@ def test_p0_2_entry_accepted_but_response_lost(env, unsafe_client, market_open, 
 
 
 def test_p0_2_exit_accepted_but_response_lost(env, unsafe_client, market_open):
-    # F: unknown exit, later found at the broker. P0-7 semantics not asserted.
+    # F: unknown exit, later found at the broker. P0-7 semantics (PK-8) are
+    # asserted in test_exit_lifecycle.py (cases G and H).
     set_mode(env.db, "live")
     buy_id, gtt_id = _live_position(env)
     sell_id = _pending_exit(env, buy_id)
@@ -983,6 +984,7 @@ def test_p0_3_emergency_exit_leaves_dry_run_positions_alone(env, market_open):
     set_mode(env.db, "live")
 
     r = env.client.post("/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "EXIT ALL"})
+    _monitor(env)  # PK-8: the fill, not the order, closes the live position
 
     assert r.json()["data"]["count"] == 1
     assert len(_sells(env)) == 1
@@ -1470,12 +1472,19 @@ def test_p0_4_duplicate_exit_is_superseded_and_cannot_sell_again(env, market_ope
 
     r1 = env.client.post(f"/api/tickets/{first}/confirm")
     assert r1.status_code == 200 and r1.json()["data"]["status"] == "executed"
+    # PK-8: while the first exit is EXITING, the second is refused but kept —
+    # the first may still be rejected by the exchange.
+    r2 = env.client.post(f"/api/tickets/{second}/confirm")
+    assert r2.status_code == 409 and r2.json()["detail"]["error_code"] == "EXIT_ALREADY_IN_PROGRESS"
+    assert ticket_row(env.db, second)["status"] == "pending_confirmation"
+
+    _monitor(env)  # the first exit fills: the position closes, the sibling is superseded
     assert ticket_row(env.db, second)["status"] == "rejected"
     assert _details(env, second) == [f"Superseded by exit ticket {first} — position {buy_id} is closed; "
                                      f"no order was sent."]
 
-    r2 = env.client.post(f"/api/tickets/{second}/confirm")
-    assert r2.status_code == 409
+    r3 = env.client.post(f"/api/tickets/{second}/confirm")
+    assert r3.status_code == 409
     assert len(_sells(env)) == 1
 
 
@@ -1832,7 +1841,7 @@ def test_p0_4_emergency_exit_continues_past_a_refused_position(env, market_open,
     assert r.status_code == 200
     results = {res["symbol"]: res for res in r.json()["data"]["results"]}
     assert (results["TCS"]["status"], results["TCS"]["error_code"]) == ("refused", "EXIT_ALREADY_IN_PROGRESS")
-    assert results["INFY"]["status"] == "executed"
+    assert results["INFY"]["status"] == "exit_submitted"  # PK-8: placed, not yet filled
     assert [s["tradingsymbol"] for s in _sells(env)] == ["INFY"]
 
 
@@ -1913,8 +1922,10 @@ def test_p0_6_triggered_gtt_without_fill_keeps_position_open(env, market_open, f
 # Safety property: placing an exit order is not exiting. Until the exit
 # fills, the position stays open, keeps its protective GTT and is not
 # journaled.
+# PK-8 turned this strict xfail into a regression test: order_monitor now
+# closes an explicit exit's position only on a broker COMPLETE. Wider
+# coverage lives in test_exit_lifecycle.py.
 
-@_xfail("P0-7", "exit placement deletes the GTT, stamps closed_at and journals before any fill")
 @pytest.mark.parametrize("scenario", ["limit_market_hours", "market_amo_after_hours"])
 def test_p0_7_unfilled_exit_keeps_protection_and_position_open(env, monkeypatch, scenario):
     from backend import market

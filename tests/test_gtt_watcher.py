@@ -301,9 +301,11 @@ def test_ineligible_ticket_with_a_historical_gtt_id_is_ignored(env, market_open,
 
 def test_explicit_exit_confirmed_mid_cycle_is_not_duplicated(env, market_open):
     # The watcher has read the open position; before it looks at the GTT
-    # book, the user's exit is approved, sells, deletes the GTT and closes
-    # the position. The watcher then finds the GTT gone — it must not
-    # record a second exit.
+    # book, the user's exit is approved and placed. PK-8: placing it removes
+    # nothing — the GTT stays active, so the watcher has nothing to judge.
+    # The order monitor closes the position on the fill and removes the GTT;
+    # the watcher must never record a second exit.
+    from backend import order_monitor
     from backend.routes import tickets
     set_mode(env.db, "live")
     buy_id, gtt_id = _live_position(env)
@@ -322,17 +324,19 @@ def test_explicit_exit_confirmed_mid_cycle_is_not_duplicated(env, market_open):
         env.kite.on_call("get_gtts", None)
     _precondition(raced["result"][0] == 200 and raced["result"][1]["status"] == "executed",
                   f"the racing exit should execute: {raced['result']}")
-    _precondition(env.kite.gtt_book[gtt_id]["status"] == "deleted", "the exit should have removed the GTT")
+    assert env.kite.gtt_book[gtt_id]["status"] == "active"  # EXITING: still protected
+    assert ticket_row(env.db, buy_id)["closed_at"] is None
 
+    _tick()
+    order_monitor.check_pending_orders(env.kite)
     _tick()
 
     assert [e["id"] for e in _exits(env, buy_id)] == [exit_id]
     assert len(_sells(env)) == 1
     [trade] = _closed_trades_for(env, buy_id)
     assert trade["sell_ticket_id"] == exit_id
-    # PK-4: the watcher defers to the owning exit and asks a human to look.
-    [flag] = _flags(env, buy_id)
-    assert f"exit ticket {exit_id} owns the position" in flag["actual"]
+    assert env.kite.gtt_book[gtt_id]["status"] == "deleted"
+    assert _flags(env, buy_id) == [] and _errors_for(env, buy_id) == []
 
 
 def test_gtt_firing_while_an_unknown_exit_owns_the_position_creates_no_sibling(env, unsafe_client, market_open):

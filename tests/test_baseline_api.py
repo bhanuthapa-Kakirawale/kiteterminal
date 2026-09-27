@@ -221,6 +221,7 @@ def test_start_trailing_manual(env):
 # ---------------------------------------------------------------- exits / kill switch
 
 def test_exit_ticket_closes_position_and_records_trade(env):
+    from backend import order_monitor
     set_mode(env.db, "live")
     buy_id = _insert_ticket(env.db, source="strategy", strategy_name="momentum_breakout", kite_gtt_id=None,
                             executed_at="2026-09-01 04:00:00", current_stop_loss=2900.0)
@@ -229,13 +230,17 @@ def test_exit_ticket_closes_position_and_records_trade(env):
                              status="pending_confirmation", mode=None, closes_ticket_id=buy_id,
                              rule_checklist=json.dumps({"time_exit": {"pass": True}}))
     r = env.client.post(f"/api/tickets/{sell_id}/confirm").json()["data"]
-    assert r["status"] == "executed"
+    assert r["status"] == "executed" and r["exit_state"] == "exiting"
+    # PK-8: accepted is not filled — the order monitor closes it on COMPLETE.
+    assert ticket_row(env.db, buy_id)["closed_at"] is None
+    order_monitor.check_pending_orders(env.kite)
     assert ticket_row(env.db, buy_id)["closed_at"] is not None
     stats = env.client.get("/api/journal/stats", params={"mode": "live"}).json()["data"]
     assert stats["overall"]["trade_count"] == 1
 
 
 def test_emergency_exit(env):
+    from backend import order_monitor
     set_mode(env.db, "dry_run")
     _insert_ticket(env.db, mode="dry_run")
     preview = env.client.get("/api/kill-switch/emergency-exit-preview").json()["data"]
@@ -248,6 +253,8 @@ def test_emergency_exit(env):
     set_mode(env.db, "live")
     ok = env.client.post("/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "EXIT ALL"})
     assert ok.status_code == 200 and ok.json()["data"]["count"] == 1
+    assert ok.json()["data"]["results"][0]["status"] == "exit_submitted"
+    order_monitor.check_pending_orders(env.kite)  # PK-8: closed on the broker fill
     assert ticket_row(env.db, live_id)["closed_at"] is not None
 
 

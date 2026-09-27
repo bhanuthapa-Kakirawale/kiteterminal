@@ -5,7 +5,7 @@ from datetime import datetime
 
 import numpy as np
 
-from backend import risk_engine
+from backend import execution, risk_engine
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,13 @@ def record_closed_trade(conn: sqlite3.Connection, sell_ticket_id: int) -> int | 
             f"Ticket {sell_ticket_id} is not an executed exit ticket (transaction_type="
             f"{sell['transaction_type']}, closes_ticket_id={sell['closes_ticket_id']}, status={sell['status']})"
         )
+    if sell["entry_fill_status"] not in (None, "filled"):
+        # PK-8: an accepted, partial or unconfirmed exit has not closed
+        # anything — journaling it would record a trade that may never happen.
+        raise ValueError(
+            f"Exit ticket {sell_ticket_id} is not filled (entry_fill_status={sell['entry_fill_status']!r}) — "
+            f"no closed trade to record yet"
+        )
 
     if conn.execute(
         "SELECT id FROM closed_trades WHERE sell_ticket_id = ?", (sell_ticket_id,)
@@ -69,9 +76,9 @@ def record_closed_trade(conn: sqlite3.Connection, sell_ticket_id: int) -> int | 
             f"— refusing to silently pick one."
         )
 
-    # The broker's actual fills once order_monitor.py has recorded them; the
-    # tickets' reference prices otherwise (dry run, or fill not seen yet —
-    # apply_exit_fill() re-prices the row when the exit fill arrives).
+    # The broker's actual fills, as order_monitor.py recorded them before
+    # calling this (PK-8: a live exit is only journaled once filled); the
+    # tickets' reference prices only for a dry run or a pre-fill-tracking row.
     entry_price = buy["filled_price"] or buy["entry_price"]
     exit_price = sell["filled_price"] or sell["entry_price"]
     quantity = buy["quantity"]
@@ -88,7 +95,8 @@ def record_closed_trade(conn: sqlite3.Connection, sell_ticket_id: int) -> int | 
     r_multiple_realized = (realized_pnl / risk_amount) if risk_amount else None
 
     entry_date = (buy["executed_at"] or buy["created_at"])[:10]
-    exit_date = (sell["executed_at"] or sell["created_at"])[:10]
+    # The fill, not the order: an AMO exit placed tonight fills tomorrow.
+    exit_date = (sell["filled_at"] or sell["executed_at"] or sell["created_at"])[:10]
     holding_calendar_days = (datetime.fromisoformat(exit_date) - datetime.fromisoformat(entry_date)).days
     holding_trading_days = (
         int(np.busday_count(entry_date, exit_date)) if exit_date >= entry_date else 0
@@ -122,10 +130,37 @@ def record_closed_trade(conn: sqlite3.Connection, sell_ticket_id: int) -> int | 
     return cursor.lastrowid
 
 
+def close_position_for_exit(conn: sqlite3.Connection, sell_ticket_id: int, closes_ticket_id: int,
+                            closed_at: str) -> bool:
+    """Closes the original position of an exit whose full fill is PROVEN
+    (PK-8): the broker reported it COMPLETE (order_monitor.py) or it is a
+    dry-run simulation (routes/tickets.py). Never call it for an order that
+    was merely accepted. Stamps closed_at with the fill time — conditionally,
+    so a position closed already keeps its first closure — supersedes the
+    position's other pending exits (PK-4), and writes the closed_trades row
+    exactly once (idx_closed_trades_sell_ticket). A row written before PK-8
+    at the reference price is re-priced at the fill instead. Commits.
+    Returns whether this call stamped closed_at."""
+    closed_now = conn.execute(
+        "UPDATE trade_tickets SET closed_at = ? WHERE id = ? AND closed_at IS NULL",
+        (closed_at, closes_ticket_id),
+    ).rowcount == 1
+    execution.supersede_sibling_exits(conn, closes_ticket_id, sell_ticket_id)
+    conn.commit()
+    try:
+        if record_closed_trade(conn, sell_ticket_id) is None:
+            sell = conn.execute("SELECT filled_price FROM trade_tickets WHERE id = ?", (sell_ticket_id,)).fetchone()
+            apply_exit_fill(conn, sell_ticket_id, sell["filled_price"])
+            conn.commit()
+    except ValueError:
+        logger.exception("Failed to record closed_trades for ticket %d", sell_ticket_id)
+    return closed_now
+
+
 def apply_exit_fill(conn: sqlite3.Connection, sell_ticket_id: int, fill_price: float) -> None:
-    """Re-prices a closed_trades row with the broker's actual exit fill. The
-    row is first written when the exit is placed, using the reference price,
-    because a MARKET exit's fill isn't known yet. Caller commits."""
+    """Re-prices a closed_trades row with the broker's actual exit fill.
+    Only rows written before PK-8 need it — they were written when the exit
+    was placed, at the reference price. Caller commits."""
     row = conn.execute("SELECT * FROM closed_trades WHERE sell_ticket_id = ?", (sell_ticket_id,)).fetchone()
     if row is None or not fill_price:
         return
@@ -147,11 +182,14 @@ def apply_exit_fill(conn: sqlite3.Connection, sell_ticket_id: int, fill_price: f
 def backfill_closed_trades(conn: sqlite3.Connection) -> int:
     """One-time catch-up for exit tickets that executed before this phase
     existed (or any that somehow got missed). Safe to call on every
-    startup — record_closed_trade is idempotent per sell_ticket_id."""
+    startup — record_closed_trade is idempotent per sell_ticket_id. Only
+    exits whose fill is proven: an EXITING exit found at startup is left to
+    order_monitor, which journals it when the broker reports the fill (PK-8)."""
     rows = conn.execute(
-        """
+        f"""
         SELECT id FROM trade_tickets
         WHERE transaction_type = 'SELL' AND closes_ticket_id IS NOT NULL AND status = 'executed'
+          AND {execution.EXIT_FILL_PROVEN_SQL}
           AND id NOT IN (SELECT sell_ticket_id FROM closed_trades)
         """
     ).fetchall()

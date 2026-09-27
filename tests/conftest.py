@@ -25,6 +25,18 @@ SEED_INSTRUMENTS = [
     (3930881, "RECLTD", "REC"),
 ]
 
+# The UI is served from and calls back to this origin. Every ordinary test
+# request carries what a same-origin browser page running app.js sends on a
+# write: the application header plus a matching Origin (PK-5 / P0-8).
+# Security tests that need to omit or alter these build a bare TestClient.
+TERMINAL_ORIGIN = "http://127.0.0.1:8000"
+TERMINAL_HEADERS = {"X-Kite-Terminal": "1", "Origin": TERMINAL_ORIGIN}
+
+
+def terminal_client(app, **kwargs):
+    from fastapi.testclient import TestClient
+    return TestClient(app, base_url=TERMINAL_ORIGIN, headers=TERMINAL_HEADERS, **kwargs)
+
 
 def last_weekday(d: date) -> date:
     while d.weekday() >= 5:
@@ -105,9 +117,8 @@ def env(tmp_path, monkeypatch):
     broadcasts: list[dict] = []
     monkeypatch.setattr(ticker_manager, "broadcast", lambda message: broadcasts.append(message))
 
-    from fastapi.testclient import TestClient
     from backend.main import app
-    client = TestClient(app)  # startup hooks intentionally NOT run: no background loops in tests
+    client = terminal_client(app)  # startup hooks intentionally NOT run: no background loops in tests
 
     return SimpleNamespace(client=client, kite=fake, db=db, broadcasts=broadcasts, tmp_path=tmp_path)
 
@@ -138,4 +149,4 @@ def ticket_row(db, ticket_id: int) -> dict:
 
 
 __all__ = ["FakeKite", "make_candles", "seed_ohlc", "add_watch", "account_id", "set_mode", "ticket_row",
-           "last_weekday", "IST"]
+           "last_weekday", "IST", "TERMINAL_ORIGIN", "TERMINAL_HEADERS", "terminal_client"]

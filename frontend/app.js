@@ -21,7 +21,8 @@ async function fetchJson(url) {
 async function fetchJsonMutate(url, method, body) {
   const res = await fetch(url, {
     method,
-    headers: { "Content-Type": "application/json" },
+    // X-Kite-Terminal is required by the server on every write (CSRF guard, P0-8).
+    headers: { "Content-Type": "application/json", "X-Kite-Terminal": "1" },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   if (res.status === 401) {
@@ -336,7 +337,6 @@ const el = {
   cancelAllPendingConfirmBtn: document.getElementById("cancel-all-pending-confirm-btn"),
   emergencyExitAllBtn: document.getElementById("emergency-exit-all-btn"),
   emergencyExitDialog: document.getElementById("emergency-exit-dialog"),
-  emergencyExitModeLabel: document.getElementById("emergency-exit-mode-label"),
   emergencyExitPreviewBody: document.querySelector("#emergency-exit-preview-table tbody"),
   emergencyExitPhrase: document.getElementById("emergency-exit-phrase"),
   emergencyExitError: document.getElementById("emergency-exit-error"),
@@ -2024,7 +2024,29 @@ async function loadWatchlist() {
 
 const STATUS_LABELS = { pending_confirmation: "awaiting approval", risk_rejected: "risk rejected" };
 
+// PK-2: a broker submission whose outcome is not known. Deliberately unlike
+// rejected/cancelled/failed — the order may be live at the broker.
+function isSubmissionUnresolved(t) {
+  return t.status === "confirmed" && ["unknown", "needs_review"].includes(t.submission_state);
+}
+
 function statusBadgeHtml(status, ticket = null) {
+  if (ticket && status === "confirmed" && ticket.submission_state === "needs_review") {
+    return `<span class="status-badge submission_unknown" title="Broker orders for this ticket are ambiguous — resolve it in Kite. Nothing will be resubmitted.">NEEDS REVIEW — CHECK KITE</span>`;
+  }
+  if (ticket && status === "confirmed" && ticket.submission_state === "unknown") {
+    return `<span class="status-badge submission_unknown" title="The order may or may not exist at the broker. The app is searching Kite for it by its order tag.">UNKNOWN — DO NOT RESUBMIT</span>`;
+  }
+  if (ticket && status === "failed" && ticket.submission_state === "not_found") {
+    return `<span class="status-badge failed" title="No broker order with this ticket's tag appeared — nothing was placed.">not placed · no broker order</span>`;
+  }
+  // PK-8: an exit order at the broker is not a closed position.
+  if (ticket && ticket.exit_state === "exiting") {
+    return `<span class="status-badge exiting" title="Exit order placed with the broker but not filled. The position stays open and keeps its protective GTT until Kite reports the fill.">EXITING · awaiting fill</span>`;
+  }
+  if (ticket && ["exit_partial", "exit_unconfirmed"].includes(ticket.exit_state)) {
+    return `<span class="status-badge submission_unknown" title="The exit did not fill completely (or its fill could not be confirmed). The position is NOT closed — check Kite. Nothing will be resubmitted.">PARTIAL EXIT — NEEDS REVIEW</span>`;
+  }
   if (ticket && status === "executed" && ticket.entry_fill_status === "pending") {
     return `<span class="status-badge awaiting_fill" title="Order placed with the broker — waiting for the fill">placed · awaiting fill</span>`;
   }
@@ -2048,7 +2070,8 @@ function ticketRowHtml(t) {
     <td class="num">${fmt(t.current_stop_loss ?? t.stop_loss)}</td>
     <td class="num">${fmt(t.target_1)}</td>
     <td>${trailingChipHtml(t)}</td>
-    <td>${statusBadgeHtml(t.status, t)}</td>
+    <td>${statusBadgeHtml(t.status, t)}${t.exit_in_flight_ticket_id != null
+      ? ` <span class="chip warn" title="Exit ticket #${t.exit_in_flight_ticket_id} is at the broker but not filled — the position is still open.">exiting</span>` : ""}</td>
     <td>${modeChipHtml(t.mode)}</td>
     <td>${fmtDateTime(t.created_at)}</td>
   `;
@@ -2078,8 +2101,9 @@ function renderTicketsTable(tickets = state.tickets, bodyEl = el.ticketsBody) {
       tr.title = "Click to view details";
       tr.addEventListener("click", () => openDetailDialog(t));
     }
-    if (t.status === "executed" && t.mode === "live" && !t.kite_gtt_id && !t.closed_at
-        && t.closes_ticket_id == null && t.use_gtt) {
+    if ((t.status === "executed" && t.mode === "live" && !t.kite_gtt_id && !t.closed_at
+        && t.closes_ticket_id == null && t.use_gtt) || isSubmissionUnresolved(t)
+        || ["exit_partial", "exit_unconfirmed"].includes(t.exit_state)) {
       tr.classList.add("row-flagged");
     }
     if (t.archived) {
@@ -2253,7 +2277,6 @@ el.cancelAllPendingConfirmBtn.addEventListener("click", async () => {
 el.emergencyExitAllBtn.addEventListener("click", async () => {
   try {
     const positions = await API.emergencyExitPreview();
-    el.emergencyExitModeLabel.textContent = state.executionMode === "live" ? "LIVE" : "Dry Run";
     el.emergencyExitPreviewBody.innerHTML = positions.length
       ? positions.map((p) => `
           <tr>
@@ -2286,8 +2309,21 @@ el.emergencyExitConfirmBtn.addEventListener("click", async () => {
     el.emergencyExitDialog.close();
     await refreshTicketViews();
     refreshOrderBooks();
-    toast(`${result.count} position(s) processed — check Orders & Trades for fills.`,
-      { type: "warning", title: "Emergency exit complete" });
+    // PK-8: an exit order placed is not a position closed — the positions
+    // stay open (EXITING) until Kite reports each fill.
+    const submitted = (result.results || []).filter((r) => r.status === "exit_submitted").length;
+    toast(`${submitted} exit order(s) placed for ${result.count} position(s). They stay open (EXITING) until `
+      + "Kite reports the fills — check Orders & Trades.",
+    { type: "warning", title: "Emergency exit orders sent" });
+    // Positions that were NOT exited by this click (refused at confirmation,
+    // an exit already in flight/UNKNOWN, rejected by the broker, risk check
+    // unavailable) — never hidden inside the count.
+    const notExited = (result.results || []).filter((r) =>
+      ["refused", "exit_outcome_unknown", "already_exiting", "failed", "risk_check_unavailable"].includes(r.status));
+    if (notExited.length) {
+      toast(notExited.map((r) => `${r.symbol}: ${r.message || r.status}`).join(" · "),
+        { type: "error", title: `${notExited.length} position(s) NOT exited — check Kite`, timeout: 0 });
+    }
   } catch (e) {
     el.emergencyExitError.textContent = e.message;
   }
@@ -2602,9 +2638,17 @@ function ticketConfirmHtml(t) {
   `;
 }
 
+// The mode approving this ticket executes in. A ticket carries its own mode
+// once stamped — an exit inherits the mode of the position it closes, so the
+// global toggle must not be shown as its mode. Only a new entry (mode still
+// unset) follows the global toggle.
+function ticketExecMode(t) {
+  return t?.mode || state.executionMode;
+}
+
 // How an approval will be executed — shown before the user commits.
 function executionNote(t) {
-  const live = state.executionMode === "live";
+  const live = ticketExecMode(t) === "live";
   if (!live) return { live, text: "DRY RUN — approving simulates the trade; nothing is sent to the broker." };
   const how = computeMarketStatus() === "open"
     ? "a regular order"
@@ -2688,12 +2732,19 @@ async function approveTicket(id) {
 
 function reportExecution(t) {
   const what = `${t.transaction_type} ${fmt(t.quantity, 0)} ${t.symbol}`;
-  if (!t.success) {
+  if (isSubmissionUnresolved(t)) {
+    toast(t.execution_message, { type: "warning", title: `${what} — outcome UNKNOWN, do not resubmit`, timeout: 0 });
+  } else if (!t.success) {
     toast(t.execution_message, { type: "error", title: `${what} — not executed` });
   } else if (/UNPROTECTED|FAILED/.test(t.execution_message || "")) {
     toast(t.execution_message, { type: "warning", title: `${what} — placed, check protection`, timeout: 0 });
   } else if (t.mode === "dry_run") {
     toast("Simulated — no real order was sent.", { type: "success", title: `${what} (dry run)` });
+  } else if (t.exit_state === "exiting") {
+    toast(t.order_variety === "amo"
+      ? "Exit sent as AMO — it executes when the market opens. The position stays open, with its protective GTT, until Kite reports the fill."
+      : "Exit placed — the position stays open, with its protective GTT, until Kite reports the fill.",
+    { type: "success", title: `${what} — EXITING` });
   } else {
     toast(t.order_variety === "amo"
       ? "Sent as AMO — it executes when the market opens. The fill is tracked automatically."
@@ -2847,12 +2898,17 @@ async function openDetailDialog(ticket) {
     ? `<div class="row"><span>Kite Order ID</span><strong>${ticket.kite_order_id}</strong></div>` : "";
   const gttRow = ticket.kite_gtt_id
     ? `<div class="row"><span>Kite GTT ID</span><strong>${ticket.kite_gtt_id}</strong></div>` : "";
-  el.ticketDetailBody.innerHTML = statusRow + modeRow + orderRow + gttRow + ticketConfirmHtml(ticket);
+  const tagRow = ticket.order_tag
+    ? `<div class="row"><span>Kite order tag</span><strong>${esc(ticket.order_tag)}</strong></div>` : "";
+  el.ticketDetailBody.innerHTML = statusRow + modeRow + orderRow + gttRow + tagRow + ticketConfirmHtml(ticket);
   renderTicketDetailEvents([]); // populated below once we fetch full detail
 
   const isDraft = ticket.status === "draft";
   const isSoftDeletable = ["rejected", "cancelled", "failed"].includes(ticket.status);
-  el.ticketDetailEditBtn.hidden = !isDraft;
+  // Exit / reduction tickets are never editable (the server refuses too).
+  const isClosing = ticket.closes_ticket_id != null
+    || (ticket.transaction_type === "SELL" && ticket.source === "alert_action");
+  el.ticketDetailEditBtn.hidden = !isDraft || isClosing;
   el.ticketDetailDeleteBtn.hidden = !isDraft;
   el.ticketDetailArchiveBtn.hidden = !isSoftDeletable;
   el.ticketDetailRevertBtn.hidden = ticket.status !== "rejected";
@@ -3832,8 +3888,8 @@ el.viewApprovals.addEventListener("click", async (event) => {
     if (approve && !(await confirmAction({
       title: `Move ${proposal?.symbol ?? ""} stop to breakeven?`,
       html: `<p>Stop ${inr(proposal?.current_stop)} → <strong>${inr(proposal?.proposed_stop)}</strong>.</p>
-        <div class="exec-note${state.executionMode === "live" ? " live" : ""}">${state.executionMode === "live"
-          ? "LIVE — the protective GTT at the broker is modified." : "DRY RUN — only the app's record is updated."}</div>`,
+        <div class="exec-note${proposal?.mode !== "dry_run" ? " live" : ""}">${proposal?.mode !== "dry_run"
+          ? "LIVE position — the protective GTT at the broker is modified." : "Dry-run position — only the app's record is updated."}</div>`,
       okLabel: "Move stop", okClass: "btn-success",
     }))) return;
     card.classList.add("busy");
@@ -3862,7 +3918,7 @@ el.viewApprovals.addEventListener("click", async (event) => {
   } else if (action === "details") {
     openConfirmDialog(ticket);
   } else if (action === "approve") {
-    const live = state.executionMode === "live";
+    const live = ticketExecMode(ticket) === "live";
     const ok = await confirmAction({
       title: live ? `Place a real ${ticket.transaction_type} order?` : "Approve this trade (dry run)?",
       html: approvalConfirmHtml(ticket),
@@ -4557,7 +4613,8 @@ function sdRenderContextSection() {
 function sdRenderActions() {
   const t = sd.ticket;
   const decidable = t.status === "pending_confirmation" || t.status === "draft";
-  el.sdApprove.hidden = !decidable;
+  // A draft has not passed risk checks, so the server refuses to confirm it.
+  el.sdApprove.hidden = t.status !== "pending_confirmation";
   el.sdReject.hidden = !decidable;
   const note = executionNote(t);
   el.sdExecNote.className = `exec-note${note.live ? " live" : ""}`;
@@ -4634,7 +4691,7 @@ el.sdEvidenceInner.addEventListener("click", (event) => {
 el.sdApprove.addEventListener("click", async () => {
   const t = sd.ticket;
   if (!t) return;
-  const live = state.executionMode === "live";
+  const live = ticketExecMode(t) === "live";
   const ok = await confirmAction({
     title: live ? `Place a real ${t.transaction_type} order?` : "Approve this trade (dry run)?",
     html: approvalConfirmHtml(t),

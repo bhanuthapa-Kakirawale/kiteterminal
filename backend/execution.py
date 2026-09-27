@@ -1,16 +1,9 @@
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from kiteconnect import KiteConnect
-from kiteconnect.exceptions import (
-    GeneralException,
-    InputException,
-    NetworkException,
-    OrderException,
-    PermissionException,
-    TokenException,
-)
+from kiteconnect.exceptions import InputException, OrderException, PermissionException
 
 from backend import config, instruments, market
 from backend.db import get_connection
@@ -44,6 +37,157 @@ def set_execution_mode(mode: str, confirm_real_money: bool, account_id: int | No
     return mode
 
 
+# ---- PK-2: broker submission tracking ---------------------------------------
+#
+# trade_tickets.submission_state records what is known about a live ticket's
+# broker order, separately from its lifecycle status:
+#
+#   NULL          never submitted (draft/pending/rejected tickets, dry runs,
+#                 and every ticket from before PK-2)
+#   submitting    execution claimed (status 'confirmed'); the broker call is
+#                 about to start or in flight. Written in the same
+#                 compare-and-set as pending_confirmation -> confirmed.
+#   acknowledged  the broker returned an order id (status 'executed')
+#   rejected      the broker definitively rejected the order (status 'failed')
+#   unknown       the call failed in a way that does not prove rejection:
+#                 the order may or may not exist. Status stays 'confirmed';
+#                 order_monitor searches Kite for the order tag.
+#   adopted       an unknown submission whose tagged broker order was found
+#                 and taken over (status 'executed', normal lifecycle)
+#   not_found     no tagged order appeared within the reconciliation window:
+#                 no order was placed (status 'failed')
+#   needs_review  the broker evidence is contradictory (several or
+#                 mismatching tagged orders) or can no longer be checked.
+#                 Status stays 'confirmed'; automation stops touching it.
+SUBMITTING = "submitting"
+ACKNOWLEDGED = "acknowledged"
+REJECTED = "rejected"
+UNKNOWN = "unknown"
+ADOPTED = "adopted"
+NOT_FOUND = "not_found"
+NEEDS_REVIEW = "needs_review"
+
+# Only these prove that Kite refused the order: it answered with an explicit
+# validation/RMS/permission error. Everything else that can escape
+# place_order — NetworkException (gateway timeout), TokenException,
+# GeneralException (5xx / unrecognised error_type), DataException
+# (unparseable body), raw requests errors (kiteconnect re-raises them
+# unwrapped), KeyError/TypeError from a malformed payload — leaves open the
+# possibility that the order was accepted, so it is an UNKNOWN outcome.
+DEFINITE_REJECTIONS = (OrderException, InputException, PermissionException)
+
+KITE_TAG_MAX_LENGTH = 20
+_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _base36(n: int) -> str:
+    digits = ""
+    while True:
+        n, r = divmod(n, 36)
+        digits = _BASE36[r] + digits
+        if n == 0:
+            return digits
+
+
+def order_tag_for(ticket_id: int, created_at: str) -> str:
+    """The Kite order tag for a ticket's order: 'kt<id>x<created_at as
+    base36 epoch seconds>'. Deterministic from the ticket row, so it survives
+    a restart even without the copy persisted in trade_tickets.order_tag. The
+    created_at part keeps it unique if a restored database backup reissues a
+    ticket id that already tagged an order the same day. Kite allows at most
+    20 alphanumeric characters."""
+    created = datetime.strptime(created_at[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    tag = f"kt{ticket_id}x{_base36(int(created.timestamp()))}"
+    if len(tag) > KITE_TAG_MAX_LENGTH or not tag.isalnum():
+        raise ValueError(f"Order tag {tag!r} does not satisfy Kite's tag rules")
+    return tag
+
+
+def utc_now_sql() -> str:
+    """Now, in the text format SQLite's datetime('now') uses."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def update_ticket_if(
+    conn: sqlite3.Connection, ticket_id: int, *,
+    status_in: tuple[str, ...], submission_state_in: tuple[str | None, ...], **columns,
+) -> bool:
+    """Compare-and-set for the writes that follow the claim: applies
+    `columns` only if the ticket is still in one of status_in AND one of
+    submission_state_in (None matches NULL). Since PK-2 both the confirming
+    request and order_monitor can resolve the same live ticket, so neither
+    writes unconditionally — the loser gets False, must not overwrite, and
+    re-reads the ticket. Column names come from code, never from input."""
+    assignments = ", ".join(f"{name} = ?" for name in columns)
+    states = [s for s in submission_state_in if s is not None]
+    conditions = []
+    if states:
+        conditions.append(f"submission_state IN ({', '.join('?' * len(states))})")
+    if None in submission_state_in:
+        conditions.append("submission_state IS NULL")
+    cursor = conn.execute(
+        f"UPDATE trade_tickets SET {assignments} "
+        f"WHERE id = ? AND status IN ({', '.join('?' * len(status_in))}) AND ({' OR '.join(conditions)})",
+        (*columns.values(), ticket_id, *status_in, *states),
+    )
+    return cursor.rowcount == 1
+
+
+# ---- PK-8: explicit exit lifecycle ------------------------------------------
+#
+# Placing an exit order is not exiting. A live exit ticket goes
+#   confirmed (claimed / UNKNOWN) -> executed + entry_fill_status 'pending'
+# once Kite accepts the order: EXITING. The position it closes stays OPEN,
+# keeps its protective GTT and is not journaled until order_monitor sees the
+# broker report the full quantity COMPLETE ('filled'); only then is the
+# position's closed_at stamped. 'partial' / 'unconfirmed' exits keep the
+# position open and need a human. A dry-run exit is simulated as filled at
+# once. No new status value: 'executed' keeps the exit owning its position
+# under the PK-4 unique index while it is in flight.
+#
+# An exit whose fill is proven. NULL covers exits from before fills were
+# tracked; their positions already carry closed_at.
+EXIT_FILL_PROVEN_SQL = "COALESCE(entry_fill_status, 'filled') = 'filled'"
+
+_EXIT_STATES = {"pending": "exiting", "partial": "exit_partial", "unconfirmed": "exit_unconfirmed"}
+
+
+def exit_state(ticket) -> str | None:
+    """'exiting' (order at the broker, awaiting its fill), 'exit_partial',
+    'exit_unconfirmed' (both need review) or 'exited' for an executed
+    closing sell; None for anything else."""
+    if ticket["status"] != "executed" or not is_closing_sell(ticket):
+        return None
+    return _EXIT_STATES.get(ticket["entry_fill_status"], "exited")
+
+
+def supersede_sibling_exits(conn: sqlite3.Connection, position_id: int, owner_id: int) -> list[int]:
+    """Once exit ticket owner_id has closed position_id — its full fill is
+    proven (PK-8) — every other exit of that position still awaiting
+    approval is stale: each is rejected (compare-and-set, so a sibling
+    claimed meanwhile is left alone) so it can no longer be approved. Never
+    called on a claim, an UNKNOWN outcome or a merely accepted order: those
+    leave the siblings pending (and blocked, PK-4). The caller commits."""
+    candidates = conn.execute(
+        "SELECT id FROM trade_tickets WHERE closes_ticket_id = ? AND id != ? "
+        "AND status IN ('draft', 'pending_confirmation') ORDER BY id",
+        (position_id, owner_id),
+    ).fetchall()
+    superseded = []
+    for row in candidates:
+        if conn.execute(
+            "UPDATE trade_tickets SET status = 'rejected' WHERE id = ? AND status IN ('draft', 'pending_confirmation')",
+            (row["id"],),
+        ).rowcount == 1:
+            conn.execute(
+                "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'rejected', ?)",
+                (row["id"], f"Superseded by exit ticket {owner_id} — position {position_id} is closed; "
+                            f"no order was sent."),
+            )
+            superseded.append(row["id"])
+    return superseded
+
+
 def compute_risk_metrics(ticket_like: dict) -> dict:
     entry = ticket_like["entry_price"]
     qty = ticket_like["quantity"]
@@ -74,8 +218,10 @@ class ExecutionResult:
     success: bool
     kite_order_id: str | None
     kite_gtt_id: int | None
-    status: str  # 'executed' | 'failed'
-    event_type: str  # 'executed' | 'execution_failed' | 'protection_failed'
+    # 'executed' | 'failed' | 'confirmed' (outcome unknown: the ticket stays
+    # claimed until order_monitor resolves it from broker evidence)
+    status: str
+    event_type: str  # 'executed' | 'execution_failed' | 'protection_failed' | 'submission_unknown'
     message: str
     order_variety: str | None = None  # 'regular' | 'amo'
     # 'pending' for a live order until backend/order_monitor.py sees the
@@ -105,6 +251,27 @@ def execute_ticket(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
     if is_closing_sell(ticket):
         return _execute_exit(kite, ticket)
     return _execute_live(kite, ticket)
+
+
+def _order_tag(ticket: sqlite3.Row) -> str:
+    return ticket["order_tag"] or order_tag_for(ticket["id"], ticket["created_at"])
+
+
+def unknown_result(ticket: sqlite3.Row, exc: BaseException, variety: str | None = None) -> ExecutionResult:
+    """The broker call failed without proving that Kite rejected the order.
+    Never retried here: order_monitor resolves it by the order tag."""
+    what = "Exit" if is_closing_sell(ticket) else "Entry"
+    return ExecutionResult(
+        success=False, kite_order_id=None, kite_gtt_id=None,
+        status="confirmed", event_type="submission_unknown",
+        message=(
+            f"{what} order outcome UNKNOWN — DO NOT RESUBMIT. The broker call failed with "
+            f"{type(exc).__name__}: {exc}. Kite may or may not have accepted the order. The order monitor is "
+            f"searching Kite's order book for tag {_order_tag(ticket)} and will take the order over if it "
+            f"exists; nothing will be resubmitted automatically."
+        ),
+        order_variety=variety,
+    )
 
 
 def _simulate(ticket: sqlite3.Row) -> ExecutionResult:
@@ -158,38 +325,32 @@ def _execute_live(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
 
     # 1. Entry order — common to both trailing and non-trailing branches. A
     # GTT alone cannot open a position, so both branches place a real order first.
+    order_kwargs = dict(
+        variety=variety,
+        exchange=exchange,
+        tradingsymbol=symbol,
+        transaction_type=transaction_type,
+        quantity=quantity,
+        product=product,
+        order_type=ticket["entry_order_type"],
+        tag=_order_tag(ticket),
+    )
+    if ticket["entry_order_type"] == "LIMIT":
+        order_kwargs["price"] = market.round_to_tick(ticket["entry_price"], tick)
+    # Only the broker call itself is inside the try, so every exception
+    # caught here happened after the request may have left this process.
     try:
-        order_kwargs = dict(
-            variety=variety,
-            exchange=exchange,
-            tradingsymbol=symbol,
-            transaction_type=transaction_type,
-            quantity=quantity,
-            product=product,
-            order_type=ticket["entry_order_type"],
-        )
-        if ticket["entry_order_type"] == "LIMIT":
-            order_kwargs["price"] = market.round_to_tick(ticket["entry_price"], tick)
         kite_order_id = kite.place_order(**order_kwargs)
-    except (OrderException, InputException, GeneralException, PermissionException) as e:
+    except DEFINITE_REJECTIONS as e:
         return ExecutionResult(
             success=False, kite_order_id=None, kite_gtt_id=None,
             status="failed", event_type="execution_failed",
             message=f"Entry order rejected by Kite: {e}", order_variety=variety,
         )
-    except (NetworkException, TokenException) as e:
-        # Ambiguous: we cannot tell if Kite actually received the order before
-        # the network/auth error. Never assume success or silently retry —
-        # surface this explicitly so the human verifies before resubmitting.
-        return ExecutionResult(
-            success=False, kite_order_id=None, kite_gtt_id=None,
-            status="failed", event_type="execution_failed",
-            message=(
-                f"Entry order outcome UNKNOWN (network/auth error): {e}. "
-                f"Verify manually in Kite before retrying — do not resubmit blindly."
-            ),
-            order_variety=variety,
-        )
+    except Exception as e:
+        # Ambiguous: Kite may have accepted the order before the failure. Never
+        # assume either way and never retry — order_monitor resolves it.
+        return unknown_result(ticket, e, variety)
 
     # 2. Protective exit-side GTT — placed immediately after a successful
     # entry so the position is never left naked, even briefly (and even if
@@ -270,69 +431,40 @@ def _execute_exit(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
     the Quick Action popup's sell action, which reduces/exits a holding that
     may have no originating ticket at all) reduces or closes an existing
     position. It must NOT get a protective GTT of its own — there's nothing
-    new to protect — and, when closes_ticket_id IS set, the ORIGINAL
-    position's GTT must be cancelled here, synchronously, once this exit is
-    accepted, so a now-flat position doesn't keep a dangling stop-loss GTT
-    that could later trigger against nothing. The original ticket's
-    closed_at is stamped by the caller (routes/tickets.py's
-    confirm_and_execute_ticket), immediately, in the same transaction as
-    this exit's own execution — that stamping (and the closed_trades journal
-    row) only happens when closes_ticket_id is set; an alert_action sell
-    with no closes_ticket_id has no original ticket to stamp or journal
-    (see routes/tickets.py's alert-action sell endpoint for why). If the
-    broker later rejects this exit, order_monitor.py re-opens the position
-    (when there is an original ticket to reopen) and raises an urgent alert."""
+    new to protect.
+
+    PK-8: an accepted order id only makes the exit EXITING. The original
+    position's GTT is deliberately left in place — until the exit fills it
+    is still the position's only protection (an OPEN LIMIT exit, an AMO
+    waiting overnight, or an exit the exchange later rejects) — and the
+    position is neither closed nor journaled here. order_monitor.py
+    finalizes all of that once Kite reports the full quantity COMPLETE."""
     exchange, symbol = ticket["exchange"], ticket["symbol"]
     tick = instruments.get_tick_size(symbol, exchange)
     variety = resolve_order_variety(kite)
+    order_kwargs = dict(
+        variety=variety,
+        exchange=exchange,
+        tradingsymbol=symbol,
+        transaction_type=ticket["transaction_type"],
+        quantity=ticket["quantity"],
+        product=ticket["product_type"],
+        order_type=ticket["entry_order_type"],
+        tag=_order_tag(ticket),
+    )
+    if ticket["entry_order_type"] == "LIMIT":
+        order_kwargs["price"] = market.round_to_tick(ticket["entry_price"], tick)
     try:
-        order_kwargs = dict(
-            variety=variety,
-            exchange=exchange,
-            tradingsymbol=symbol,
-            transaction_type=ticket["transaction_type"],
-            quantity=ticket["quantity"],
-            product=ticket["product_type"],
-            order_type=ticket["entry_order_type"],
-        )
-        if ticket["entry_order_type"] == "LIMIT":
-            order_kwargs["price"] = market.round_to_tick(ticket["entry_price"], tick)
         kite_order_id = kite.place_order(**order_kwargs)
-    except (OrderException, InputException, GeneralException, PermissionException) as e:
+    except DEFINITE_REJECTIONS as e:
         return ExecutionResult(
             success=False, kite_order_id=None, kite_gtt_id=None,
             status="failed", event_type="execution_failed",
             message=f"Exit order rejected by Kite: {e}", order_variety=variety,
         )
-    except (NetworkException, TokenException) as e:
-        return ExecutionResult(
-            success=False, kite_order_id=None, kite_gtt_id=None,
-            status="failed", event_type="execution_failed",
-            message=(
-                f"Exit order outcome UNKNOWN (network/auth error): {e}. "
-                f"Verify manually in Kite before retrying — do not resubmit blindly."
-            ),
-            order_variety=variety,
-        )
-
-    conn = get_connection()
-    try:
-        original = conn.execute(
-            "SELECT kite_gtt_id FROM trade_tickets WHERE id = ?", (ticket["closes_ticket_id"],)
-        ).fetchone()
-    finally:
-        conn.close()
-
-    gtt_note = ""
-    if original is not None and original["kite_gtt_id"] is not None:
-        try:
-            kite.delete_gtt(original["kite_gtt_id"])
-        except Exception as e:
-            gtt_note = (
-                f" WARNING: exit order placed, but deleting the original position's GTT "
-                f"({original['kite_gtt_id']}) FAILED: {e}. Remove it manually in Kite — "
-                f"it is now orphaned against a closed/reduced position."
-            )
+    except Exception as e:
+        # Until the exit is known to exist, the position keeps everything.
+        return unknown_result(ticket, e, variety)
 
     closes_note = f" (closes ticket {ticket['closes_ticket_id']})" if ticket["closes_ticket_id"] is not None else ""
     return ExecutionResult(
@@ -340,7 +472,9 @@ def _execute_exit(kite: KiteConnect, ticket: sqlite3.Row) -> ExecutionResult:
         status="executed", event_type="executed",
         message=(
             f"order_id={kite_order_id}, {ticket['transaction_type']} {ticket['quantity']} {symbol} "
-            f"@ {ticket['entry_order_type']}{_variety_note(kite, variety)}{closes_note}"
-        ) + gtt_note,
+            f"@ {ticket['entry_order_type']}{_variety_note(kite, variety)}{closes_note} — EXITING: the exit order "
+            f"is placed but not filled. The position stays open and keeps its protective GTT until Kite reports "
+            f"the fill."
+        ),
         order_variety=variety, entry_fill_status="pending",
     )

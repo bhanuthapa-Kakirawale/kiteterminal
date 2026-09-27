@@ -157,31 +157,35 @@ def _open_position_with_exit(env) -> tuple[int, int, int]:
     return buy_id, sell_id, gtt_id
 
 
-def test_order_monitor_exit_fill_reprices_journal(env):
+def test_order_monitor_exit_fill_journals_at_fill_price(env):
     from backend import order_monitor
     buy_id, sell_id, _ = _open_position_with_exit(env)
     env.kite.auto_fill = False
     done = env.client.post(f"/api/tickets/{sell_id}/confirm").json()["data"]
+    assert _rows(env, "SELECT * FROM closed_trades") == []  # PK-8: nothing before the fill
     env.kite.set_order_state(done["kite_order_id"], "COMPLETE", filled_quantity=5, average_price=3150.0)
     order_monitor.check_pending_orders(env.kite)
     trade = _rows(env, "SELECT * FROM closed_trades WHERE sell_ticket_id = ?", sell_id)[0]
     assert trade["exit_price"] == 3150.0 and trade["realized_pnl"] == pytest.approx(750.0)
 
 
-def test_order_monitor_rejected_exit_reopens_position(env):
+def test_order_monitor_rejected_exit_keeps_position_open_and_protected(env):
+    # PK-8: the exit never closed the position or removed its GTT, so a
+    # rejection has nothing to reopen — the position simply stays as it was.
     from backend import order_monitor
     buy_id, sell_id, gtt_id = _open_position_with_exit(env)
     env.kite.auto_fill = False
     done = env.client.post(f"/api/tickets/{sell_id}/confirm").json()["data"]
-    assert ticket_row(env.db, buy_id)["closed_at"] is not None
+    assert ticket_row(env.db, buy_id)["closed_at"] is None
     env.kite.set_order_state(done["kite_order_id"], "REJECTED", status_message="Exchange rejected")
     order_monitor.check_pending_orders(env.kite)
     buy = ticket_row(env.db, buy_id)
-    assert buy["closed_at"] is None and buy["kite_gtt_id"] is None  # GTT was removed when the exit was placed
+    assert buy["closed_at"] is None and buy["kite_gtt_id"] == gtt_id
+    assert env.kite.gtt_book[gtt_id]["status"] == "active"
     assert ticket_row(env.db, sell_id)["status"] == "failed"
     assert _rows(env, "SELECT * FROM closed_trades") == []
     mismatches = env.client.get("/api/reconciliation/mismatches").json()["data"]
-    assert any("UNPROTECTED" in m["detail"] for m in mismatches)
+    assert any("still OPEN" in m["detail"] and "still active" in m["detail"] for m in mismatches)
     assert [p["ticket_id"] for p in env.client.get("/api/kill-switch/emergency-exit-preview").json()["data"]] == [buy_id]
 
 
@@ -209,20 +213,21 @@ def test_rejected_exit_signal_keeps_position_open(env):
 
 
 def test_executed_exit_does_not_leave_phantom_open_risk(env):
-    from backend import risk_engine
+    from backend import order_monitor, risk_engine
+
+    def open_risk():
+        conn = _conn(env)
+        try:
+            return risk_engine._open_risk_sum(conn, account_id(env.db))
+        finally:
+            conn.close()
+
     buy_id, sell_id, _ = _open_position_with_exit(env)
-    conn = _conn(env)
-    try:
-        before = risk_engine._open_risk_sum(conn, account_id(env.db))
-    finally:
-        conn.close()
-    assert before == 500.0
+    assert open_risk() == 500.0
     env.client.post(f"/api/tickets/{sell_id}/confirm")
-    conn = _conn(env)
-    try:
-        assert risk_engine._open_risk_sum(conn, account_id(env.db)) == 0
-    finally:
-        conn.close()
+    assert open_risk() == 500.0  # PK-8: EXITING — still open until the fill
+    order_monitor.check_pending_orders(env.kite)
+    assert open_risk() == 0
 
 
 # ---------------------------------------------------------------- trailing engine
