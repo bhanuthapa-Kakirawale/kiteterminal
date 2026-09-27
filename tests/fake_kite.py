@@ -3,11 +3,17 @@ the local demo server so nothing ever reaches the real broker."""
 
 import copy
 import itertools
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from kiteconnect.exceptions import InputException
 
 TERMINAL_ORDER_STATUSES = {"COMPLETE", "CANCELLED", "REJECTED"}
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _ist_now() -> str:
+    # Kite reports order and GTT timestamps in exchange (IST) time.
+    return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
 
 class FakeKite:
@@ -28,6 +34,12 @@ class FakeKite:
         self.gtt_book: dict[int, dict] = {}
         self.calls: list[tuple[str, dict]] = []
         self.fail_next: dict[str, Exception] = {}
+        # Raised AFTER the call has taken effect — the broker accepted it but
+        # the response never arrived (see accept_then_raise).
+        self.fail_after_next: dict[str, Exception] = {}
+        # Called with the call's kwargs before it takes effect; lets a test
+        # hold a thread inside a broker call deterministically (see on_call).
+        self.before_call: dict[str, object] = {}
         self.auto_fill = True
         self._order_ids = itertools.count(250_000_000_001)
         self._gtt_ids = itertools.count(9001)
@@ -35,9 +47,35 @@ class FakeKite:
     # -- helpers for tests -------------------------------------------------
     def _record(self, name, **kwargs):
         self.calls.append((name, kwargs))
+        hook = self.before_call.get(name)
+        if hook is not None:
+            hook(kwargs)
         exc = self.fail_next.pop(name, None)
         if exc is not None:
             raise exc
+
+    def _raise_if_accepted_then_lost(self, name):
+        exc = self.fail_after_next.pop(name, None)
+        if exc is not None:
+            raise exc
+
+    def raise_on_next(self, name, exc):
+        """The next `name` call raises before taking effect: the request never
+        reached the broker."""
+        self.fail_next[name] = exc
+
+    def accept_then_raise(self, name, exc):
+        """The next `name` call takes full effect at the broker, then raises:
+        e.g. the order was accepted but the HTTP response was lost."""
+        self.fail_after_next[name] = exc
+
+    def on_call(self, name, fn):
+        """Run fn(kwargs) inside every `name` call, before it takes effect.
+        Pass fn=None to remove the hook."""
+        if fn is None:
+            self.before_call.pop(name, None)
+        else:
+            self.before_call[name] = fn
 
     def calls_to(self, name):
         return [kw for n, kw in self.calls if n == name]
@@ -50,9 +88,74 @@ class FakeKite:
         if average_price is not None:
             order["average_price"] = average_price
         order["status_message"] = status_message
+        if order["filled_quantity"] and order.get("exchange_timestamp") is None:
+            order["exchange_timestamp"] = _ist_now()
 
     def set_gtt_status(self, gtt_id, status):
         self.gtt_book[gtt_id]["status"] = status
+
+    def trigger_gtt(self, gtt_id, leg=0, status="COMPLETE", filled_quantity=None, average_price=None,
+                    expose_result=True, placement="success", rejection_reason=""):
+        """What Kite does when a GTT fires: marks it 'triggered' and places the
+        leg's LIMIT order. That order need not fill — pass status='OPEN' (and
+        optionally a partial filled_quantity) for a gap through the limit.
+
+        Like Kite, the fired leg then carries a `result` whose
+        order_result.order_id links the GTT to that order. expose_result=False
+        leaves the link out (a GTT listing without it); placement='failed'
+        means Kite could not place the order at all (e.g. circuit limit): no
+        order exists and the result says why. Returns the new order id, or
+        None when placement failed. Holdings are not touched; use set_holding."""
+        gtt = self.gtt_book[gtt_id]
+        if leg >= len(gtt["orders"]):
+            raise ValueError(f"GTT {gtt_id} has no order leg {leg}")
+        order = gtt["orders"][leg]
+        gtt["status"] = "triggered"
+        order_id = None
+        if placement == "success":
+            if filled_quantity is None:
+                filled_quantity = order["quantity"] if status == "COMPLETE" else 0
+            if average_price is None:
+                average_price = order["price"] if filled_quantity else 0
+            order_id = self._new_order(
+                self.VARIETY_REGULAR, gtt["condition"]["exchange"], gtt["condition"]["tradingsymbol"],
+                order["transaction_type"], order["quantity"], order["product"], order.get("order_type", "LIMIT"),
+                order["price"], status, filled_quantity, average_price,
+            )
+        if expose_result:
+            triggers = gtt["condition"]["trigger_values"]
+            order["result"] = {
+                "account_id": "DT0001", "order_id": order_id or "", "status": placement,
+                "timestamp": _ist_now(), "triggered_at": triggers[min(leg, len(triggers) - 1)],
+                "order_result": {"status": placement, "order_id": order_id or "",
+                                 "rejection_reason": rejection_reason},
+            }
+        return order_id
+
+    def set_holding(self, symbol, quantity, t1_quantity=0, average_price=None, last_price=None, exchange="NSE"):
+        """Set (or, with both quantities 0, remove) the broker's holding for symbol."""
+        existing = next((h for h in self._holdings if h["tradingsymbol"] == symbol), None)
+        if quantity == 0 and t1_quantity == 0:
+            if existing is not None:
+                self._holdings.remove(existing)
+            return
+        if existing is None:
+            existing = {"tradingsymbol": symbol, "exchange": exchange, "instrument_token": 0, "pnl": 0.0,
+                        "day_change": 0.0, "day_change_percentage": 0.0}
+            self._holdings.append(existing)
+        price = self.ltp_map.get(f"{exchange}:{symbol}", 100.0)
+        existing.update(
+            quantity=quantity, t1_quantity=t1_quantity,
+            average_price=average_price if average_price is not None else existing.get("average_price", price),
+            last_price=last_price if last_price is not None else existing.get("last_price", price),
+        )
+
+    def set_position(self, symbol, quantity, product="CNC", exchange="NSE"):
+        """Set (or, with quantity 0, remove) the broker's net position for symbol."""
+        self._positions[:] = [p for p in self._positions if p["tradingsymbol"] != symbol]
+        if quantity:
+            self._positions.append({"tradingsymbol": symbol, "exchange": exchange, "product": product,
+                                    "quantity": quantity})
 
     # -- portfolio ---------------------------------------------------------
     def profile(self):
@@ -81,24 +184,53 @@ class FakeKite:
 
     # -- orders ------------------------------------------------------------
     def place_order(self, variety, exchange, tradingsymbol, transaction_type, quantity, product, order_type,
-                    price=None, **kwargs):
+                    price=None, tag=None, **kwargs):
         self._record("place_order", variety=variety, exchange=exchange, tradingsymbol=tradingsymbol,
                      transaction_type=transaction_type, quantity=quantity, product=product,
-                     order_type=order_type, price=price)
-        order_id = str(next(self._order_ids))
+                     order_type=order_type, price=price, tag=tag)
         key = f"{exchange}:{tradingsymbol}"
         fill_price = price if price is not None else self.ltp_map.get(key, 100.0)
         filled = self.auto_fill
         pending_status = "AMO REQ RECEIVED" if variety == self.VARIETY_AMO else "OPEN"
+        order_id = self._new_order(
+            variety, exchange, tradingsymbol, transaction_type, quantity, product, order_type, price,
+            "COMPLETE" if filled else pending_status, quantity if filled else 0, fill_price if filled else 0,
+            tag=tag,
+        )
+        self._raise_if_accepted_then_lost("place_order")
+        return order_id
+
+    def add_broker_order(self, tradingsymbol, transaction_type, quantity, tag=None, status="OPEN", exchange="NSE",
+                         product="CNC", order_type="LIMIT", price=3000.0, variety="regular", filled_quantity=None,
+                         average_price=None, order_timestamp=None):
+        """An order that already exists at the broker (placed by an earlier
+        process, or outside this app). Not recorded as a place_order call.
+        order_timestamp (IST, 'YYYY-MM-DD HH:MM:SS') defaults to now.
+        Returns the new order id."""
+        if filled_quantity is None:
+            filled_quantity = quantity if status == "COMPLETE" else 0
+        if average_price is None:
+            average_price = price if filled_quantity else 0
+        return self._new_order(variety, exchange, tradingsymbol, transaction_type, quantity, product, order_type,
+                               price, status, filled_quantity, average_price, tag=tag, order_timestamp=order_timestamp)
+
+    def _new_order(self, variety, exchange, tradingsymbol, transaction_type, quantity, product, order_type, price,
+                   status, filled_quantity, average_price, tag=None, order_timestamp=None):
+        order_id = str(next(self._order_ids))
+        placed_at = order_timestamp or _ist_now()
         self.order_book[order_id] = {
             "order_id": order_id, "variety": variety, "exchange": exchange, "tradingsymbol": tradingsymbol,
             "transaction_type": transaction_type, "quantity": quantity, "product": product,
             "order_type": order_type, "price": price or 0,
-            "status": "COMPLETE" if filled else pending_status,
-            "filled_quantity": quantity if filled else 0,
-            "average_price": fill_price if filled else 0,
+            "status": status,
+            "filled_quantity": filled_quantity,
+            "average_price": average_price,
             "status_message": None,
-            "order_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "order_timestamp": placed_at,
+            "exchange_timestamp": placed_at if filled_quantity else None,
+            # Kite returns the order's tag, and (newer API) a list of tags.
+            "tag": tag,
+            "tags": [tag] if tag else [],
         }
         return order_id
 
@@ -119,6 +251,7 @@ class FakeKite:
         self._record("cancel_order", variety=variety, order_id=order_id)
         if order_id in self.order_book:
             self.order_book[order_id]["status"] = "CANCELLED"
+        self._raise_if_accepted_then_lost("cancel_order")
         return order_id
 
     # -- GTT ---------------------------------------------------------------
@@ -132,6 +265,7 @@ class FakeKite:
                           "trigger_values": list(trigger_values), "last_price": last_price},
             "orders": copy.deepcopy(orders),
         }
+        self._raise_if_accepted_then_lost("place_gtt")
         return {"trigger_id": gtt_id}
 
     def modify_gtt(self, trigger_id, trigger_type, tradingsymbol, exchange, trigger_values, last_price, orders):
@@ -143,6 +277,7 @@ class FakeKite:
         gtt["condition"]["trigger_values"] = list(trigger_values)
         gtt["condition"]["last_price"] = last_price
         gtt["orders"] = copy.deepcopy(orders)
+        self._raise_if_accepted_then_lost("modify_gtt")
         return {"trigger_id": trigger_id}
 
     def delete_gtt(self, trigger_id):
@@ -150,6 +285,7 @@ class FakeKite:
         if trigger_id not in self.gtt_book:
             raise InputException(f"GTT {trigger_id} not found")
         self.gtt_book[trigger_id]["status"] = "deleted"
+        self._raise_if_accepted_then_lost("delete_gtt")
         return {"trigger_id": trigger_id}
 
     def get_gtts(self):

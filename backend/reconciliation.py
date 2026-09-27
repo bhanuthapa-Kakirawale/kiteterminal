@@ -57,9 +57,12 @@ def _already_logged(conn: sqlite3.Connection, ticket_id: int | None, check_type:
     return row is not None
 
 
-def log_mismatch(conn: sqlite3.Connection, ticket_id: int | None, check_type: str, expected: str, actual: str, detail: str) -> None:
+def log_mismatch(conn: sqlite3.Connection, ticket_id: int | None, check_type: str, expected: str, actual: str,
+                 detail: str) -> bool:
+    """True if a new row was written; False if the same unresolved finding
+    was already logged (callers alert only on True)."""
     if _already_logged(conn, ticket_id, check_type, actual):
-        return
+        return False
     conn.execute(
         """
         INSERT INTO reconciliation_log (ticket_id, check_type, expected, actual, mismatch, detail)
@@ -68,6 +71,7 @@ def log_mismatch(conn: sqlite3.Connection, ticket_id: int | None, check_type: st
         (ticket_id, check_type, expected, actual, detail),
     )
     logger.warning("Reconciliation mismatch (%s): expected=%r actual=%r — %s", check_type, expected, actual, detail)
+    return True
 
 
 def _check_order_status(conn: sqlite3.Connection, kite, account) -> None:
@@ -122,17 +126,21 @@ def _check_gtt_state(conn: sqlite3.Connection, kite, account) -> None:
         logger.exception("Could not fetch get_gtts()")
         return
     # get_gtts() also lists triggered/cancelled/expired GTTs — only 'active'
-    # ones are still protecting anything.
-    active_gtt_ids = {g["id"] for g in gtts if g.get("status", "active") == "active"}
+    # ones are still protecting anything. A GTT absent from the list and one
+    # listed as e.g. 'triggered' are different findings, so they are logged
+    # (and de-duplicated) separately.
+    gtt_status = {g["id"]: g.get("status", "active") for g in gtts}
 
     for t in tickets:
-        if t["kite_gtt_id"] not in active_gtt_ids:
+        status = gtt_status.get(t["kite_gtt_id"])
+        if status != "active":
             log_mismatch(
                 conn, t["id"], "order_status",
                 expected=f"GTT {t['kite_gtt_id']} active",
-                actual="GTT not active in kite.get_gtts()",
-                detail=f"{t['symbol']}: GTT is no longer active — trailing_engine should detect this on its own next "
-                       f"tick and close the position; this is an independent, earlier flag of the same event.",
+                actual=f"GTT {status or 'missing'} in kite.get_gtts()",
+                detail=f"{t['symbol']}: protective GTT {t['kite_gtt_id']} is {status or 'missing'} at Kite. A fired or "
+                       f"missing GTT does not prove the shares were sold: the position stays open until the GTT "
+                       f"watcher finds a broker fill for it. Check Kite's orders and holdings.",
             )
 
 

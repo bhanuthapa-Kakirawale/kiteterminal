@@ -7,9 +7,10 @@ filled, unclosed position that has a GTT; the ratchet still runs only for
 trailing ones. Each cycle runs off the event loop, and one position's
 failure no longer stops the others being checked (P1-9).
 
-These tests pin WHO is watched. WHAT evidence closes a position (P0-6) is
-PK-7's, so they assert today's closure outcome only where a real fill
-exists, and otherwise compare a non-trailing position with a trailing one.
+These tests pin WHO is watched. WHAT evidence closes a position (P0-6,
+PK-7) is pinned in test_gtt_closure_proof.py; here closure outcomes are
+asserted only where a real fill exists, and otherwise a non-trailing
+position is compared with a trailing one.
 
 No sleeps: threads hand over through Events whose timeouts are only safety
 bounds. Nothing here reaches Zerodha or the network.
@@ -179,8 +180,9 @@ def _outcome(env, position_id):
 
 @pytest.mark.parametrize("event", ["filled", "triggered_unfilled", "deleted_no_fill", "vanished"])
 def test_non_trailing_position_gets_the_same_gtt_handling_as_a_trailing_one(env, market_open, event):
-    # Relative on purpose: PK-7 will change what some of these events do,
-    # for both kinds of position alike.
+    # Relative on purpose: it holds whatever each event does, as long as
+    # both kinds of position are treated alike (PK-7 changed the outcome
+    # of triggered_unfilled and vanished for both at once).
     oco_id, oco_gtt = _live_position(env)
     trl_id, trl_gtt = _infy_position(env, **TRAILING)
     _apply_gtt_event(env, oco_gtt, event)

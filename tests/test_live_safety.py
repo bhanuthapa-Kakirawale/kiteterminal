@@ -1793,7 +1793,8 @@ def test_p0_4_gtt_firing_while_an_exit_is_unresolved_is_flagged_not_recorded(env
     env.kite.raise_on_next("place_order", requests.ReadTimeout("timed out"))
     _assert_unknown_response(unsafe_client.post(f"/api/tickets/{owner}/confirm"))
     env.kite.set_gtt_status(tcs_gtt, "triggered")
-    env.kite.set_gtt_status(infy_gtt, "triggered")
+    # INFY's stop fires and fills (PK-7: only a fill closes a position).
+    env.kite.trigger_gtt(infy_gtt, status="COMPLETE")
 
     asyncio.run(trailing_engine._tick_once())
     asyncio.run(trailing_engine._tick_once())
@@ -1864,8 +1865,11 @@ def test_p0_5_oco_stop_or_target_fill_closes_and_journals_position(env, market_o
 
 
 # ================================================================ P0-6
-# Safety property: "GTT triggered" is not "position closed". Only a real
-# fill (or the broker no longer holding the shares) closes the position.
+# Safety property: "GTT triggered" is not "position closed". Only a broker
+# fill of the full quantity closes the position.
+# PK-7 turned this strict xfail into a regression test: the GTT watcher now
+# closes only on broker proof. Wider coverage lives in
+# test_gtt_closure_proof.py.
 
 def test_p0_6_triggered_gtt_with_complete_fill_closes_at_fill_price(env, market_open):
     # Already correct, and must survive the P0-6 fix: a matched COMPLETE fill
@@ -1881,7 +1885,6 @@ def test_p0_6_triggered_gtt_with_complete_fill_closes_at_fill_price(env, market_
     assert trades[0]["exit_price"] == env.kite.order_book[fill_id]["average_price"]
 
 
-@_xfail("P0-6", "a triggered GTT is treated as a close even when its SELL LIMIT has not filled")
 @pytest.mark.parametrize("filled", [0, 2], ids=["unfilled", "partial"])
 def test_p0_6_triggered_gtt_without_fill_keeps_position_open(env, market_open, filled):
     row = _open_live_entry(env, trailing_enabled=True, trailing_trigger="after_target_1", trailing_distance=50.0)

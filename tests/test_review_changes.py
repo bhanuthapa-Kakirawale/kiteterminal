@@ -227,14 +227,18 @@ def test_executed_exit_does_not_leave_phantom_open_risk(env):
 
 # ---------------------------------------------------------------- trailing engine
 
-def test_trailing_triggered_gtt_is_detected_as_closed(env):
+def test_trailing_triggered_gtt_without_exit_evidence_stays_open(env):
+    # PK-7 (P0-6): 'triggered' alone proves nothing was sold — no order at
+    # Kite, no fill. The position stays open and is flagged for review.
     from backend import trailing_engine
     gtt_id = env.kite.place_gtt("single", "TCS", "NSE", [2900.0], 3000.0, [])["trigger_id"]
     env.kite.set_gtt_status(gtt_id, "triggered")
     tid = _insert_ticket(env.db, trailing_enabled=1, trailing_trigger="after_target_1", trailing_distance=50.0,
                          current_stop_loss=2900.0, kite_gtt_id=gtt_id, executed_at="2026-09-01 04:00:00")
     asyncio.run(trailing_engine._tick_once())
-    assert ticket_row(env.db, tid)["closed_at"] is not None
+    row = ticket_row(env.db, tid)
+    assert row["closed_at"] is None and row["kite_gtt_id"] == gtt_id
+    assert any(m["type"] == "trailing_error" and "CLOSURE NEEDS REVIEW" in m["message"] for m in env.broadcasts)
     assert env.kite.calls_to("modify_gtt") == []
 
 

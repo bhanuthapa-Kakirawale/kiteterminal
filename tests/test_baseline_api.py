@@ -475,11 +475,15 @@ def test_trailing_ratchet_moves_stop(env):
     assert ticket_row(env.db, tid)["current_stop_loss"] == 3050.0
 
 
-def test_trailing_detects_vanished_gtt_and_records_close(env):
+def test_trailing_vanished_gtt_without_fill_is_flagged_not_closed(env):
+    # PK-7 (P0-6): a GTT missing from Kite with no exit fill is lost
+    # protection, not a close — nothing is journaled at a guessed price.
     from backend import trailing_engine
     tid = _insert_ticket(env.db, trailing_enabled=1, trailing_trigger="after_target_1", trailing_distance=50.0,
                          current_stop_loss=2900.0, kite_gtt_id=424242, executed_at="2026-09-01 04:00:00")
     asyncio.run(trailing_engine._tick_once())
-    assert ticket_row(env.db, tid)["closed_at"] is not None
+    row = ticket_row(env.db, tid)
+    assert row["closed_at"] is None and row["kite_gtt_id"] is None
+    assert any(m["type"] == "trailing_error" and "PROTECTION MISSING" in m["message"] for m in env.broadcasts)
     stats = env.client.get("/api/journal/stats", params={"mode": "live"}).json()["data"]
-    assert stats["overall"]["trade_count"] == 1
+    assert stats["overall"]["trade_count"] == 0
