@@ -9,7 +9,8 @@ from datetime import datetime, timedelta, timezone
 from kiteconnect.exceptions import GeneralException, InputException, OrderException, TokenException
 
 from backend import (
-    config, execution, instruments, journal, kite_client, market, order_monitor, reconciliation, risk_engine,
+    config, execution, instruments, kite_client, market, order_monitor, position_quantity, reconciliation,
+    risk_engine,
 )
 from backend.accounts import get_default_account
 from backend.db import get_connection
@@ -163,6 +164,8 @@ def _process_ticket(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, ltp_dat
         _handle_inactive_gtt(kite, conn, ticket, status, gtt)
         return
 
+    _converge_protection(kite, conn, ticket, gtt)
+
     if not ticket["trailing_enabled"]:
         return  # fixed stop + target (OCO): nothing to ratchet
 
@@ -178,6 +181,21 @@ def _process_ticket(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, ltp_dat
         return
 
     _try_ratchet(kite, conn, ticket, ltp)
+
+
+def _converge_protection(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, gtt: dict) -> None:
+    """PK-13 self-healing: an active GTT whose legs do not cover exactly the
+    shares held (a resize that failed, or raced) is resized now; if that is
+    impossible it is flagged (once per distinct state). Costs no broker call
+    while the quantities agree."""
+    desired = position_quantity.protection_quantity(conn, ticket)
+    legs = position_quantity.gtt_leg_quantities(gtt)
+    if not legs or (desired is not None and all(q == desired for q in legs)):
+        return  # agrees — or the listing carries no legs to compare
+    result = position_quantity.sync_protection(conn, kite, ticket["id"], "GTT watcher",
+                                               gtt_book={ticket["kite_gtt_id"]: gtt})
+    if result.new_flag:
+        ticker_manager.broadcast({"type": "trailing_error", "ticket_id": ticket["id"], "message": result.message})
 
 
 # ---- GTT no longer active: closure needs broker proof (PK-7, P0-6) --------
@@ -230,10 +248,28 @@ def _handle_inactive_gtt(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, st
 
 
 def _exit_owner(conn: sqlite3.Connection, position_id: int) -> sqlite3.Row | None:
+    # PK-13: an exit owns the position only while its order is in flight; the
+    # shares an ended (filled / partial) exit sold are already subtracted
+    # from the position's open quantity.
     return conn.execute(
-        "SELECT id, status, submission_state FROM trade_tickets "
-        "WHERE closes_ticket_id = ? AND status IN ('confirmed', 'executed') LIMIT 1",
+        f"SELECT id, status, submission_state FROM trade_tickets "
+        f"WHERE closes_ticket_id = ? AND {execution.EXIT_IN_FLIGHT_SQL} LIMIT 1",
         (position_id,),
+    ).fetchone()
+
+
+def _recorded_from_order(conn: sqlite3.Connection, position_id: int, order_id) -> int:
+    """Shares of this position already recorded as sold by the GTT order
+    `order_id` (a synthesized exit from an earlier partial fill, PK-13)."""
+    row = _gtt_exit_for(conn, position_id, order_id)
+    return (row["filled_quantity"] or 0) if row is not None else 0
+
+
+def _gtt_exit_for(conn: sqlite3.Connection, position_id: int, order_id) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM trade_tickets WHERE closes_ticket_id = ? AND status = 'executed' "
+        "AND json_extract(rule_checklist, '$.gtt_auto_trigger.matched_order_id') = ? LIMIT 1",
+        (position_id, str(order_id)),
     ).fetchone()
 
 
@@ -246,12 +282,25 @@ def _exit_evidence(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, status: 
     orders = kite.orders()
     fired = [leg["result"] for leg in (gtt or {}).get("orders") or [] if isinstance(leg.get("result"), dict)]
     if fired:
-        return _linked_evidence(kite, ticket, exit_side, orders, fired)
+        return _linked_evidence(kite, conn, ticket, exit_side, orders, fired, gtt)
     return _matched_evidence(conn, ticket, exit_side, orders, status, gtt)
 
 
-def _linked_evidence(kite, ticket: sqlite3.Row, exit_side: str, orders: list[dict],
-                     fired: list[dict]) -> ExitEvidence:
+def _exit_quantity_fits(conn: sqlite3.Connection, ticket: sqlite3.Row, order: dict,
+                        gtt: dict | None = None) -> bool:
+    """PK-13: this position's exit order was placed for the shares it held
+    then — what is open now plus what that same order has already been
+    recorded as selling. A GTT's own order (linked) may also simply carry
+    the GTT leg's quantity."""
+    quantity = int(order.get("quantity") or 0)
+    held = position_quantity.open_quantity(conn, ticket["id"])
+    if held is not None and quantity == held + _recorded_from_order(conn, ticket["id"], order.get("order_id")):
+        return True
+    return gtt is not None and quantity in position_quantity.gtt_leg_quantities(gtt)
+
+
+def _linked_evidence(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, exit_side: str, orders: list[dict],
+                     fired: list[dict], gtt: dict | None) -> ExitEvidence:
     """The GTT names the order it placed: that order, and only that order,
     is this position's exit."""
     if len(fired) > 1:
@@ -269,7 +318,7 @@ def _linked_evidence(kite, ticket: sqlite3.Row, exit_side: str, orders: list[dic
         order = order_monitor._order_from_history(kite, order_id)
     if order is None:
         return ExitEvidence("none", linked=True, reason=f"its exit order {order_id} is not in Kite's order book")
-    if not _is_exit_order_for(order, ticket, exit_side):
+    if not (_is_exit_order_for(order, ticket, exit_side) and _exit_quantity_fits(conn, ticket, order, gtt)):
         return ExitEvidence("ambiguous", order=order, linked=True, candidates=[order],
                             reason=f"the order the GTT placed ({_describe(order)}) does not match this position")
     return _classify(order, ticket, linked=True)
@@ -281,7 +330,12 @@ def _matched_evidence(conn: sqlite3.Connection, ticket: sqlite3.Row, exit_side: 
     an order counts only if it cannot plausibly be anything else. Several
     plausible orders, or another app position in the same symbol, and
     nothing is attributed — the most recent is never simply taken."""
-    known = _app_order_ids(conn)
+    # An order this position's own earlier partial GTT fill was attributed to
+    # stays its candidate (PK-13); every other known order is excluded.
+    own = {str(r["id"]) for r in conn.execute(
+        "SELECT json_extract(rule_checklist, '$.gtt_auto_trigger.matched_order_id') AS id FROM trade_tickets "
+        "WHERE closes_ticket_id = ? AND rule_checklist LIKE '%gtt_auto_trigger%'", (ticket["id"],)).fetchall()}
+    known = _app_order_ids(conn) - own
     since = _utc_sql_to_ist(ticket["executed_at"])
     # A triggered GTT's order carries one of its legs' prices exactly. Not
     # applied otherwise: a GTT deleted in Kite placed nothing, and a manual
@@ -293,7 +347,7 @@ def _matched_evidence(conn: sqlite3.Connection, ticket: sqlite3.Row, exit_side: 
 
     candidates = [
         o for o in orders
-        if _is_exit_order_for(o, ticket, exit_side)
+        if _is_exit_order_for(o, ticket, exit_side) and _exit_quantity_fits(conn, ticket, o)
         and o.get("product") in (None, ticket["product_type"])
         and str(o.get("order_id")) not in known
         and not _APP_ORDER_TAG.match(str(o.get("tag") or ""))
@@ -321,7 +375,9 @@ def _matched_evidence(conn: sqlite3.Connection, ticket: sqlite3.Row, exit_side: 
 def _classify(order: dict, ticket: sqlite3.Row, linked: bool) -> ExitEvidence:
     filled = int(order.get("filled_quantity") or 0)
     status = order.get("status")
-    if status == "COMPLETE" and filled >= ticket["quantity"]:
+    # The order's own quantity was checked against the position's shares
+    # (_exit_quantity_fits): all of it filled is a full exit.
+    if status == "COMPLETE" and filled >= int(order.get("quantity") or 0):
         kind = "filled"
     elif filled > 0:
         kind = "partial"  # still working or ended: either way not a full exit
@@ -336,10 +392,11 @@ def _classify(order: dict, ticket: sqlite3.Row, linked: bool) -> ExitEvidence:
 
 
 def _is_exit_order_for(order: dict, ticket: sqlite3.Row, exit_side: str) -> bool:
+    # Quantity is checked separately, against the shares actually held
+    # (_exit_quantity_fits), never the entry's requested quantity (PK-13).
     return (order.get("tradingsymbol") == ticket["symbol"]
             and order.get("exchange", ticket["exchange"]) == ticket["exchange"]
-            and order.get("transaction_type") == exit_side
-            and int(order.get("quantity") or 0) == ticket["quantity"])
+            and order.get("transaction_type") == exit_side)
 
 
 def _app_order_ids(conn: sqlite3.Connection) -> set[str]:
@@ -408,13 +465,21 @@ def _held_quantity(kite, symbol: str) -> int | None:
         return None
 
 
-def _held_note(held: int | None, ticket: sqlite3.Row) -> str:
+def _held_note(held: int | None, ticket: sqlite3.Row, conn: sqlite3.Connection) -> str:
     if held is None:
         return "The broker's held quantity could not be read."
     if held <= 0:
         return (f"Kite now shows no {ticket['symbol']} held — the shares appear to have gone, but the order and "
                 f"price that sold them cannot be identified.")
-    return f"Kite shows {held} {ticket['symbol']} held (this position is {ticket['quantity']})."
+    return f"Kite shows {held} {ticket['symbol']} held (this position is {_open_text(conn, ticket)})."
+
+
+def _open_text(conn: sqlite3.Connection, ticket: sqlite3.Row) -> str:
+    # What the app believes is held (PK-13), with the order size if it differs.
+    held = position_quantity.open_quantity(conn, ticket["id"])
+    if held == ticket["quantity"]:
+        return str(held)
+    return f"{'unknown' if held is None else held} of {ticket['quantity']} ordered"
 
 
 def _flag(conn: sqlite3.Connection, ticket: sqlite3.Row, check_type: str, expected: str, actual: str,
@@ -433,22 +498,29 @@ def _gtt_state(ticket: sqlite3.Row, status: str | None) -> str:
 
 def _handle_exit_not_filled(conn: sqlite3.Connection, ticket: sqlite3.Row, status: str | None,
                             evidence: ExitEvidence) -> None:
-    order, qty = evidence.order, ticket["quantity"]
+    order = evidence.order
+    qty = int(order.get("quantity") or 0)
     filled = int(order.get("filled_quantity") or 0)
     ended = order.get("status") in order_monitor.TERMINAL_STATUSES
     if filled == 0:
         headline = "GTT TRIGGERED — EXIT NOT FILLED — POSITION MAY BE UNPROTECTED"
         advice = (f"The GTT no longer protects it; its SELL LIMIT @ {order.get('price')} is waiting unfilled. "
                   f"Check that order in Kite now (modify it, or cancel it and place a new stop).")
+        recorded = "no exit is recorded"
     else:
+        # PK-13: the shares it sold are sold — recorded, so the position's
+        # open quantity (risk, Emergency Exit, reconciliation) is what is
+        # really left. Not a close, and not journaled while shares remain.
+        _record_gtt_exit(conn, ticket, order, evidence.linked, final=False)
+        left = position_quantity.open_quantity(conn, ticket["id"])
         headline = "GTT EXIT PARTIALLY FILLED — POSITION NOT CLOSED"
-        left = f"{qty - filled} share(s) are still held"
-        advice = (f"{left} and UNPROTECTED: the exit order has ended. Place a stop-loss in Kite." if ended else
-                  f"{left} while the rest of the order waits; check it in Kite.")
-        advice += (f" Filled so far: {filled} @ avg {order.get('average_price')}. The app still shows the full "
-                   f"{qty} until partial exits are modelled.")
+        advice = (f"{left} share(s) are still held and UNPROTECTED: the exit order has ended and this app places "
+                  f"no new stop by itself. Place a stop-loss for {left} in Kite." if ended else
+                  f"{left} share(s) are still held while the rest of the order waits; check it in Kite.")
+        advice += f" Filled so far: {filled} @ avg {order.get('average_price')}."
+        recorded = f"the {filled} share(s) sold are recorded; nothing is journaled until the position is flat"
     detail = (f"{headline}: {ticket['symbol']} (ticket {ticket['id']}) — {_gtt_state(ticket, status)}; "
-              f"{evidence.reason}. The position is kept OPEN and no exit is recorded. {advice}")
+              f"{evidence.reason}. The position is kept OPEN and {recorded}. {advice}")
     if ended:
         # Nothing left at Kite to watch: this GTT is spent and its order over.
         conn.execute("UPDATE trade_tickets SET kite_gtt_id = NULL WHERE id = ?", (ticket["id"],))
@@ -460,7 +532,7 @@ def _handle_exit_failed(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, sta
                         evidence: ExitEvidence) -> None:
     held = _held_quantity(kite, ticket["symbol"])
     detail = (f"GTT TRIGGERED BUT ITS EXIT ORDER FAILED: {ticket['symbol']} (ticket {ticket['id']}) — "
-              f"{_gtt_state(ticket, status)}; {evidence.reason}. {_held_note(held, ticket)} "
+              f"{_gtt_state(ticket, status)}; {evidence.reason}. {_held_note(held, ticket, conn)} "
               f"The position is still OPEN but UNPROTECTED. Place a stop-loss in Kite now.")
     gtt_id = ticket["kite_gtt_id"]
     conn.execute("UPDATE trade_tickets SET kite_gtt_id = NULL WHERE id = ?", (ticket["id"],))
@@ -472,38 +544,57 @@ def _handle_closure_needs_review(kite, conn: sqlite3.Connection, ticket: sqlite3
                                  evidence: ExitEvidence) -> None:
     held = _held_quantity(kite, ticket["symbol"])
     detail = (f"CLOSURE NEEDS REVIEW: {ticket['symbol']} (ticket {ticket['id']}) — {_gtt_state(ticket, status)}, "
-              f"but no broker fill can be attributed to this position: {evidence.reason}. {_held_note(held, ticket)} "
+              f"but no broker fill can be attributed to this position: {evidence.reason}. {_held_note(held, ticket, conn)} "
               f"The position is kept OPEN; no exit, price or journal entry is assumed. Check Kite's orders and "
               f"holdings.")
-    _flag(conn, ticket, "position_state", expected=f"broker fill of {ticket['quantity']} for this position",
+    _flag(conn, ticket, "position_state",
+          expected=f"broker fill of {position_quantity.open_quantity(conn, ticket['id'])} for this position",
           actual=f"GTT {status or 'missing'}; closure unproven: {evidence.reason}; "
                  f"held {'unknown' if held is None else held}",
           detail=detail)
 
 
-def _handle_gtt_closure(conn: sqlite3.Connection, ticket: sqlite3.Row, fill: dict, linked: bool) -> None:
-    """The broker sold this position's full quantity (`fill`, a COMPLETE
-    order). Synthesizes a proper executed SELL ticket (closes_ticket_id set)
-    at the broker's fill price and time before marking the original closed,
-    and runs it through the exact same closed_trades computation exit tickets
-    use — one code path for "how did this position's P&L get computed,"
-    regardless of whether a human/strategy explicitly exited or Kite
-    auto-triggered the stop/target."""
+def _fill_time_utc(order: dict) -> str:
+    fill_time_ist = _kite_time(order.get("exchange_timestamp")) or _kite_time(order.get("order_timestamp"))
+    return _ist_to_utc_sql(fill_time_ist) if fill_time_ist else execution.utc_now_sql()
+
+
+def _record_gtt_exit(conn: sqlite3.Connection, ticket: sqlite3.Row, order: dict, linked: bool,
+                     final: bool) -> int | None:
+    """Records what the GTT's order sold as an executed SELL ticket of the
+    position (closes_ticket_id set), at the broker's own fill price and time
+    — one per GTT order, updated as it fills further (PK-13). `final` = the
+    order filled completely ('filled'); otherwise 'partial': those shares
+    are sold, the rest of the position is still open. Returns the ticket id,
+    or None if another exit took the position meanwhile."""
+    filled, fill_price = int(order.get("filled_quantity") or 0), order.get("average_price") or order.get("price")
+    exit_at = _fill_time_utc(order)
+    fill_state = "filled" if final else "partial"
+    existing = _gtt_exit_for(conn, ticket["id"], order["order_id"])
+    if existing is not None:
+        position_quantity.record_fill(conn, existing, filled)
+        conn.execute(
+            "UPDATE trade_tickets SET entry_fill_status = ?, filled_price = ?, entry_price = ?, filled_at = ?, "
+            "executed_at = ? WHERE id = ?",
+            (fill_state, fill_price, fill_price, exit_at, exit_at, existing["id"]),
+        )
+        _log_event(conn, existing["id"], "modified",
+                   f"Kite order {order['order_id']} has now sold {filled} @ {fill_price} ({fill_state}).")
+        return existing["id"]
+
     exit_side = execution.resolve_exit_side(ticket["transaction_type"])
-    fill_price = fill["average_price"]
-    matched_order_id = fill["order_id"]
-    fill_time_ist = _kite_time(fill.get("exchange_timestamp")) or _kite_time(fill.get("order_timestamp"))
-    exit_at = _ist_to_utc_sql(fill_time_ist) if fill_time_ist else execution.utc_now_sql()
+    matched_order_id = order["order_id"]
     rationale = (f"Stop-loss/target hit via GTT auto-trigger: Kite order {matched_order_id} sold "
-                 f"{ticket['quantity']} @ {fill_price}")
+                 f"{filled} @ {fill_price}" + ("" if final else f" (of {order.get('quantity')} — partial)"))
 
     current_stop = ticket["current_stop_loss"] or ticket["stop_loss"]
     dist_to_stop = abs(fill_price - current_stop)
     dist_to_target = abs(fill_price - ticket["target_1"])
     closer_to = "stop_loss" if dist_to_stop <= dist_to_target else "target"
 
+    quantity = int(order.get("quantity") or filled)
     metrics = execution.compute_risk_metrics({
-        "entry_price": fill_price, "quantity": ticket["quantity"],
+        "entry_price": fill_price, "quantity": quantity,
         "stop_loss": ticket["stop_loss"], "target_1": ticket["target_1"], "target_2": None,
     })
     rule_checklist = json.dumps({
@@ -516,6 +607,10 @@ def _handle_gtt_closure(conn: sqlite3.Connection, ticket: sqlite3.Row, fill: dic
     # Earlier tickets' writes in this tick stay durable whatever happens below.
     conn.commit()
     try:
+        # Inserted as an in-flight exit first, so the PK-4 storage backstop
+        # (idx_trade_tickets_one_exit_owner) still refuses it if an explicit
+        # exit was claimed between the owner check and here; its broker
+        # outcome is then set in the same transaction.
         cursor = conn.execute(
             """
             INSERT INTO trade_tickets (
@@ -524,39 +619,63 @@ def _handle_gtt_closure(conn: sqlite3.Connection, ticket: sqlite3.Row, fill: dic
                 stop_loss, target_1, target_2,
                 trailing_enabled, product_type, use_gtt, risk_amount, risk_reward_ratio,
                 rationale, status, mode, executed_at, closes_ticket_id, rule_checklist,
-                entry_fill_status, filled_price, filled_at
+                entry_fill_status, filled_price, filled_at, filled_quantity
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'MARKET', ?, ?, NULL,
-                      0, ?, 1, ?, ?, ?, 'executed', ?, ?, ?, ?, 'filled', ?, ?)
+                      0, ?, 1, ?, ?, ?, 'executed', ?, ?, ?, ?, 'pending', ?, ?, ?)
             """,
             (
                 ticket["account_id"], ticket["source"], ticket["strategy_name"], ticket["symbol"],
-                ticket["exchange"], ticket["instrument_token"], exit_side, ticket["quantity"], fill_price,
+                ticket["exchange"], ticket["instrument_token"], exit_side, quantity, fill_price,
                 ticket["stop_loss"], ticket["target_1"], ticket["product_type"],
                 metrics["risk_amount"], metrics["risk_reward_ratio"], rationale, ticket["mode"], exit_at,
-                ticket["id"], rule_checklist, fill_price, exit_at,
+                ticket["id"], rule_checklist, fill_price, exit_at, filled,
             ),
         )
     except sqlite3.IntegrityError:
         # An exit was claimed between the owner check and this insert.
         conn.rollback()
         _handle_owned_closure(conn, ticket, None, "confirmed", None)
-        return
+        return None
     sell_ticket_id = cursor.lastrowid
+    conn.execute("UPDATE trade_tickets SET entry_fill_status = ? WHERE id = ?", (fill_state, sell_ticket_id))
     _log_event(conn, sell_ticket_id, "created", rationale)
     _log_event(conn, sell_ticket_id, "executed", rationale)
+    return sell_ticket_id
 
-    conn.execute("UPDATE trade_tickets SET closed_at = ? WHERE id = ?", (exit_at, ticket["id"]))
-    _log_event(conn, ticket["id"], "closed",
-               f"Kite order {matched_order_id} filled {ticket['quantity']} @ {fill_price} after the protective GTT "
-               f"left 'active'; recorded as closed via ticket {sell_ticket_id}.")
-    execution.supersede_sibling_exits(conn, ticket["id"], sell_ticket_id)
+
+def _handle_gtt_closure(conn: sqlite3.Connection, ticket: sqlite3.Row, fill: dict, linked: bool) -> None:
+    """The broker's order sold everything it was placed for (`fill`, a
+    COMPLETE order). Records it as a proper executed SELL ticket at the
+    broker's fill price and time, and — once the position holds nothing —
+    marks it closed and runs the exact same closed_trades computation exit
+    tickets use: one code path for "how did this position's P&L get
+    computed," whether a human/strategy explicitly exited or Kite
+    auto-triggered the stop/target."""
+    sell_ticket_id = _record_gtt_exit(conn, ticket, fill, linked, final=True)
+    if sell_ticket_id is None:
+        return
+    filled, fill_price = int(fill.get("filled_quantity") or 0), fill["average_price"]
+    # The GTT placed this order itself: it is spent, not to be removed.
+    result = position_quantity.close_if_flat(conn, None, ticket["id"], sell_ticket_id, _fill_time_utc(fill),
+                                             remove_gtt=False)
+    if result.closed:
+        _log_event(conn, ticket["id"], "closed",
+                   f"Kite order {fill['order_id']} filled {filled} @ {fill_price} after the protective GTT "
+                   f"left 'active'; recorded as closed via ticket {sell_ticket_id}.")
+        conn.commit()
+        ticker_manager.broadcast({"type": "tickets_changed", "reason": "gtt_closed", "ticket_id": ticket["id"]})
+        return
+    # Sold everything the order was for, yet shares remain (its GTT covered
+    # fewer than are now held): the GTT is spent, the rest is unprotected.
+    left = position_quantity.open_quantity(conn, ticket["id"])
+    gtt_id = ticket["kite_gtt_id"]
+    conn.execute("UPDATE trade_tickets SET kite_gtt_id = NULL WHERE id = ?", (ticket["id"],))
+    detail = (f"GTT EXIT FILLED — POSITION NOT CLOSED: {ticket['symbol']} (ticket {ticket['id']}) — Kite order "
+              f"{fill['order_id']} sold {filled} @ {fill_price}, but the position still holds {left} share(s), now "
+              f"UNPROTECTED (GTT {gtt_id} is spent). Place a stop-loss in Kite.{result.message}")
+    _flag(conn, ticket, "position_state", expected="the GTT exit sells the whole position",
+          actual=f"GTT order {fill['order_id']} sold {filled}; {left} remain", detail=detail)
     conn.commit()
-
-    try:
-        journal.record_closed_trade(conn, sell_ticket_id)
-    except ValueError:
-        logger.exception("Failed to record closed_trades row for synthesized exit ticket %d", sell_ticket_id)
-    ticker_manager.broadcast({"type": "tickets_changed", "reason": "gtt_closed", "ticket_id": ticket["id"]})
 
 
 def _handle_owned_closure(conn: sqlite3.Connection, ticket: sqlite3.Row, owner_id: int | None,
@@ -580,7 +699,7 @@ def _handle_protection_lost(kite, conn: sqlite3.Connection, ticket: sqlite3.Row,
     detail = (
         f"PROTECTION MISSING — POSITION STILL OPEN: {ticket['symbol']} (ticket {ticket['id']}) — "
         f"{_gtt_state(ticket, gtt_status)} and no exit fill was found — the position is still OPEN but UNPROTECTED. "
-        f"{_held_note(_held_quantity(kite, ticket['symbol']), ticket)} Place a stop-loss in Kite."
+        f"{_held_note(_held_quantity(kite, ticket['symbol']), ticket, conn)} Place a stop-loss in Kite."
     )
     gtt_id = ticket["kite_gtt_id"]
     conn.execute("UPDATE trade_tickets SET kite_gtt_id = NULL WHERE id = ?", (ticket["id"],))
@@ -618,7 +737,16 @@ def _try_ratchet(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, ltp: float
         return
 
     exit_side = execution.resolve_exit_side(ticket["transaction_type"])
+    # PK-13: the ratchet re-sends the whole GTT, quantity included — the
+    # shares actually held, read fresh under the position's protection lock
+    # so a concurrent fill resize is never overwritten with a stale figure.
+    lock = position_quantity.protection_lock(ticket["id"])
+    lock.acquire()
     try:
+        fresh = conn.execute("SELECT * FROM trade_tickets WHERE id = ?", (ticket["id"],)).fetchone()
+        quantity = position_quantity.protection_quantity(conn, fresh)
+        if not quantity or quantity < 0:
+            return  # nothing (or an unknown quantity) to protect: the fill paths flag it
         kite.modify_gtt(
             trigger_id=ticket["kite_gtt_id"],
             trigger_type=kite.GTT_TYPE_SINGLE,
@@ -628,7 +756,7 @@ def _try_ratchet(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, ltp: float
             last_price=ltp,
             orders=[{
                 "transaction_type": exit_side,
-                "quantity": ticket["quantity"],
+                "quantity": quantity,
                 "order_type": "LIMIT",
                 "product": ticket["product_type"],
                 "price": execution.buffered_stop_price(candidate, ticket["transaction_type"], tick),
@@ -646,6 +774,8 @@ def _try_ratchet(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, ltp: float
                            f"for {ticket['symbol']}: {e}",
             })
         return
+    finally:
+        lock.release()
 
     conn.execute("UPDATE trade_tickets SET current_stop_loss = ? WHERE id = ?", (candidate, ticket["id"]))
     _log_event(conn, ticket["id"], "trailing_adjusted", f"Stop moved from {current_stop} to {candidate} (LTP {ltp})")

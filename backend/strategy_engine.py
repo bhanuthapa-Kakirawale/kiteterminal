@@ -6,7 +6,7 @@ from datetime import date
 from kiteconnect import KiteConnect
 from kiteconnect.exceptions import KiteException
 
-from backend import config, execution, indicators, instruments, kite_chart, market, risk_engine
+from backend import config, execution, indicators, instruments, kite_chart, market, position_quantity, risk_engine
 from backend.db import get_connection
 from backend.strategies import STRATEGIES
 from backend.watchlist import list_watchlist
@@ -402,13 +402,14 @@ def _create_entry_ticket(
 
 
 def _has_pending_exit(conn: sqlite3.Connection, position_ticket_id: int) -> bool:
-    # An executed exit whose fill is not proven (EXITING / partial, PK-8)
-    # counts too: the position is still open, but its exit is in flight.
+    # An executed exit still in flight (EXITING, PK-8) counts too: the
+    # position is still open, but its exit is at the broker. One that ended
+    # after a partial fill does not (PK-13): what it left may be exited.
     row = conn.execute(
         f"""
         SELECT COUNT(*) AS n FROM trade_tickets
-        WHERE closes_ticket_id = ? AND (status IN ('pending_confirmation', 'risk_rejected', 'confirmed')
-                                        OR (status = 'executed' AND NOT ({execution.EXIT_FILL_PROVEN_SQL})))
+        WHERE closes_ticket_id = ? AND (status IN ('pending_confirmation', 'risk_rejected')
+                                        OR {execution.EXIT_IN_FLIGHT_SQL})
         """,
         (position_ticket_id,),
     ).fetchone()
@@ -422,6 +423,8 @@ def run_exit_scan(module, conn: sqlite3.Connection, account: sqlite3.Row, kite: 
             continue  # only this module manages exits for positions it opened
         if pos["entry_fill_status"] == "pending":
             continue  # entry hasn't filled — nothing to exit yet
+        if not pos["open_quantity"] or pos["open_quantity"] < 0:
+            continue  # nothing broker-confirmed to sell, or unknown (PK-13)
         if _has_pending_exit(conn, pos["id"]):
             continue
         df = indicators.load_ohlc_frame(pos["instrument_token"])
@@ -446,8 +449,10 @@ def _create_exit_ticket(
     # position being closed, purely to satisfy the schema.
     tick = instruments.get_tick_size(position["symbol"], position["exchange"])
     entry_price = market.round_to_tick(result["close"], tick)
+    # PK-13: sells what the position actually holds, never what it requested.
+    quantity = position_quantity.open_quantity(conn, position["id"])
     metrics = execution.compute_risk_metrics({
-        "entry_price": entry_price, "quantity": position["quantity"],
+        "entry_price": entry_price, "quantity": quantity,
         "stop_loss": position["stop_loss"], "target_1": position["target_1"], "target_2": None,
     })
     # Looked up against the ENTRY strategy_name — strategy_configs has no
@@ -468,7 +473,7 @@ def _create_exit_ticket(
         """,
         (
             account["id"], module.EXIT_STRATEGY_NAME, strategy_version, position["symbol"], position["exchange"], position["instrument_token"],
-            position["quantity"], entry_price, position["stop_loss"], position["target_1"],
+            quantity, entry_price, position["stop_loss"], position["target_1"],
             position["product_type"], metrics["risk_amount"], metrics["risk_reward_ratio"],
             # An exit inherits the position's mode, never the global one (PK-3).
             result["rationale"], position["id"], json.dumps(result["checklist"]), position["mode"],
@@ -646,24 +651,33 @@ def resolve_stop_adjustment(
                 f"{ticket['symbol']} is at ₹{ltp:,.2f}, already through the proposed stop ₹{new_stop:,.2f} — "
                 f"exit the position instead of moving the stop."
             )
-        try:
-            kite.modify_gtt(
-                trigger_id=ticket["kite_gtt_id"],
-                trigger_type=kite.GTT_TYPE_SINGLE,
-                tradingsymbol=ticket["symbol"],
-                exchange=ticket["exchange"],
-                trigger_values=[new_stop],
-                last_price=ltp,
-                orders=[{
-                    "transaction_type": exit_side,
-                    "quantity": ticket["quantity"],
-                    "order_type": "LIMIT",
-                    "product": ticket["product_type"],
-                    "price": execution.buffered_stop_price(new_stop, ticket["transaction_type"], tick),
-                }],
-            )
-        except KiteException as e:
-            raise ValueError(f"Kite rejected the stop update: {e}")
+        # PK-13: the GTT keeps covering exactly the shares held — read under
+        # the position's protection lock, so a concurrent fill resize is
+        # never overwritten with a stale quantity.
+        with position_quantity.protection_lock(ticket["id"]):
+            fresh = conn.execute("SELECT * FROM trade_tickets WHERE id = ?", (ticket["id"],)).fetchone()
+            quantity = position_quantity.protection_quantity(conn, fresh)
+            if not quantity or quantity < 0:
+                raise ValueError(f"{ticket['symbol']}: the position's open quantity is {quantity} — its stop cannot be "
+                                 f"moved safely; check it in Kite.")
+            try:
+                kite.modify_gtt(
+                    trigger_id=ticket["kite_gtt_id"],
+                    trigger_type=kite.GTT_TYPE_SINGLE,
+                    tradingsymbol=ticket["symbol"],
+                    exchange=ticket["exchange"],
+                    trigger_values=[new_stop],
+                    last_price=ltp,
+                    orders=[{
+                        "transaction_type": exit_side,
+                        "quantity": quantity,
+                        "order_type": "LIMIT",
+                        "product": ticket["product_type"],
+                        "price": execution.buffered_stop_price(new_stop, ticket["transaction_type"], tick),
+                    }],
+                )
+            except KiteException as e:
+                raise ValueError(f"Kite rejected the stop update: {e}")
 
     conn.execute(
         "UPDATE trade_tickets SET current_stop_loss = ? WHERE id = ?",

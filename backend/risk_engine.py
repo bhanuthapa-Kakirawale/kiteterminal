@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from kiteconnect import KiteConnect
 from kiteconnect.exceptions import KiteException, TokenException
 
-from backend import execution, sector_mapping
+from backend import execution, position_quantity, sector_mapping
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -216,9 +216,12 @@ def _symbol_exposure(conn: sqlite3.Connection, account_id: int, symbol: str, ctx
     cutoff = _same_day_ist_cutoff_utc()
     # closes_ticket_id IS NULL: an executed exit ticket reduces exposure, so
     # its own notional must never be added on top of the position it closed.
+    # PK-13: at the quantity the position can actually hold — its requested
+    # size while the entry order may still fill, what filled once it ended,
+    # less whatever its exits have already sold.
     row = conn.execute(
-        """
-        SELECT COALESCE(SUM(entry_price * quantity), 0) AS total
+        f"""
+        SELECT COALESCE(SUM(entry_price * {position_quantity.risk_quantity_sql()}), 0) AS total
         FROM trade_tickets
         WHERE account_id = ? AND symbol = ? AND status = 'executed' AND mode = 'live'
           AND closed_at IS NULL AND closes_ticket_id IS NULL AND executed_at >= ?
@@ -244,9 +247,15 @@ def _symbol_exposure(conn: sqlite3.Connection, account_id: int, symbol: str, ctx
 # forever), and so does an EXITING one — accepted by Kite, not yet filled —
 # or a partially filled one (PK-8). Such a position still counts for max
 # open positions, portfolio risk, Emergency Exit and reconciliation.
+#
+# PK-13: a proven fill no longer means "closed" on its own — an exit may
+# sell only part of what the position holds (the entry filled further after
+# the exit was sized). Every proven close stamps closed_at (since PK-8), so
+# the exit-based fallback is kept only for exits from before fill tracking
+# (entry_fill_status NULL), whose positions predate that stamping.
 _CLOSED_BY_EXECUTED_EXIT = (
     "SELECT closes_ticket_id FROM trade_tickets WHERE closes_ticket_id IS NOT NULL AND status = 'executed' "
-    f"AND {execution.EXIT_FILL_PROVEN_SQL}"
+    "AND entry_fill_status IS NULL"
 )
 _OPEN_POSITION_WHERE = f"""
     account_id = ? AND status = 'executed' AND mode = 'live' AND transaction_type = 'BUY'
@@ -269,18 +278,32 @@ def _open_position_count(conn: sqlite3.Connection, account_id: int, exclude_tick
 def list_open_positions(conn: sqlite3.Connection, account_id: int) -> list:
     """Full rows (not just a count) of currently open live BUY positions, per
     the exact same definition _open_position_count uses. Used by Phase 5's
-    exit scanner and breakeven check."""
+    exit scanner and breakeven check. PK-13: each row also carries
+    open_quantity (shares actually held: filled minus sold; NULL if
+    unknown) and risk_quantity (position_quantity.py)."""
     return conn.execute(
-        f"SELECT * FROM trade_tickets WHERE {_OPEN_POSITION_WHERE}", (account_id,)
+        f"SELECT *, {position_quantity.open_quantity_sql()} AS open_quantity, "
+        f"{position_quantity.risk_quantity_sql()} AS risk_quantity "
+        f"FROM trade_tickets WHERE {_OPEN_POSITION_WHERE}", (account_id,)
     ).fetchall()
+
+
+def _risk_fraction_sql() -> str:
+    # Exactly 1 for a position at its requested size, so the usual case
+    # sums risk_amount unchanged.
+    rq = position_quantity.risk_quantity_sql()
+    return f"(CASE WHEN {rq} = quantity THEN 1.0 ELSE {rq} * 1.0 / quantity END)"
 
 
 def _open_risk_sum(conn: sqlite3.Connection, account_id: int, exclude_ticket_id: int = 0) -> float:
     # Exit tickets carry a risk_amount only to satisfy the schema; counting
     # them made every executed exit add phantom risk forever.
+    # PK-13: risk_amount was sized for the requested quantity; each position
+    # risks it pro rata to the shares it can actually hold (risk_quantity).
     row = conn.execute(
         f"""
-        SELECT (SELECT COALESCE(SUM(risk_amount), 0) FROM trade_tickets
+        SELECT (SELECT COALESCE(SUM(risk_amount * {_risk_fraction_sql()}), 0)
+                FROM trade_tickets
                 WHERE account_id = ? AND status = 'executed' AND mode = 'live' AND closed_at IS NULL
                   AND closes_ticket_id IS NULL
                   AND id NOT IN ({_CLOSED_BY_EXECUTED_EXIT}))
@@ -394,11 +417,12 @@ def linked_exit_problem(conn: sqlite3.Connection, ticket_row) -> ExitProblem | N
     another exit may already own it. DB-only, no broker call. Mode is not
     checked here: confirmation checks it first (routes/tickets._claim_mode).
 
-    Quantity: the exit must equal the position's quantity — the best
-    representation of the open quantity available until partial fills are
-    modelled (PK-13). A larger exit would oversell; a smaller one is not
-    modelled either (its fill would delete the whole position's GTT and
-    journal the full quantity as closed)."""
+    Quantity (PK-13): the exit must equal the position's OPEN quantity —
+    the shares the broker actually filled for it, less those its earlier
+    exits already sold — never the requested quantity. A larger exit would
+    oversell; a smaller one (a user-chosen partial exit) is not supported:
+    an exit closes whatever the position still holds. An unknown or zero
+    open quantity cannot be exited from here."""
     position_id = ticket_row["closes_ticket_id"]
     position = conn.execute(
         "SELECT * FROM trade_tickets WHERE id = ? AND account_id = ?", (position_id, ticket_row["account_id"])
@@ -412,25 +436,30 @@ def linked_exit_problem(conn: sqlite3.Connection, ticket_row) -> ExitProblem | N
                            f"Exit ticket {ticket_row['id']} references ticket {position_id}, which {state} — "
                            f"not an open executed BUY position.", True)
 
+    legacy_exit = conn.execute(
+        "SELECT id FROM trade_tickets WHERE closes_ticket_id = ? AND id != ? AND status = 'executed' "
+        "AND entry_fill_status IS NULL LIMIT 1",
+        (position_id, ticket_row["id"]),
+    ).fetchone()
+    if legacy_exit is not None:
+        return ExitProblem("EXIT_POSITION_CLOSED",
+                           f"Position {position_id} was already exited by ticket {legacy_exit['id']}.", True)
+    if position["closed_at"] is not None:
+        return ExitProblem("EXIT_POSITION_CLOSED",
+                           f"Position {position_id} is already closed (at {position['closed_at']}).", True)
+    # PK-13: only an exit whose order is still in flight owns the position.
     owner = conn.execute(
-        """
+        f"""
         SELECT id, status, submission_state, entry_fill_status FROM trade_tickets
-        WHERE closes_ticket_id = ? AND id != ? AND status IN ('confirmed', 'executed')
+        WHERE closes_ticket_id = ? AND id != ? AND {execution.EXIT_IN_FLIGHT_SQL}
         ORDER BY status = 'executed' DESC, id LIMIT 1
         """,
         (position_id, ticket_row["id"]),
     ).fetchone()
-    owner_filled = owner is not None and owner["status"] == "executed" and owner["entry_fill_status"] in (None, "filled")
-    if owner_filled:
-        return ExitProblem("EXIT_POSITION_CLOSED",
-                           f"Position {position_id} was already exited by ticket {owner['id']}.", True)
-    if position["closed_at"] is not None:
-        return ExitProblem("EXIT_POSITION_CLOSED",
-                           f"Position {position_id} is already closed (at {position['closed_at']}).", True)
     if owner is not None and owner["status"] == "executed":
-        # PK-8: EXITING (or partially filled) — the owning exit is at the
-        # broker but its fill is not proven. Not permanent: if it is rejected
-        # or cancelled unfilled, this exit may close the position after all.
+        # PK-8: EXITING — the owning exit is at the broker but has not
+        # finished. Not permanent: once it ends (rejected, cancelled, or
+        # filled only in part) this exit may close what is left.
         state = ("awaiting its broker fill (EXITING)" if owner["entry_fill_status"] == "pending"
                  else f"{owner['entry_fill_status']} — needs review")
         return ExitProblem("EXIT_ALREADY_IN_PROGRESS",
@@ -441,11 +470,25 @@ def linked_exit_problem(conn: sqlite3.Connection, ticket_row) -> ExitProblem | N
                            f"Exit ticket {owner['id']} for position {position_id} is already being executed "
                            f"(submission {owner['submission_state'] or 'in progress'}) — its broker outcome must be "
                            f"resolved first. DO NOT RESUBMIT.", False)
-    if ticket_row["quantity"] != position["quantity"]:
+    held = position_quantity.open_quantity(conn, position_id)
+    if held is None:
+        return ExitProblem("EXIT_QUANTITY_UNKNOWN",
+                           f"Position {position_id}'s open quantity is unknown (a partial fill was never recorded) — "
+                           f"it cannot be sized safely; check it in Kite.", True)
+    if held == 0 and position_quantity.entry_ended(position):
+        # Flat: earlier exits already sold everything it bought.
+        return ExitProblem("EXIT_POSITION_CLOSED",
+                           f"Position {position_id} was already exited in full "
+                           f"({position_quantity.describe(position, held)}).", True)
+    if held <= 0:
+        return ExitProblem("EXIT_NOTHING_OPEN",
+                           f"Position {position_id} holds no broker-confirmed shares to sell "
+                           f"({position_quantity.describe(position, held)}).", True)
+    if ticket_row["quantity"] != held:
         return ExitProblem("EXIT_QUANTITY_MISMATCH",
-                           f"Exit quantity {ticket_row['quantity']} does not match the {position['quantity']} shares "
-                           f"of position {position_id}"
-                           + (" — it would sell more than the position holds." if ticket_row["quantity"] > position["quantity"]
+                           f"Exit quantity {ticket_row['quantity']} does not match the {held} shares position "
+                           f"{position_id} holds ({position_quantity.describe(position, held)})"
+                           + (" — it would sell more than the position holds." if ticket_row["quantity"] > held
                               else " — partial exits of a tracked position are not supported."), True)
     return None
 

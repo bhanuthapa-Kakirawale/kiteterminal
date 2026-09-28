@@ -4,7 +4,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from kiteconnect import KiteConnect
 
-from backend import execution, risk_engine, system_events
+from backend import execution, order_monitor, position_quantity, risk_engine, system_events
 from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
@@ -23,7 +23,10 @@ def _build_exit_preview(conn, account) -> list[dict]:
     positions = risk_engine.list_open_positions(conn, account["id"])
     return [
         {
+            # PK-13: quantity is what was ordered; open_quantity is what is
+            # actually held — the most an Emergency Exit will sell.
             "ticket_id": p["id"], "symbol": p["symbol"], "quantity": p["quantity"],
+            "filled_quantity": position_quantity.filled(p), "open_quantity": p["open_quantity"],
             "entry_price": p["entry_price"], "stop_loss": p["stop_loss"], "target_1": p["target_1"],
             "current_stop_loss": p["current_stop_loss"], "strategy_name": p["strategy_name"], "mode": p["mode"],
             "entry_fill_status": p["entry_fill_status"],
@@ -153,10 +156,26 @@ def _exit_one(conn, kite: KiteConnect, account, pos, ltp_data: dict, attempt: di
                        f"is already at the broker, fill {in_flight['entry_fill_status']} — not resubmitted. "
                        f"Check Kite.",
         }
+    note = ""
     if pos["mode"] == "live" and pos["entry_fill_status"] == "pending" and pos["kite_order_id"]:
+        # PK-13: stop the rest of the entry, then sell only what the broker
+        # confirms was bought — re-read from Kite now, since the monitor's
+        # figure may be a cycle old. Never the requested quantity.
         cancelled = _cancel_unfilled_entry(kite, conn, pos)
-        if cancelled is not None:
+        held = _refresh_entry_fill(conn, kite, pos)
+        if cancelled is not None and not held:
             return cancelled
+        note = (f" (cancellation of the rest of entry order {pos['kite_order_id']} requested)" if cancelled else
+                f" (cancelling entry order {pos['kite_order_id']} FAILED — it may still fill further; check Kite)")
+
+    held = position_quantity.open_quantity(conn, pos["id"])
+    if held is None or held <= 0:
+        why = ("its open quantity is unknown (a partial fill was never recorded)" if held is None else
+               f"no broker-confirmed shares are held ({position_quantity.describe(pos, held)})")
+        return {"ticket_id": None, "symbol": pos["symbol"], "status": "refused",
+                "error_code": "QUANTITY_UNKNOWN" if held is None else "NOTHING_HELD",
+                "message": f"{pos['symbol']}: not exited — {why}{note}. Nothing was sent; check the position in "
+                           f"Kite."}
 
     ticket_id = _create_emergency_exit_ticket(conn, account, pos, ltp_data)
     attempt["ticket_id"] = ticket_id
@@ -189,8 +208,21 @@ def _exit_one(conn, kite: KiteConnect, account, pos, ltp_data: dict, attempt: di
                 "error_code": detail.get("error_code"), "message": detail.get("message")}
     return {
         "ticket_id": ticket_id, "symbol": pos["symbol"],
-        "status": _result_status(data), "message": data["execution_message"],
+        "status": _result_status(data), "message": data["execution_message"] + note,
     }
+
+
+def _refresh_entry_fill(conn, kite: KiteConnect, pos) -> int | None:
+    """The entry's broker fill as Kite reports it right now, recorded
+    monotonically (and the protective GTT resized to it). Returns the
+    position's open quantity afterwards; unchanged if Kite cannot say."""
+    order = order_monitor._order_from_history(kite, pos["kite_order_id"])
+    if order is not None:
+        outcome = position_quantity.record_fill(conn, pos, order.get("filled_quantity") or 0)
+        if outcome == position_quantity.INCREASED:
+            position_quantity.sync_protection(conn, kite, pos["id"], "Emergency Exit refreshed the entry fill")
+        conn.commit()
+    return position_quantity.open_quantity(conn, pos["id"])
 
 
 def _isolated_failure(conn, account, pos, ticket_id: int | None, error: Exception) -> dict:
@@ -251,13 +283,14 @@ def _log_summary_event(conn, account, detail: str) -> None:
 
 
 def _exit_in_flight(conn, position_id: int):
-    """The exit that owns this position without a proven fill: claimed /
-    UNKNOWN ('confirmed'), or at the broker and EXITING / partial (PK-8)."""
+    """The exit that owns this position while its order is in flight:
+    claimed / UNKNOWN ('confirmed'), or at the broker and EXITING (PK-8). An
+    exit that ended after a partial fill does not (PK-13): what it left is
+    exited anew."""
     return conn.execute(
         f"""
         SELECT id, status, order_tag, kite_order_id, entry_fill_status FROM trade_tickets
-        WHERE closes_ticket_id = ?
-          AND (status = 'confirmed' OR (status = 'executed' AND NOT ({execution.EXIT_FILL_PROVEN_SQL})))
+        WHERE closes_ticket_id = ? AND {execution.EXIT_IN_FLIGHT_SQL}
         ORDER BY id LIMIT 1
         """,
         (position_id,),
@@ -280,11 +313,14 @@ def _create_emergency_exit_ticket(conn, account, position, ltp_data: dict) -> in
     # when available (same source check_breakeven_candidates already uses
     # for a live price), falling back to the position's own current stop
     # if the LTP fetch failed, so ticket creation never blocks on it.
+    # Sized to the position's OPEN quantity as it is now (PK-13) — never
+    # what the entry requested; the caller has checked it is positive.
+    quantity = position_quantity.open_quantity(conn, position["id"])
     key = f"{position['exchange']}:{position['symbol']}"
     entry_price = ltp_data.get(key, {}).get("last_price") or position["current_stop_loss"] or position["stop_loss"]
 
     metrics = execution.compute_risk_metrics({
-        "entry_price": entry_price, "quantity": position["quantity"],
+        "entry_price": entry_price, "quantity": quantity,
         "stop_loss": position["stop_loss"], "target_1": position["target_1"], "target_2": None,
     })
     cursor = conn.execute(
@@ -302,7 +338,7 @@ def _create_emergency_exit_ticket(conn, account, position, ltp_data: dict) -> in
         (
             account["id"], position["source"], position["strategy_name"], position["strategy_version"],
             position["symbol"], position["exchange"], position["instrument_token"],
-            position["quantity"], entry_price, position["stop_loss"], position["target_1"],
+            quantity, entry_price, position["stop_loss"], position["target_1"],
             position["product_type"], metrics["risk_amount"], metrics["risk_reward_ratio"],
             "Emergency exit — all positions", position["id"],
             json.dumps({"emergency_exit_all": True}), position["mode"],  # inherited, never the global mode

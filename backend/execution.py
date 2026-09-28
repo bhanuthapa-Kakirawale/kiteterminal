@@ -144,23 +144,38 @@ def update_ticket_if(
 #   confirmed (claimed / UNKNOWN) -> executed + entry_fill_status 'pending'
 # once Kite accepts the order: EXITING. The position it closes stays OPEN,
 # keeps its protective GTT and is not journaled until order_monitor sees the
-# broker report the full quantity COMPLETE ('filled'); only then is the
-# position's closed_at stamped. 'partial' / 'unconfirmed' exits keep the
-# position open and need a human. A dry-run exit is simulated as filled at
-# once. No new status value: 'executed' keeps the exit owning its position
-# under the PK-4 unique index while it is in flight.
+# broker report the full quantity COMPLETE ('filled'); only then — and only
+# if that leaves the position flat — is the position's closed_at stamped.
+# PK-13: an exit that ends after a partial fill ('partial') sold exactly its
+# filled_quantity; the rest of the position stays open, and the exit no
+# longer owns it. 'unconfirmed' exits still keep it and need a human. A
+# dry-run exit is simulated as filled at once. No new status value:
+# 'executed' + 'pending' keeps the exit owning its position under the PK-4
+# unique index while its order is in flight (EXIT_IN_FLIGHT_SQL).
 #
 # An exit whose fill is proven. NULL covers exits from before fills were
 # tracked; their positions already carry closed_at.
 EXIT_FILL_PROVEN_SQL = "COALESCE(entry_fill_status, 'filled') = 'filled'"
 
+# PK-13: an exit that OWNS its position — its order is still in flight:
+# claimed / UNKNOWN ('confirmed'), EXITING ('executed' + 'pending') or
+# dropped off the order book unresolved ('unconfirmed'). Exactly the
+# predicate of db.idx_trade_tickets_one_exit_owner. An exit whose order has
+# ended — 'filled', or 'partial' (ended after a partial fill) — no longer
+# owns it: the shares it sold are subtracted from the position's open
+# quantity (backend/position_quantity.py) and the rest may be exited anew.
+EXIT_IN_FLIGHT_SQL = (
+    "(status = 'confirmed' OR (status = 'executed' AND COALESCE(entry_fill_status, '') IN ('pending', 'unconfirmed')))"
+)
+
 _EXIT_STATES = {"pending": "exiting", "partial": "exit_partial", "unconfirmed": "exit_unconfirmed"}
 
 
 def exit_state(ticket) -> str | None:
-    """'exiting' (order at the broker, awaiting its fill), 'exit_partial',
-    'exit_unconfirmed' (both need review) or 'exited' for an executed
-    closing sell; None for anything else."""
+    """'exiting' (order at the broker, awaiting its fill), 'exit_partial'
+    (the order ended after a partial fill: those shares are sold, the rest
+    of the position is still open — PK-13), 'exit_unconfirmed' (needs
+    review) or 'exited' for an executed closing sell; None otherwise."""
     if ticket["status"] != "executed" or not is_closing_sell(ticket):
         return None
     return _EXIT_STATES.get(ticket["entry_fill_status"], "exited")

@@ -77,6 +77,21 @@ def _assert_open_and_unrecorded(env, position_id):
     return row
 
 
+def _assert_open_and_partly_sold(env, position_id, sold):
+    """PK-13: a partial GTT fill is recorded as ONE 'partial' synthetic exit
+    of exactly the shares sold — never a close, never a journal row, never
+    an order sent, never a guessed price."""
+    row = ticket_row(env.db, position_id)
+    assert row["closed_at"] is None
+    [partial] = _exits(env, position_id)
+    assert (partial["entry_fill_status"], partial["filled_quantity"], partial["filled_price"]) == (
+        "partial", sold, STOP_LIMIT)
+    assert _closed_trades_for(env, position_id) == []
+    assert _sells(env) == []
+    assert env.kite.calls_to("ltp") == []
+    return row
+
+
 def _messages(env, position_id):
     return [e["message"] for e in _errors_for(env, position_id)]
 
@@ -119,7 +134,9 @@ def test_partial_fill_is_not_a_close_and_each_change_is_flagged(env, kind):
     _tick()
     _tick()
 
-    row = _assert_open_and_unrecorded(env, buy_id)
+    # PK-13: the 2 sold are recorded (a 'partial' synthetic exit), so the
+    # position is 3 shares — but it is not closed, and nothing is journaled.
+    row = _assert_open_and_partly_sold(env, buy_id, 2)
     assert row["kite_gtt_id"] == gtt_id
     [first] = _messages(env, buy_id)
     assert "GTT EXIT PARTIALLY FILLED — POSITION NOT CLOSED" in first
@@ -133,7 +150,7 @@ def test_partial_fill_is_not_a_close_and_each_change_is_flagged(env, kind):
     # The rest is cancelled: 2 shares are left with no protection at all.
     env.kite.set_order_state(order_id, "CANCELLED")
     _tick()
-    row = _assert_open_and_unrecorded(env, buy_id)
+    row = _assert_open_and_partly_sold(env, buy_id, 3)
     assert row["kite_gtt_id"] is None         # spent GTT, finished order: nothing left to watch
     assert "2 share(s) are still held and UNPROTECTED" in _messages(env, buy_id)[-1]
     assert [f["actual"] for f in _flags(env, buy_id)] == [
@@ -413,8 +430,11 @@ def test_order_book_outage_is_never_read_as_no_fill(env):
 @pytest.mark.parametrize("fired", ["unfilled", "filled"])
 def test_gtt_firing_while_an_explicit_exit_owns_the_position_records_nothing(env, owner_status, fired):
     buy_id, gtt_id = _position(env, "oco")
+    # An executed owner is EXITING: at the broker, fill still 'pending'
+    # (PK-13: an exit whose order has ended no longer owns the position).
     owner = _pending_exit(env, buy_id, status=owner_status, mode="live",
-                          submission_state="acknowledged", kite_order_id="250000000777")
+                          submission_state="acknowledged", kite_order_id="250000000777",
+                          entry_fill_status="pending" if owner_status == "executed" else None)
     env.kite.trigger_gtt(gtt_id, leg=0, status="OPEN" if fired == "unfilled" else "COMPLETE")
 
     _tick()
@@ -474,7 +494,7 @@ def _apply(env, gtt_id, scenario):
 _EXPECTED = {
     "filled": (True, True, 1, 1, 0, 0),
     "unfilled": (False, True, 0, 0, 1, 1),
-    "partial": (False, True, 0, 0, 1, 1),
+    "partial": (False, True, 1, 0, 1, 1),  # PK-13: the shares sold are recorded (a 'partial' exit), not closed
     "exit_failed": (False, False, 0, 0, 1, 1),
     "triggered_no_order": (False, True, 0, 0, 1, 1),
     "ambiguous": (False, True, 0, 0, 1, 1),

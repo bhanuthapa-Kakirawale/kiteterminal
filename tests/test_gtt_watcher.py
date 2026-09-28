@@ -115,14 +115,17 @@ def test_non_trailing_oco_leg_fill_is_closed_and_journaled(env, market_open, leg
 def test_rsi_mean_reversion_position_oco_closure_is_detected(env, market_open):
     # Built by the real strategy ticket builder from the real module, so the
     # ticket is exactly what an RSI signal produces: no trailing, OCO GTT.
-    from backend import order_monitor, strategy_engine
+    from backend import market, order_monitor, strategy_engine
     from backend.accounts import get_default_account
     from backend.strategies import rsi_mean_reversion as rsi
 
     params = env.client.get("/api/strategies/rsi_mean_reversion").json()["data"]["params"]
     candidate = {"symbol": "TCS", "instrument_token": 2953217, "close": 3000.0, "atr_14": 40.0,
                  "swing_low": 2950.0, "checklist": {"rsi_condition": {"pass": True}}, "conditions": [],
-                 "markers": [], "signal_date": "2026-09-25"}
+                 "markers": [],
+                 # The latest complete session, not a fixed date: a fixed one
+                 # goes stale (PK-12E refuses it) as the calendar moves on.
+                 "signal_date": market.last_complete_session_date().isoformat()}
     _precondition(rsi.compute_entry_levels(candidate, params)["trailing_distance"] is None,
                   "rsi_mean_reversion should not trail")
     conn = env.db.get_connection()

@@ -2,7 +2,7 @@ import asyncio
 import logging
 import sqlite3
 
-from backend import config, kite_client, risk_engine
+from backend import config, kite_client, position_quantity, risk_engine
 from backend.accounts import get_default_account
 from backend.db import get_connection
 
@@ -78,10 +78,12 @@ def _check_order_status(conn: sqlite3.Connection, kite, account) -> None:
     # Only today's orders can be looked up (the broker's order book covers
     # the current session — older ids just error every cycle), and orders
     # still awaiting a fill are followed by order_monitor.py, not flagged.
+    # PK-13: a 'partial' ticket (its order ended after a partial fill) is
+    # checked too — against the quantity the app recorded as filled.
     tickets = conn.execute(
-        "SELECT id, symbol, quantity, kite_order_id FROM trade_tickets "
+        "SELECT * FROM trade_tickets "
         "WHERE account_id = ? AND status = 'executed' AND kite_order_id IS NOT NULL "
-        "AND executed_at >= ? AND COALESCE(entry_fill_status, 'filled') = 'filled'",
+        "AND executed_at >= ? AND COALESCE(entry_fill_status, 'filled') IN ('filled', 'partial')",
         (account["id"], risk_engine._same_day_ist_cutoff_utc()),
     ).fetchall()
     for t in tickets:
@@ -95,8 +97,18 @@ def _check_order_status(conn: sqlite3.Connection, kite, account) -> None:
         latest = history[-1]
         status = latest.get("status")
         filled_qty = latest.get("filled_quantity")
+        recorded = position_quantity.filled(t)
 
-        if status != "COMPLETE" or (filled_qty is not None and filled_qty != t["quantity"]):
+        if t["entry_fill_status"] == "partial":
+            if filled_qty is not None and filled_qty != recorded:
+                log_mismatch(
+                    conn, t["id"], "order_status",
+                    expected=f"{status}, filled_quantity={recorded} (as recorded)",
+                    actual=f"{status}, filled_quantity={filled_qty}",
+                    detail=f"{t['symbol']}: TICKET FILLED QUANTITY MISMATCH — order {t['kite_order_id']} reports "
+                           f"{filled_qty} filled but the app recorded {recorded}. Check the order in Kite.",
+                )
+        elif status != "COMPLETE" or (filled_qty is not None and filled_qty != t["quantity"]):
             log_mismatch(
                 conn, t["id"], "order_status",
                 expected=f"COMPLETE, filled_quantity={t['quantity']}",
@@ -114,7 +126,7 @@ def _check_gtt_state(conn: sqlite3.Connection, kite, account) -> None:
     # the reconciliation_log schema only distinguishes order-side vs
     # position-side checks, and a GTT is fundamentally an order construct.
     tickets = conn.execute(
-        "SELECT id, symbol, kite_gtt_id FROM trade_tickets "
+        "SELECT * FROM trade_tickets "
         "WHERE account_id = ? AND status = 'executed' AND kite_gtt_id IS NOT NULL AND closed_at IS NULL",
         (account["id"],),
     ).fetchall()
@@ -129,7 +141,8 @@ def _check_gtt_state(conn: sqlite3.Connection, kite, account) -> None:
     # ones are still protecting anything. A GTT absent from the list and one
     # listed as e.g. 'triggered' are different findings, so they are logged
     # (and de-duplicated) separately.
-    gtt_status = {g["id"]: g.get("status", "active") for g in gtts}
+    by_id = {g["id"]: g for g in gtts}
+    gtt_status = {gtt_id: g.get("status", "active") for gtt_id, g in by_id.items()}
 
     for t in tickets:
         status = gtt_status.get(t["kite_gtt_id"])
@@ -142,14 +155,40 @@ def _check_gtt_state(conn: sqlite3.Connection, kite, account) -> None:
                        f"missing GTT does not prove the shares were sold: the position stays open until the GTT "
                        f"watcher finds a broker fill for it. Check Kite's orders and holdings.",
             )
+            continue
+        _check_gtt_quantity(conn, t, by_id[t["kite_gtt_id"]])
+
+
+def _check_gtt_quantity(conn: sqlite3.Connection, ticket: sqlite3.Row, gtt: dict) -> None:
+    """PK-13: an active protective GTT must cover exactly the shares held —
+    an oversized SELL GTT is rejected by Kite for CNC (effectively no
+    protection), an undersized one leaves shares unprotected."""
+    desired = position_quantity.protection_quantity(conn, ticket)
+    legs = position_quantity.gtt_leg_quantities(gtt)
+    if desired is None or not legs or all(q == desired for q in legs):
+        return
+    covered = max(legs)
+    kind = "OVERSIZED" if covered > desired else "UNDERSIZED"
+    log_mismatch(
+        conn, ticket["id"], "order_status",
+        expected=f"GTT {ticket['kite_gtt_id']} covers {desired}",
+        actual=f"GTT {ticket['kite_gtt_id']} covers {covered}",
+        detail=f"{ticket['symbol']}: PROTECTION QUANTITY MISMATCH — protective GTT {ticket['kite_gtt_id']} is "
+               f"{kind}: it covers {covered} share(s) but the position holds {desired}. The GTT watcher resizes it; "
+               f"check it in Kite if this persists.",
+    )
 
 
 def _check_position_state(conn: sqlite3.Connection, kite, account) -> None:
+    # PK-13: what each position actually holds — filled, less what its exits
+    # sold (a partial exit's residual included) — never the requested
+    # quantity. A working entry counts only what has filled so far.
     expected_by_symbol: dict[str, int] = {}
     for pos in risk_engine.list_open_positions(conn, account["id"]):
-        if pos["entry_fill_status"] == "pending":
-            continue  # not bought yet — order_monitor.py follows it
-        expected_by_symbol[pos["symbol"]] = expected_by_symbol.get(pos["symbol"], 0) + pos["quantity"]
+        held = pos["open_quantity"]
+        if not held or held < 0:
+            continue  # nothing bought yet (order_monitor follows it), or unknown / NEEDS REVIEW (flagged there)
+        expected_by_symbol[pos["symbol"]] = expected_by_symbol.get(pos["symbol"], 0) + held
     if not expected_by_symbol:
         return
 

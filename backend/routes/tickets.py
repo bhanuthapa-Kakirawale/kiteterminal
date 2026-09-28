@@ -8,7 +8,8 @@ from kiteconnect import KiteConnect
 from kiteconnect.exceptions import KiteException
 
 from backend import (
-    account_safety, execution, instruments, journal, kite_chart, reconciliation, risk_engine, signal_chart,
+    account_safety, execution, instruments, journal, kite_chart, position_quantity, reconciliation, risk_engine,
+    signal_chart,
     system_events,
 )
 from backend.accounts import get_trading_account
@@ -265,22 +266,20 @@ def create_alert_action_sell(req: AlertActionSellRequest, kite: KiteConnect = De
 
     conn = get_connection()
     try:
-        # Only link to a specific tracked ticket on a genuine FULL close —
-        # this app's exit model has no partial-exit/quantity-split modeling
-        # (execution.py's own comment), so linking a PARTIAL sell to a
-        # tracked ticket would make journal.record_closed_trade compute P&L
-        # against the wrong (larger) quantity and incorrectly mark the whole
-        # original position closed. A partial reduction (the common case for
-        # the concentration action) always falls through to case (b): no
-        # closes_ticket_id, validated instead against held quantity by
-        # risk_engine._check_exit_or_reduction.
+        # Only link to a specific tracked ticket on a genuine FULL close of
+        # what it holds (PK-13: its OPEN quantity — the shares the broker
+        # filled, less any already sold — never its requested quantity). A
+        # user-chosen partial sell of a tracked position is not modelled: a
+        # partial reduction (the common case for the concentration action)
+        # always falls through to case (b): no closes_ticket_id, validated
+        # instead against held quantity by risk_engine._check_exit_or_reduction.
         open_positions = [p for p in risk_engine.list_open_positions(conn, account["id"]) if p["symbol"] == req.symbol]
         closes_ticket_id = None
         # A linked full close inherits the position's mode (PK-3); an
         # unlinked reduction stays NULL and takes the global mode at claim.
         mode = None
         link_note = "none (partial reduction)"
-        if len(open_positions) == 1 and open_positions[0]["quantity"] == req.quantity:
+        if len(open_positions) == 1 and open_positions[0]["open_quantity"] == req.quantity:
             closes_ticket_id = open_positions[0]["id"]
             mode = open_positions[0]["mode"]
             link_note = "full_close"
@@ -367,6 +366,7 @@ def list_tickets(
         data = []
         for r in rows:
             item = _serialize(r)
+            item.update(_quantity_fields(conn, r))
             item["exit_in_flight_ticket_id"] = in_flight.get(r["id"])
             data.append(item)
         return {"data": data}
@@ -375,18 +375,33 @@ def list_tickets(
 
 
 def _exits_in_flight(conn: sqlite3.Connection, account_id: int) -> dict[int, int]:
-    """position id -> the exit ticket that owns it but has not proven a fill
-    (claimed/UNKNOWN, EXITING, partial): the position still exists, but an
-    exit is in flight (PK-8)."""
+    """position id -> the exit ticket that owns it while its order is in
+    flight (claimed/UNKNOWN, EXITING, unconfirmed): the position still
+    exists, but an exit is in flight (PK-8). An exit that ended after a
+    partial fill no longer owns it (PK-13)."""
     rows = conn.execute(
         f"""
         SELECT closes_ticket_id, id FROM trade_tickets
-        WHERE account_id = ? AND closes_ticket_id IS NOT NULL
-          AND (status = 'confirmed' OR (status = 'executed' AND NOT ({execution.EXIT_FILL_PROVEN_SQL})))
+        WHERE account_id = ? AND closes_ticket_id IS NOT NULL AND {execution.EXIT_IN_FLIGHT_SQL}
         """,
         (account_id,),
     ).fetchall()
     return {r["closes_ticket_id"]: r["id"] for r in rows}
+
+
+def _quantity_fields(conn: sqlite3.Connection, ticket: sqlite3.Row) -> dict:
+    """PK-13: requested vs filled vs open. For a position (an executed entry):
+    open_quantity = shares still held. For an exit: remaining_quantity = what
+    its order has not sold."""
+    bought = position_quantity.filled(ticket)
+    fields = {"filled_quantity": bought, "open_quantity": None, "remaining_quantity": None}
+    if ticket["status"] != "executed":
+        return fields
+    if ticket["closes_ticket_id"] is None and not execution.is_closing_sell(ticket):
+        fields["open_quantity"] = 0 if ticket["closed_at"] else position_quantity.open_quantity(conn, ticket["id"])
+    elif bought is not None:
+        fields["remaining_quantity"] = ticket["quantity"] - bought
+    return fields
 
 
 @router.get("/api/tickets/{ticket_id}")
@@ -399,6 +414,7 @@ def get_ticket(ticket_id: int, kite: KiteConnect = Depends(require_trading_accou
             "SELECT * FROM ticket_events WHERE ticket_id = ? ORDER BY created_at ASC", (ticket_id,)
         ).fetchall()
         data = _serialize(ticket)
+        data.update(_quantity_fields(conn, ticket))
         data["events"] = [dict(e) for e in events]
         return {"data": data}
     finally:
@@ -581,6 +597,26 @@ def _refuse_stale_exit(conn: sqlite3.Connection, ticket: sqlite3.Row, account_id
         "error_code": problem.code,
         "message": f"{problem.message} Nothing was executed"
                    + (" — this exit ticket has been rejected." if problem.permanent else "."),
+    })
+
+
+def _exit_claim_condition() -> tuple[str, tuple]:
+    """The claim predicate of a linked exit (PK-13), evaluated inside the
+    claiming UPDATE on trade_tickets: its position is still open and holds
+    exactly this exit's quantity."""
+    position = "(SELECT {} FROM trade_tickets p WHERE p.id = trade_tickets.closes_ticket_id)"
+    return (f"{position.format('p.closed_at')} IS NULL AND "
+            f"trade_tickets.quantity = {position.format(position_quantity.open_quantity_sql('p'))}", ())
+
+
+def _refuse_exit_claim(conn: sqlite3.Connection, account: sqlite3.Row, ticket: sqlite3.Row) -> None:
+    """The exit lost its claim to the quantity/closed predicate: the position
+    changed between the check and the claim. The fresh check says why."""
+    _refuse_stale_exit(conn, ticket, account["id"])
+    raise HTTPException(409, {
+        "error_code": "EXIT_QUANTITY_MISMATCH",
+        "message": f"Position {ticket['closes_ticket_id']} changed while this exit was being approved. Nothing "
+                   f"was executed.",
     })
 
 
@@ -803,6 +839,12 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
         _refuse_stale_exit(conn, ticket, account["id"])
     variety = None
     entry_limit = None
+    if ticket["closes_ticket_id"] is not None:
+        # PK-13: the check above and this claim are one decision — the
+        # position must still be open and hold exactly this exit's quantity
+        # at the moment of the claim (a fill recorded in between, or another
+        # exit's partial sale, changes what may be sold).
+        entry_limit = _exit_claim_condition()
     if new_entry:
         # PK-12: refused before the claim — nothing written, nothing sent.
         variety = _account_safety_precheck(conn, account, ticket, mode, allow_amo)
@@ -841,6 +883,8 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
     if not claimed:
         conn.rollback()
         if entry_limit is not None and _get_ticket_or_404(conn, ticket_id, account["id"])["status"] in _CONFIRMABLE_STATUSES:
+            if ticket["closes_ticket_id"] is not None:
+                _refuse_exit_claim(conn, account, ticket)
             _refuse_daily_entry_limit(conn, account, ticket)
         _raise_invalid_state(conn, ticket_id, account["id"], "confirm")
     _log_event(conn, ticket_id, "confirmed", f"Confirmed in {mode} mode{mode_note}")
@@ -891,6 +935,7 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
 
     _notify("executed", ticket_id=ticket_id, status=ticket["status"], success=result.success)
     data = _serialize(ticket)
+    data.update(_quantity_fields(conn, ticket))
     if won:
         data["execution_message"] = result.message
         data["success"] = result.success
@@ -925,6 +970,8 @@ def _record_execution_result(conn: sqlite3.Connection, ticket: sqlite3.Row, resu
             order_variety=result.order_variety, entry_fill_status=result.entry_fill_status,
             filled_price=ticket["entry_price"] if filled_now else None,
             filled_at=now if filled_now else None,
+            # PK-13: nothing has filled at the broker yet; a simulation fills all.
+            filled_quantity=ticket["quantity"] if filled_now else 0,
             submission_state=execution.ACKNOWLEDGED if live else None,
         )
     if result.event_type == "submission_unknown":

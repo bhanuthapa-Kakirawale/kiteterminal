@@ -197,29 +197,35 @@ def test_f_partial_fill_in_progress_is_flagged_not_closed(env, market_open):
     assert len([u for u in _urgent_updates(env) if "PARTIAL EXIT" in u["message"]]) == 2
 
 
-def test_f_partial_fill_then_ended_needs_review_and_sends_nothing(env, market_open):
+def test_f_partial_fill_then_ended_leaves_the_rest_open_protected_and_exitable(env, market_open):
+    # PK-13 restates PK-8's interim rule ("the partial exit keeps the
+    # position, needs review, GTT still covers all 5"): the 2 sold are
+    # recorded, the other 3 stay open with the GTT resized to them, and the
+    # ended exit no longer owns the position, so the remainder can be sold.
     buy_id, gtt_id, sell_id, order_id = _exiting_position(env)
-    sibling = _pending_exit(env, buy_id)
+    sibling = _pending_exit(env, buy_id)  # sized for the full 5 before the partial
     env.kite.set_order_state(order_id, "CANCELLED", filled_quantity=2, average_price=3100.0,
                              status_message="circuit limit")
     for _ in range(2):
         _monitor(env)
         _tick()
 
-    assert not _still_open_and_protected(env, buy_id, gtt_id)
+    assert not _still_open_and_protected(env, buy_id, gtt_id)  # not closed, GTT kept, not journaled
+    assert {leg["quantity"] for leg in env.kite.gtt_book[gtt_id]["orders"]} == {3}
     exit_row = ticket_row(env.db, sell_id)
-    assert (exit_row["status"], exit_row["entry_fill_status"]) == ("executed", "partial")
+    assert (exit_row["status"], exit_row["entry_fill_status"], exit_row["filled_quantity"]) == (
+        "executed", "partial", 2)
     [alert] = [u for u in _urgent_updates(env) if u["ticket_id"] == sell_id]
-    assert "PARTIAL EXIT, NEEDS REVIEW" in alert["message"] and "reduce it in Kite" in alert["message"]
+    assert "PARTIAL EXIT: 2 share(s) sold" in alert["message"] and "3 share(s)" in alert["message"]
     listed = {t["id"]: t for t in env.client.get("/api/tickets").json()["data"]}
     assert listed[sell_id]["exit_state"] == "exit_partial"
-    # The partial exit keeps the position: no other exit, no Emergency Exit sale.
+    # The stale 5-share sibling can never oversell the 3 left.
     r = env.client.post(f"/api/tickets/{sibling}/confirm")
-    assert r.status_code == 409 and r.json()["detail"]["error_code"] == "EXIT_ALREADY_IN_PROGRESS"
+    assert r.status_code == 409 and r.json()["detail"]["error_code"] == "EXIT_QUANTITY_MISMATCH"
     ee = env.client.post("/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "EXIT ALL"})
     [result] = ee.json()["data"]["results"]
-    assert (result["status"], result["ticket_id"]) == ("already_exiting", sell_id)
-    assert len(env.kite.calls_to("place_order")) == 1
+    assert result["status"] == "exit_submitted"
+    assert [c["quantity"] for c in env.kite.calls_to("place_order")] == [5, 3]
 
 
 # ---------------------------------------------------------------- G / H: UNKNOWN, adopted (PK-2)

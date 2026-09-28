@@ -160,7 +160,11 @@ def test_partially_filled_exit_cancel_is_not_reported_as_cancelled(env, market_o
     assert not _still_open_and_protected(env, buy_id, gtt_id)
     listed = {t["id"]: t for t in env.client.get("/api/tickets").json()["data"]}
     assert listed[sell_id]["exit_state"] == "exit_partial"
-    assert listed[buy_id]["exit_in_flight_ticket_id"] == sell_id  # still owns the position
+    # PK-13: the 2 sold are recorded and the ended exit no longer owns the
+    # position: its remaining 3 are still open, protected, and exitable.
+    assert listed[buy_id]["exit_in_flight_ticket_id"] is None
+    assert (listed[sell_id]["filled_quantity"], listed[buy_id]["open_quantity"]) == (2, 3)
+    assert {leg["quantity"] for leg in env.kite.gtt_book[gtt_id]["orders"]} == {3}
 
 
 # ---------------------------------------------------------------- repeats and failures

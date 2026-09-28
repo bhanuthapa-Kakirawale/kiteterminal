@@ -901,38 +901,108 @@ def _ensure_submission_tracking_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE trade_tickets ADD COLUMN {column} {sql_type}")
 
 
+def _ensure_filled_quantity_column(conn: sqlite3.Connection) -> None:
+    # PK-13: trade_tickets.quantity is the REQUESTED order size; this is what
+    # the broker actually filled, cumulatively — for an entry the shares
+    # bought, for an exit ticket the shares that exit sold. NULL = unknown
+    # (never submitted, or a historical partial whose fill was never
+    # recorded). Must run after _ensure_alert_action_source (that rebuild
+    # copies an explicit column list). A plain ADD COLUMN, no rebuild: the
+    # CHECK is the storage invariant 0 <= filled_quantity <= quantity.
+    if _column_exists(conn, "trade_tickets", "filled_quantity"):
+        return
+    # The column and its one-time backfill land together or not at all: DDL
+    # opens no implicit transaction in Python's sqlite3, so a savepoint does.
+    conn.execute("SAVEPOINT pk13_filled_quantity")
+    conn.execute(
+        "ALTER TABLE trade_tickets ADD COLUMN filled_quantity INTEGER "
+        "CHECK (filled_quantity IS NULL OR (filled_quantity >= 0 AND filled_quantity <= quantity))"
+    )
+    # Only rows whose fill is certain. A dry run fills at once; a live row
+    # whose fill was proven ('filled') or predates fill tracking (NULL — its
+    # position was treated as fully open) filled its whole quantity; a live
+    # order still 'pending' has filled nothing the app knows of. Historical
+    # 'partial' / 'unconfirmed' rows stay NULL: their quantity is not guessed.
+    conn.execute(
+        """
+        UPDATE trade_tickets SET filled_quantity = quantity
+        WHERE status = 'executed'
+          AND (mode = 'dry_run' OR entry_fill_status IS NULL OR entry_fill_status = 'filled')
+        """
+    )
+    conn.execute(
+        "UPDATE trade_tickets SET filled_quantity = 0 "
+        "WHERE status = 'executed' AND mode = 'live' AND entry_fill_status = 'pending'"
+    )
+    conn.execute("RELEASE pk13_filled_quantity")
+
+
+# PK-4 storage backstop, relaxed by PK-13: only an exit whose order is still
+# IN FLIGHT owns its position — claimed for execution ('confirmed': in
+# flight, unknown or needs_review) or at the broker awaiting its fill
+# ('executed' + 'pending', or 'unconfirmed'). An exit whose order has ENDED
+# — filled, or ended after a partial fill — no longer owns it: the shares it
+# sold are counted (position_quantity), and whatever remains may be exited
+# by a new ticket. The claim of that new ticket is checked atomically
+# against the remaining open quantity (routes/tickets), so a finished exit
+# can never be repeated.
+_EXIT_OWNER_PREDICATE = (
+    "closes_ticket_id IS NOT NULL AND (status = 'confirmed' OR "
+    "(status = 'executed' AND COALESCE(entry_fill_status, '') IN ('pending', 'unconfirmed')))"
+)
+
+
 def _ensure_single_exit_owner_index(conn: sqlite3.Connection) -> None:
-    # PK-4 storage backstop: at most one exit ticket may OWN a position —
-    # claimed for execution ('confirmed': in flight, unknown or
-    # needs_review) or 'executed'. Two exits of one position racing through
-    # confirmation both pass the application checks; the second claim then
-    # fails here instead of sending a second SELL. Exits that no longer own
-    # the position (failed at the broker, rejected, cancelled) drop out, so
-    # a failed exit frees the position for a new one.
+    # Two exits of one position racing through confirmation both pass the
+    # application checks; the second claim then fails here instead of
+    # sending a second SELL. Exits that no longer own the position (failed at
+    # the broker, rejected, cancelled, or — PK-13 — ended) drop out.
     #
     # Must run after every trade_tickets rebuild (they drop indexes). A
-    # future status that owns a position (e.g. a PK-7/PK-8 'exiting') must be
-    # added to the predicate; partial exits (PK-13) must relax it.
+    # future state that owns a position must be added to the predicate.
+    existing = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_trade_tickets_one_exit_owner'"
+    ).fetchone()
+    if existing is not None and "'unconfirmed'" in existing["sql"]:
+        return  # already the PK-13 predicate
     duplicates = conn.execute(
-        """
+        f"""
         SELECT closes_ticket_id, COUNT(*) AS n FROM trade_tickets
-        WHERE closes_ticket_id IS NOT NULL AND status IN ('confirmed', 'executed')
+        WHERE {_EXIT_OWNER_PREDICATE}
         GROUP BY closes_ticket_id HAVING n > 1
         """
     ).fetchall()
     if duplicates:
         # Existing data already violates the invariant: never block startup
-        # over it. The application-level checks still apply.
+        # over it (an older, stricter index, if any, stays). The
+        # application-level checks still apply.
         logger.warning(
             "Not creating idx_trade_tickets_one_exit_owner: position(s) %s already have more than one "
-            "claimed/executed exit ticket — review them in Ticket History.",
+            "in-flight exit ticket — review them in Ticket History.",
             [d["closes_ticket_id"] for d in duplicates],
         )
         return
+    conn.execute("DROP INDEX IF EXISTS idx_trade_tickets_one_exit_owner")
     conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_tickets_one_exit_owner ON trade_tickets(closes_ticket_id) "
-        "WHERE closes_ticket_id IS NOT NULL AND status IN ('confirmed', 'executed')"
+        "CREATE UNIQUE INDEX idx_trade_tickets_one_exit_owner ON trade_tickets(closes_ticket_id) "
+        f"WHERE {_EXIT_OWNER_PREDICATE}"
     )
+
+
+def _ensure_closed_trades_one_per_position_index(conn: sqlite3.Connection) -> None:
+    # PK-13: a position sold in pieces is journaled ONCE, when it is flat —
+    # one closed_trades row per round trip (journal.record_closed_trade).
+    # Storage backstop against a second row for the same position.
+    duplicates = conn.execute(
+        "SELECT buy_ticket_id FROM closed_trades GROUP BY buy_ticket_id HAVING COUNT(*) > 1"
+    ).fetchall()
+    if duplicates:
+        logger.warning(
+            "Not creating idx_closed_trades_buy_ticket: position(s) %s already have more than one "
+            "closed_trades row.", [d["buy_ticket_id"] for d in duplicates],
+        )
+        return
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_closed_trades_buy_ticket ON closed_trades(buy_ticket_id)")
 
 
 _ACCOUNT_SAFETY_EVENT_TYPES = (
@@ -1451,7 +1521,9 @@ def init_db() -> None:
         _ensure_execution_tracking_columns(conn)
         _ensure_alert_action_source(conn)
         _ensure_submission_tracking_columns(conn)
+        _ensure_filled_quantity_column(conn)
         _ensure_single_exit_owner_index(conn)
+        _ensure_closed_trades_one_per_position_index(conn)
         _ensure_instrument_tick_size_column(conn)
         _ensure_watchlist_tag_column(conn)
         _ensure_dashboard_panels_screen_column(conn)

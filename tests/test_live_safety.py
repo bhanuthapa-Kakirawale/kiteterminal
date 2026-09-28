@@ -1574,8 +1574,11 @@ def test_p0_4_database_refuses_a_second_owning_exit(env, unsafe_client, market_o
     assert len(_sells(env)) == 1
     conn = env.db.get_connection()
     try:
+        # PK-13: an exit owns its position while its order is in flight —
+        # EXITING is 'executed' + 'pending' (an ended exit no longer does).
         with pytest.raises(sqlite3.IntegrityError):
-            conn.execute("UPDATE trade_tickets SET status = 'executed' WHERE id = ?", (second,))
+            conn.execute("UPDATE trade_tickets SET status = 'executed', entry_fill_status = 'pending' WHERE id = ?",
+                         (second,))
     finally:
         conn.close()
 
@@ -1589,8 +1592,9 @@ def test_p0_4_exit_owner_index_migration_is_idempotent_and_tolerates_legacy_dupl
     env.db.init_db()
     assert index_exists()
 
-    # A database that already holds two executed exits of one position (it
-    # can't be created while the index exists) must still start up.
+    # A database that already holds two owning exits of one position (it
+    # can't be created while the index exists) must still start up. PK-13:
+    # owning = in flight, i.e. two EXITING exits ('executed' + 'pending').
     conn = env.db.get_connection()
     try:
         conn.execute("DROP INDEX idx_trade_tickets_one_exit_owner")
@@ -1598,7 +1602,8 @@ def test_p0_4_exit_owner_index_migration_is_idempotent_and_tolerates_legacy_dupl
     finally:
         conn.close()
     buy_id, _ = _live_position(env, closed_at="2026-09-02 04:00:00")
-    dup = [_pending_exit(env, buy_id, status="executed", mode="live", executed_at="2026-09-02 04:00:00")
+    dup = [_pending_exit(env, buy_id, status="executed", mode="live", executed_at="2026-09-02 04:00:00",
+                         entry_fill_status="pending")
            for _ in range(2)]
     env.db.init_db()
     assert not index_exists()
@@ -1911,14 +1916,17 @@ def test_p0_6_triggered_gtt_without_fill_keeps_position_open(env, market_open, f
     _run_background_cycles(env)
 
     after = ticket_row(env.db, row["id"])
-    synthetic = _rows(env, "SELECT id, entry_fill_status, entry_price FROM trade_tickets WHERE closes_ticket_id = ?",
-                      row["id"])
+    synthetic = _rows(env, "SELECT id, entry_fill_status, entry_price, filled_quantity FROM trade_tickets "
+                           "WHERE closes_ticket_id = ?", row["id"])
     violations = []
     if after["closed_at"] is not None:
         violations.append(f"position {row['id']} marked closed although SELL {order_id} is "
                           f"{env.kite.order_book[order_id]['status']} with {filled}/{row['quantity']} filled "
                           f"and the broker still holds {row['quantity'] - filled}")
-    if synthetic:
+    # PK-13: the shares a partial fill sold ARE recorded — as a 'partial'
+    # synthetic exit of exactly that many shares, never as a full exit.
+    if [s for s in synthetic if s["entry_fill_status"] != "partial" or s["filled_quantity"] != filled] or (
+            synthetic and not filled):
         violations.append(f"synthetic exit ticket(s) created: {synthetic}")
     if _closed_trades_for(env, row["id"]):
         violations.append(f"journal row written: {_closed_trades_for(env, row['id'])}")

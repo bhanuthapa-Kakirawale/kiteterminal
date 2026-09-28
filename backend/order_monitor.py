@@ -6,26 +6,41 @@ every live order the app placed until it reaches a terminal state and
 reconciles the ticket automatically, so the app never keeps believing in a
 position that never opened, or a close that never happened:
 
-* entry COMPLETE                     -> record the real fill price/time
+PK-13: the broker's cumulative filled_quantity is recorded on every ticket
+it follows (monotonically — backend/position_quantity.py), and the
+position's protective GTT is resized to the shares actually held whenever
+that changes. The requested quantity is never assumed to be the position.
+
+* entry working, some shares filled  -> record the fill; the GTT is resized
+                                        to it (once per distinct fill)
+* entry COMPLETE                     -> record the real fill price/time/qty
 * entry REJECTED/CANCELLED, 0 filled -> the position never opened: remove its
                                         protective GTT, mark ticket cancelled
-* entry partially filled, then ended -> flag for review (GTT covers full qty)
+* entry partially filled, then ended -> 'partial': a real open position of
+                                        the filled shares; GTT resized to them
 
 For an explicit exit this monitor is the only thing that closes a live
 position (PK-8, P0-7). Placing the exit made it EXITING: the position stayed
 open, protected by its GTT, unjournaled.
 
 * exit OPEN / AMO / trigger pending  -> nothing: still EXITING
-* exit working, some shares filled   -> urgent PARTIAL EXIT flag (once)
-* exit COMPLETE, full quantity       -> record the broker's fill price/time,
-                                        close the position at that time,
-                                        journal it once, supersede sibling
-                                        exits, then remove the protective GTT
-                                        (a failed removal is an urgent
-                                        ORPHANED GTT warning, never a reopen)
-* exit ended after a partial fill    -> 'partial': NOT closed, not journaled,
-                                        GTT kept, urgent needs-review; nothing
-                                        is resubmitted (PK-13 models partials)
+* exit working, some shares filled   -> record the fill: the position's open
+                                        quantity drops and its GTT is resized
+                                        to what remains; urgent PARTIAL EXIT
+                                        flag (once per distinct fill)
+* exit COMPLETE, full quantity       -> record the broker's fill price/time;
+                                        if the position is now flat: close it
+                                        at that time, journal it once,
+                                        supersede sibling exits, then remove
+                                        the protective GTT (a failed removal
+                                        is an urgent ORPHANED GTT warning,
+                                        never a reopen)
+* exit ended after a partial fill    -> 'partial': the sold shares count; the
+                                        rest stays OPEN (not journaled), its
+                                        GTT resized to it, and the exit no
+                                        longer owns the position — a new exit
+                                        may sell the remainder; nothing is
+                                        resubmitted automatically
 * exit REJECTED/CANCELLED, 0 filled  -> exit 'failed'; the position was never
                                         closed and keeps its GTT; urgent alert
 
@@ -52,7 +67,7 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-from backend import config, execution, journal, kite_client, reconciliation, risk_engine
+from backend import config, execution, kite_client, position_quantity, reconciliation, risk_engine
 from backend.accounts import get_default_account
 from backend.db import get_connection
 from backend.ticker import ticker_manager
@@ -157,8 +172,11 @@ def check_pending_orders(kite=None) -> dict:
                     conn.commit()
                 continue
             if order.get("status") not in TERMINAL_STATUSES:
-                if execution.is_closing_sell(ticket) and int(order.get("filled_quantity") or 0) > 0:
-                    updates.append(_flag_partial_exit_in_progress(conn, ticket, order))
+                if int(order.get("filled_quantity") or 0) > 0:
+                    if execution.is_closing_sell(ticket):
+                        updates.append(_flag_partial_exit_in_progress(conn, kite, ticket, order))
+                    else:
+                        updates.append(_entry_fill_in_progress(conn, kite, ticket, order))
                     conn.commit()
                 continue
             if execution.is_closing_sell(ticket):
@@ -276,7 +294,7 @@ def _adopt(conn: sqlite3.Connection, kite, ticket: sqlite3.Row, order: dict) -> 
         conn, ticket,
         status="executed", kite_order_id=order_id, current_stop_loss=ticket["stop_loss"],
         executed_at=ticket["submitted_at"] or execution.utc_now_sql(), order_variety=order.get("variety"),
-        entry_fill_status="pending", submission_state=execution.ADOPTED,
+        entry_fill_status="pending", filled_quantity=0, submission_state=execution.ADOPTED,
     ):
         return None
     symbol = ticket["symbol"]
@@ -369,19 +387,103 @@ def _mark_unconfirmed(conn: sqlite3.Connection, ticket: sqlite3.Row) -> dict | N
             "severity": "warning", "message": msg}
 
 
+def _fill_exceeds_order(conn: sqlite3.Connection, ticket: sqlite3.Row, order: dict,
+                        position_id: int | None) -> dict | None:
+    """The broker reports more filled than was ordered — impossible for a
+    correct report. Nothing is recorded, closed or sent: needs a human."""
+    filled = order.get("filled_quantity")
+    msg = (f"{ticket['symbol']}: BROKER FILL NEEDS REVIEW — order {ticket['kite_order_id']} reports {filled} filled "
+           f"but only {ticket['quantity']} were ordered. The figure was NOT recorded; the position is unchanged and "
+           f"nothing is sent. Check the order in Kite.")
+    update = {"ticket_id": ticket["id"], "symbol": ticket["symbol"], "order_status": order.get("status"),
+              "severity": "urgent", "message": msg}
+    return _flag(conn, position_id if position_id is not None else ticket["id"], update, "order_status",
+                 expected=f"filled_quantity <= {ticket['quantity']}",
+                 actual=f"order {ticket['kite_order_id']} filled_quantity={filled}")
+
+
+def _protection_note(sync: position_quantity.SyncResult, held: int | None) -> str:
+    if sync.message:
+        return " " + sync.message
+    return f" Its protective GTT covers the {held} share(s) held." if held else ""
+
+
+def _entry_fill_in_progress(conn: sqlite3.Connection, kite, ticket: sqlite3.Row, order: dict) -> dict | None:
+    """An entry still working has filled some shares: they are a real
+    position now. Record the fill and resize the protective GTT to it — the
+    GTT must never cover shares that were not bought (PK-13)."""
+    filled = int(order.get("filled_quantity") or 0)
+    outcome = position_quantity.record_fill(conn, ticket, filled)
+    if outcome == position_quantity.EXCEEDS_REQUESTED:
+        return _fill_exceeds_order(conn, ticket, order, None)
+    if outcome != position_quantity.INCREASED:
+        return None  # already recorded (or an older, lower report): nothing new
+    sync = position_quantity.sync_protection(conn, kite, ticket["id"],
+                                             f"entry order {ticket['kite_order_id']} has filled {filled}")
+    msg = (f"{ticket['symbol']}: PARTIAL FILL — entry order {ticket['kite_order_id']} is {order.get('status')} with "
+           f"{filled}/{ticket['quantity']} filled; the position holds {filled} share(s) so far and the rest of the "
+           f"order is still working.{_protection_note(sync, filled)}")
+    _log_event(conn, ticket["id"], "modified", msg)
+    return {"ticket_id": ticket["id"], "symbol": ticket["symbol"], "order_status": order.get("status"),
+            "severity": "urgent" if sync.urgent else "warning", "message": msg}
+
+
+def _close_if_sold_out(conn: sqlite3.Connection, kite, position_id: int, filled: int) -> str:
+    """The entry order just ended. If every share it bought was already sold
+    while it worked (e.g. an Emergency Exit sized to the fill so far), the
+    position is flat now: closed at its last exit's fill."""
+    if position_quantity.open_quantity(conn, position_id) != 0:
+        return ""
+    last_exit = conn.execute(
+        "SELECT id, filled_at FROM trade_tickets WHERE closes_ticket_id = ? AND status = 'executed' "
+        "AND COALESCE(filled_quantity, 0) > 0 ORDER BY id DESC LIMIT 1",
+        (position_id,),
+    ).fetchone()
+    if last_exit is None:
+        return ""
+    result = position_quantity.close_if_flat(conn, kite, position_id, last_exit["id"],
+                                             last_exit["filled_at"] or execution.utc_now_sql())
+    if result.closed:
+        _log_event(conn, position_id, "closed",
+                   f"Entry order ended with all {filled} filled share(s) already sold (last by exit ticket "
+                   f"{last_exit['id']}); position closed.")
+        return f" All {filled} share(s) were already sold — position #{position_id} closed." + result.message
+    return result.message
+
+
 def _resolve_entry(conn: sqlite3.Connection, kite, ticket: sqlite3.Row, order: dict) -> dict | None:
     status = order["status"]
-    filled = order.get("filled_quantity") or 0
+    filled = int(order.get("filled_quantity") or 0)
     avg = order.get("average_price") or None
     base = {"ticket_id": ticket["id"], "symbol": ticket["symbol"], "order_status": status}
 
     if status == "COMPLETE":
+        # Kite's COMPLETE is a full fill; a report without a figure is too.
+        filled = filled or ticket["quantity"]
+        if filled > ticket["quantity"]:
+            return _fill_exceeds_order(conn, ticket, order, None)
+        # The claim stays the monitor's first write (it is the lock between
+        # racing writers); the fill is recorded in the same transaction.
         if not _claim_pending(conn, ticket, "entry_fill_status = 'filled', filled_price = ?, "
                               "filled_at = datetime('now')", (avg or ticket["entry_price"],)):
             return None
-        msg = (f"{ticket['symbol']}: entry filled — {ticket['transaction_type']} {filled or ticket['quantity']} "
+        position_quantity.record_fill(conn, ticket, filled)
+        msg = (f"{ticket['symbol']}: entry filled — {ticket['transaction_type']} {filled} "
                f"@ {_price(avg)} (order {ticket['kite_order_id']})")
+        if filled < ticket["quantity"]:
+            msg += f" — only {filled} of the {ticket['quantity']} ordered; the position is {filled} share(s)"
         _log_event(conn, ticket["id"], "modified", msg)
+        prior = ticket["filled_quantity"] or 0
+        severity = "success"
+        if 0 < prior < ticket["quantity"] or filled < ticket["quantity"]:
+            # An earlier partial fill resized the GTT below the order (or the
+            # broker filled less): make it cover what is now held. A fill
+            # straight to COMPLETE left the GTT exactly as placed.
+            sync = position_quantity.sync_protection(conn, kite, ticket["id"],
+                                                     f"entry order {ticket['kite_order_id']} COMPLETE")
+            msg += _protection_note(sync, None)
+            severity = "urgent" if sync.urgent else severity
+        msg += _close_if_sold_out(conn, kite, ticket["id"], filled)
         if (ticket["submission_state"] == execution.ADOPTED and ticket["use_gtt"]
                 and not _gtt_is_active(kite, ticket["kite_gtt_id"])):
             # A recovered entry never had its protection placed by this app
@@ -394,23 +496,28 @@ def _resolve_entry(conn: sqlite3.Connection, kite, ticket: sqlite3.Row, order: d
                 actual=f"kite_gtt_id={ticket['kite_gtt_id']}, no active GTT", detail=warning,
             )
             return {**base, "severity": "urgent", "message": f"{msg}. {warning}"}
-        return {**base, "severity": "success", "message": msg}
+        return {**base, "severity": severity, "message": msg}
 
     reason = order.get("status_message") or "no reason given by the broker"
     if filled:
+        # PK-13: the order is over, but the shares it bought are a real,
+        # open position of exactly that size — never a cancelled ticket.
+        if filled > ticket["quantity"]:
+            return _fill_exceeds_order(conn, ticket, order, None)
         if not _claim_pending(conn, ticket, "entry_fill_status = 'partial', filled_price = ?, "
                               "filled_at = datetime('now')", (avg,)):
             return None
+        position_quantity.record_fill(conn, ticket, filled)
+        held = position_quantity.open_quantity(conn, ticket["id"])
         msg = (f"{ticket['symbol']}: entry order {status.lower()} after a PARTIAL fill "
-               f"({filled}/{ticket['quantity']}). The protective GTT still covers {ticket['quantity']} shares — "
-               f"reduce it to {filled} in Kite.")
+               f"({filled}/{ticket['quantity']}) — {reason}. The position is OPEN with {held} share(s); the "
+               f"unfilled {ticket['quantity'] - filled} will not be bought.")
+        sync = position_quantity.sync_protection(conn, kite, ticket["id"],
+                                                 f"entry order {status.lower()} after filling {filled}")
+        msg += _protection_note(sync, held)
         _log_event(conn, ticket["id"], "modified", msg)
-        reconciliation.log_mismatch(
-            conn, ticket["id"], "order_status",
-            expected=f"COMPLETE, filled_quantity={ticket['quantity']}",
-            actual=f"{status}, filled_quantity={filled}", detail=msg,
-        )
-        return {**base, "severity": "urgent", "message": msg}
+        msg += _close_if_sold_out(conn, kite, ticket["id"], filled)
+        return {**base, "severity": "urgent" if sync.urgent else "warning", "message": msg}
 
     if not _claim_pending(conn, ticket, "status = 'cancelled', entry_fill_status = ?", (status.lower(),)):
         return None
@@ -456,14 +563,28 @@ def _flag(conn: sqlite3.Connection, ticket_id: int | None, update: dict, check_t
     return update
 
 
-def _flag_partial_exit_in_progress(conn: sqlite3.Connection, ticket: sqlite3.Row, order: dict) -> dict | None:
-    filled, qty = int(order.get("filled_quantity") or 0), ticket["quantity"]
+def _flag_partial_exit_in_progress(conn: sqlite3.Connection, kite, ticket: sqlite3.Row,
+                                   order: dict) -> dict | None:
+    """An exit still working has sold some shares (PK-13): they are gone —
+    record the fill, so the position's open quantity drops, and resize its
+    protective GTT to what remains. The exit still owns the position."""
+    filled, qty, original_id = int(order.get("filled_quantity") or 0), ticket["quantity"], ticket["closes_ticket_id"]
+    outcome = position_quantity.record_fill(conn, ticket, filled)
+    if outcome == position_quantity.EXCEEDS_REQUESTED:
+        return _fill_exceeds_order(conn, ticket, order, original_id)
+    protection = ""
+    if outcome == position_quantity.INCREASED and original_id is not None:
+        sync = position_quantity.sync_protection(conn, kite, original_id,
+                                                 f"exit order {ticket['kite_order_id']} has sold {filled}")
+        protection = _protection_note(sync, None)
+    held = f" {position_quantity.open_quantity(conn, original_id)} share(s) of position #{original_id} remain OPEN;" \
+        if original_id is not None else ""
     msg = (f"{ticket['symbol']}: PARTIAL EXIT — exit order {ticket['kite_order_id']} is {order.get('status')} with "
-           f"{filled}/{qty} filled. The position is NOT closed and nothing is journaled; its protective GTT still "
-           f"covers all {qty}. Check the order in Kite — nothing is resubmitted automatically.")
+           f"{filled}/{qty} filled.{held} nothing is journaled until the position is flat.{protection} The rest of "
+           f"the order is still working — check it in Kite; nothing is resubmitted automatically.")
     update = {"ticket_id": ticket["id"], "symbol": ticket["symbol"], "order_status": order.get("status"),
               "severity": "urgent", "message": msg}
-    return _flag(conn, ticket["closes_ticket_id"] or ticket["id"], update, "order_status",
+    return _flag(conn, original_id or ticket["id"], update, "order_status",
                  expected=f"exit order filled {qty}/{qty}",
                  actual=f"exit order {ticket['kite_order_id']} {order.get('status')} {filled}/{qty} filled")
 
@@ -477,8 +598,10 @@ def _resolve_exit(conn: sqlite3.Connection, kite, ticket: sqlite3.Row, order: di
     base = {"ticket_id": ticket["id"], "symbol": ticket["symbol"], "order_status": status}
     original_id = ticket["closes_ticket_id"]
 
+    if filled > ticket["quantity"]:
+        return _fill_exceeds_order(conn, ticket, order, original_id)
     if status == "COMPLETE":
-        if filled >= ticket["quantity"] and avg:
+        if filled == ticket["quantity"] and avg:
             return _finalize_exit(conn, kite, ticket, order, filled, avg)
         # Never closed on a figure the broker did not give — least of all
         # the reference price. Stays EXITING; flagged once.
@@ -491,14 +614,25 @@ def _resolve_exit(conn: sqlite3.Connection, kite, ticket: sqlite3.Row, order: di
 
     reason = order.get("status_message") or "no reason given by the broker"
     if filled:
+        # PK-13: the order is over. The shares it sold are sold; the rest of
+        # the position is still held, still protected (its GTT resized to
+        # it) and no longer owned by this exit — a new exit may sell it.
+        fill_time = _fill_time_utc(order)
         if not _claim_pending(conn, ticket, "entry_fill_status = 'partial', filled_price = ?, filled_at = ?",
-                              (avg, _fill_time_utc(order))):
+                              (avg, fill_time)):
             return None
+        position_quantity.record_fill(conn, ticket, filled)
         msg = (f"{ticket['symbol']}: exit order {status.lower()} after a PARTIAL fill ({filled}/{ticket['quantity']}) "
-               f"— {reason}. PARTIAL EXIT, NEEDS REVIEW: the position is NOT closed and nothing is journaled; "
-               f"{ticket['quantity'] - filled} share(s) should still be held. Its protective GTT was left in place "
-               f"but still covers all {ticket['quantity']} — reduce it in Kite. Nothing is resubmitted "
-               f"automatically; this exit keeps the position until a human resolves it.")
+               f"— {reason}. PARTIAL EXIT: {filled} share(s) sold @ {_price(avg)}.")
+        if original_id is not None:
+            held = position_quantity.open_quantity(conn, original_id)
+            sync = position_quantity.sync_protection(conn, kite, original_id,
+                                                     f"exit order {status.lower()} after selling {filled}")
+            msg += (f" {held} share(s) of position #{original_id} remain OPEN and nothing is journaled until it is "
+                    f"flat.{_protection_note(sync, held)} This exit no longer holds the position — exit the "
+                    f"remaining {held} again if needed; nothing is resubmitted automatically.")
+            if held == 0:
+                msg += position_quantity.close_if_flat(conn, kite, original_id, ticket["id"], fill_time).message
         _log_event(conn, ticket["id"], "modified", msg)
         if original_id is not None:
             _log_event(conn, original_id, "modified", msg)
@@ -537,14 +671,18 @@ def _resolve_exit(conn: sqlite3.Connection, kite, ticket: sqlite3.Row, order: di
 
 def _finalize_exit(conn: sqlite3.Connection, kite, ticket: sqlite3.Row, order: dict, filled: int,
                    avg: float) -> dict | None:
-    """The broker filled the exit's full quantity: record the fill, close the
-    position at the fill time, journal it once, then remove its GTT. The
-    compare-and-set on the exit ticket makes this happen exactly once, however
-    many monitor cycles (or processes) see the same COMPLETE order."""
+    """The broker filled the exit's full quantity: record the fill and, if
+    that leaves the position flat, close it at the fill time, journal it
+    once, then remove its GTT. The compare-and-set on the exit ticket makes
+    this happen exactly once, however many monitor cycles (or processes) see
+    the same COMPLETE order. PK-13: a position that still holds shares — its
+    entry filled further after this exit was sized — stays OPEN, its GTT
+    resized to what remains."""
     fill_time = _fill_time_utc(order)
     if not _claim_pending(conn, ticket, "entry_fill_status = 'filled', filled_price = ?, filled_at = ?",
                           (avg, fill_time)):
         return None
+    position_quantity.record_fill(conn, ticket, filled)
     symbol, original_id = ticket["symbol"], ticket["closes_ticket_id"]
     msg = (f"{symbol}: exit FILLED — {ticket['transaction_type']} {filled} @ {_price(avg)} "
            f"(order {ticket['kite_order_id']})")
@@ -555,56 +693,39 @@ def _finalize_exit(conn: sqlite3.Connection, kite, ticket: sqlite3.Row, order: d
         conn.commit()
         return {**base, "severity": "success", "message": msg}
 
+    position = conn.execute("SELECT closed_at FROM trade_tickets WHERE id = ?", (original_id,)).fetchone()
+    if position is not None and position["closed_at"] is not None:
+        msg += f" — position #{original_id} was already marked closed."
+        note, urgent = position_quantity.remove_protective_gtt(conn, kite, ticket["id"], original_id)
+        conn.commit()
+        return {**base, "severity": "urgent" if urgent else "success", "message": msg + note}
+
     # Same transaction as the claim above: the exit is 'filled' exactly when
-    # the position is closed.
-    if journal.close_position_for_exit(conn, ticket["id"], original_id, fill_time):
+    # a flat position is closed (close_if_flat commits both).
+    result = position_quantity.close_if_flat(conn, kite, original_id, ticket["id"], fill_time)
+    if result.closed:
         _log_event(conn, original_id, "closed",
                    f"Exit ticket {ticket['id']}: Kite order {ticket['kite_order_id']} filled {filled} @ {avg}; "
                    f"position closed at the broker fill.")
-        msg += f" — position #{original_id} closed."
-    else:
-        msg += f" — position #{original_id} was already marked closed."
-    note, urgent = _remove_protective_gtt(conn, kite, ticket, original_id)
+        conn.commit()
+        return {**base, "severity": "urgent" if result.urgent else "success",
+                "message": msg + f" — position #{original_id} closed." + result.message}
+
+    held = position_quantity.open_quantity(conn, original_id)
+    protection = ""
+    if held is not None and held > 0:
+        sync = position_quantity.sync_protection(conn, kite, original_id,
+                                                 f"exit order {ticket['kite_order_id']} sold {filled}")
+        protection = _protection_note(sync, held)
+    msg += (f" — position #{original_id} still holds {held} share(s) (its entry filled beyond what this exit was "
+            f"sized for, or is still working), so it stays OPEN and nothing is journaled yet.{protection}"
+            f"{result.message}")
+    _log_event(conn, original_id, "modified", msg)
     conn.commit()
-    return {**base, "severity": "urgent" if urgent else "success", "message": msg + note}
+    return {**base, "severity": "urgent", "message": msg}
 
 
 def _remove_protective_gtt(conn: sqlite3.Connection, kite, exit_ticket: sqlite3.Row,
                            position_id: int) -> tuple[str, bool]:
-    """After the exit has filled, the position's GTT protects nothing: remove
-    it. Returns (note, urgent). A failure never reopens the position — the
-    shares are sold — but an orphaned GTT could fire against nothing, so it
-    is an urgent warning. A GTT that has already triggered may have sold a
-    second time: flagged, nothing deleted, nothing sent."""
-    position = conn.execute("SELECT symbol, kite_gtt_id FROM trade_tickets WHERE id = ?", (position_id,)).fetchone()
-    if position is None or position["kite_gtt_id"] is None:
-        return "", False
-    gtt_id, symbol, order_id = position["kite_gtt_id"], position["symbol"], exit_ticket["kite_order_id"]
-    try:
-        status = next((g.get("status", "active") for g in kite.get_gtts() if g["id"] == gtt_id), "missing")
-    except Exception:
-        status = None  # cannot tell: still try to remove it
-
-    if status == "triggered":
-        detail = (f"POSSIBLE DOUBLE SELL: {symbol} — exit order {order_id} filled, but protective GTT {gtt_id} has "
-                  f"ALSO triggered at Kite and may have sold again. Nothing was deleted or sent. Check Kite's orders "
-                  f"and holdings now.")
-        reconciliation.log_mismatch(conn, position_id, "order_status", expected="protective GTT removed after the exit filled",
-                                    actual=f"GTT {gtt_id} triggered alongside exit order {order_id}", detail=detail)
-        _log_event(conn, position_id, "modified", detail)
-        return f" {detail}", True
-    if status not in ("active", None):
-        return f" Protective GTT {gtt_id} was already {status} at Kite.", False
-    try:
-        kite.delete_gtt(gtt_id)
-    except Exception as e:
-        detail = (f"ORPHANED GTT: {symbol} — exit order {order_id} filled and the position is closed, but removing "
-                  f"its protective GTT {gtt_id} FAILED ({type(e).__name__}: {e}). It could still fire against shares "
-                  f"that are gone — delete it in Kite NOW.")
-        reconciliation.log_mismatch(conn, position_id, "order_status", expected=f"GTT {gtt_id} removed",
-                                    actual=f"GTT {gtt_id} delete failed after exit fill", detail=detail)
-        _log_event(conn, position_id, "modified", detail)
-        return f" {detail}", True
-    conn.execute("UPDATE trade_tickets SET kite_gtt_id = NULL WHERE id = ?", (position_id,))
-    _log_event(conn, position_id, "modified", f"Protective GTT {gtt_id} removed after exit order {order_id} filled.")
-    return f" Protective GTT {gtt_id} removed.", False
+    # Moved to position_quantity (PK-13); kept for existing callers.
+    return position_quantity.remove_protective_gtt(conn, kite, exit_ticket["id"], position_id)

@@ -5,7 +5,7 @@ from datetime import datetime
 
 import numpy as np
 
-from backend import execution, risk_engine
+from backend import execution, position_quantity, risk_engine
 
 logger = logging.getLogger(__name__)
 
@@ -75,13 +75,35 @@ def record_closed_trade(conn: sqlite3.Connection, sell_ticket_id: int) -> int | 
             f"Mode mismatch closing ticket {buy['id']}: buy mode={buy['mode']!r}, sell mode={sell['mode']!r} "
             f"— refusing to silently pick one."
         )
+    # PK-13: one row per ROUND TRIP, written once the position is flat —
+    # never while shares remain (a partial exit is not a closed trade).
+    if buy["closed_at"] is None:
+        raise ValueError(f"Position {buy['id']} is still open — no closed trade to record yet")
+    if conn.execute("SELECT id FROM closed_trades WHERE buy_ticket_id = ?", (buy["id"],)).fetchone() is not None:
+        return None
 
     # The broker's actual fills, as order_monitor.py recorded them before
     # calling this (PK-8: a live exit is only journaled once filled); the
     # tickets' reference prices only for a dry run or a pre-fill-tracking row.
     entry_price = buy["filled_price"] or buy["entry_price"]
-    exit_price = sell["filled_price"] or sell["entry_price"]
-    quantity = buy["quantity"]
+    # PK-13: the quantity actually bought, and every exit that sold part of
+    # it — a position sold in pieces (a partial exit, then another; a GTT
+    # that part-filled) is one trade at the quantity-weighted average exit.
+    bought = position_quantity.filled(buy)
+    legs = []
+    for leg in conn.execute(
+        "SELECT * FROM trade_tickets WHERE closes_ticket_id = ? AND status = 'executed' ORDER BY id", (buy["id"],)
+    ).fetchall():
+        sold = position_quantity.filled(leg)
+        if sold is None:
+            raise ValueError(f"Exit ticket {leg['id']} of position {buy['id']} has an unknown filled quantity")
+        if sold:
+            legs.append((sold, leg["filled_price"] or leg["entry_price"]))
+    quantity = sum(q for q, _ in legs)
+    if bought is None or quantity != bought:
+        raise ValueError(f"Position {buy['id']} bought {bought} but its exits sold {quantity} — "
+                         f"refusing to journal a mismatched round trip")
+    exit_price = legs[0][1] if len(legs) == 1 else sum(q * p for q, p in legs) / quantity
     # Long-only today: every closes_ticket_id currently links a SELL exit to
     # a BUY entry (Phase 5's exit scanner only ever closes BUY positions).
     # This still branches on buy's transaction_type so a future short-closing
@@ -91,7 +113,11 @@ def record_closed_trade(conn: sqlite3.Connection, sell_ticket_id: int) -> int | 
     else:
         realized_pnl = (entry_price - exit_price) * quantity
     realized_pnl_pct = (realized_pnl / (entry_price * quantity) * 100) if entry_price and quantity else 0.0
+    # The ticket's risk_amount was sized for the requested quantity; the
+    # trade only ever risked what actually filled.
     risk_amount = buy["risk_amount"]
+    if risk_amount and quantity != buy["quantity"]:
+        risk_amount = risk_amount * quantity / buy["quantity"]
     r_multiple_realized = (realized_pnl / risk_amount) if risk_amount else None
 
     entry_date = (buy["executed_at"] or buy["created_at"])[:10]
@@ -184,13 +210,19 @@ def backfill_closed_trades(conn: sqlite3.Connection) -> int:
     existed (or any that somehow got missed). Safe to call on every
     startup — record_closed_trade is idempotent per sell_ticket_id. Only
     exits whose fill is proven: an EXITING exit found at startup is left to
-    order_monitor, which journals it when the broker reports the fill (PK-8)."""
+    order_monitor, which journals it when the broker reports the fill (PK-8).
+    Only positions that are closed, once each (PK-13): a filled exit that
+    sold part of a position still holding shares is not a closed trade; of
+    several exits of one closed position, the last is its closing exit."""
     rows = conn.execute(
         f"""
         SELECT id FROM trade_tickets
         WHERE transaction_type = 'SELL' AND closes_ticket_id IS NOT NULL AND status = 'executed'
           AND {execution.EXIT_FILL_PROVEN_SQL}
+          AND closes_ticket_id IN (SELECT id FROM trade_tickets WHERE closed_at IS NOT NULL)
           AND id NOT IN (SELECT sell_ticket_id FROM closed_trades)
+          AND closes_ticket_id NOT IN (SELECT buy_ticket_id FROM closed_trades)
+        ORDER BY id DESC
         """
     ).fetchall()
     count = 0

@@ -2065,11 +2065,22 @@ function statusBadgeHtml(status, ticket = null) {
   if (ticket && ticket.exit_state === "exiting") {
     return `<span class="status-badge exiting" title="Exit order placed with the broker but not filled. The position stays open and keeps its protective GTT until Kite reports the fill.">EXITING · awaiting fill</span>`;
   }
-  if (ticket && ["exit_partial", "exit_unconfirmed"].includes(ticket.exit_state)) {
-    return `<span class="status-badge submission_unknown" title="The exit did not fill completely (or its fill could not be confirmed). The position is NOT closed — check Kite. Nothing will be resubmitted.">PARTIAL EXIT — NEEDS REVIEW</span>`;
+  // PK-13: an exit that ended after selling only part of the position.
+  if (ticket && ticket.exit_state === "exit_partial") {
+    const sold = ticket.filled_quantity ?? "?";
+    return `<span class="status-badge submission_unknown" title="The exit order ended after a partial fill. Those shares are sold; the rest of the position is still OPEN and protected, and can be exited again. Nothing will be resubmitted automatically.">PARTIAL EXIT · ${esc(sold)}/${esc(ticket.quantity)} sold</span>`;
+  }
+  if (ticket && ticket.exit_state === "exit_unconfirmed") {
+    return `<span class="status-badge submission_unknown" title="The exit's fill could not be confirmed. The position is NOT closed — check Kite. Nothing will be resubmitted.">EXIT UNCONFIRMED — NEEDS REVIEW</span>`;
+  }
+  if (ticket && status === "executed" && ticket.entry_fill_status === "pending" && ticket.filled_quantity > 0) {
+    return `<span class="status-badge exiting" title="The order is still working at the broker and has filled part of its quantity. The position holds only the filled shares; its protective GTT covers exactly those.">PARTIAL FILL · ${esc(ticket.filled_quantity)}/${esc(ticket.quantity)} · working</span>`;
   }
   if (ticket && status === "executed" && ticket.entry_fill_status === "pending") {
     return `<span class="status-badge awaiting_fill" title="Order placed with the broker — waiting for the fill">placed · awaiting fill</span>`;
+  }
+  if (ticket && status === "executed" && ticket.entry_fill_status === "partial" && ticket.closes_ticket_id == null) {
+    return `<span class="status-badge exiting" title="The order ended after a partial fill. The position is the filled shares only; the rest will not be bought.">PARTIAL FILL · ${esc(ticket.filled_quantity ?? "?")}/${esc(ticket.quantity)}</span>`;
   }
   const label = STATUS_LABELS[status] || status.replace(/_/g, " ");
   return `<span class="status-badge ${esc(status)}">${esc(label)}</span>`;
@@ -2080,13 +2091,29 @@ function trailingChipHtml(t) {
   return t.trailing_active ? `<span class="chip ok">active</span>` : `<span class="chip warn">armed</span>`;
 }
 
+// PK-13: the requested quantity alone is not the position. Shown only when
+// it differs: "Req 100 · Filled 40 · Open 40" for a position, "Exit 40 ·
+// Filled 15 · Remaining 25" for an exit.
+function quantityCellHtml(t) {
+  const qty = fmt(t.quantity, 0);
+  if (t.status !== "executed" || t.filled_quantity == null) return qty;
+  if (t.open_quantity !== undefined && t.open_quantity !== null && t.closes_ticket_id == null && !t.closed_at) {
+    if (t.filled_quantity === t.quantity && t.open_quantity === t.quantity) return qty;
+    return `${qty}<div class="badge-muted" title="Requested · broker-filled · still held">Req ${esc(t.quantity)} · Filled ${esc(t.filled_quantity)} · Open ${esc(t.open_quantity)}</div>`;
+  }
+  if (t.remaining_quantity != null && t.filled_quantity !== t.quantity && t.exit_state) {
+    return `${qty}<div class="badge-muted" title="Exit requested · filled · not sold">Exit ${esc(t.quantity)} · Filled ${esc(t.filled_quantity)} · Remaining ${esc(t.remaining_quantity)}</div>`;
+  }
+  return qty;
+}
+
 function ticketRowHtml(t) {
   const strategyTag = t.source === "strategy" && t.strategy_name
     ? ` <span class="badge-muted">${esc(strategyLabel(t.strategy_name.replace(/_exit$/, "")))}</span>` : "";
   return `
     <td>${esc(t.symbol)}${strategyTag}</td>
     <td>${sideHtml(t.transaction_type)}</td>
-    <td class="num">${fmt(t.quantity, 0)}</td>
+    <td class="num">${quantityCellHtml(t)}</td>
     <td class="num">${fmt(t.entry_price)}</td>
     <td class="num">${fmt(t.current_stop_loss ?? t.stop_loss)}</td>
     <td class="num">${fmt(t.target_1)}</td>
@@ -2124,7 +2151,9 @@ function renderTicketsTable(tickets = state.tickets, bodyEl = el.ticketsBody) {
     }
     if ((t.status === "executed" && t.mode === "live" && !t.kite_gtt_id && !t.closed_at
         && t.closes_ticket_id == null && t.use_gtt) || isSubmissionUnresolved(t)
-        || ["exit_partial", "exit_unconfirmed"].includes(t.exit_state)) {
+        || ["exit_partial", "exit_unconfirmed"].includes(t.exit_state)
+        || (t.status === "executed" && t.closes_ticket_id == null && !t.closed_at
+            && t.filled_quantity != null && t.filled_quantity !== t.quantity)) {
       tr.classList.add("row-flagged");
     }
     if (t.archived) {
@@ -2390,8 +2419,8 @@ el.emergencyExitAllBtn.addEventListener("click", async () => {
     el.emergencyExitPreviewBody.innerHTML = positions.length
       ? positions.map((p) => `
           <tr>
-            <td>${esc(p.symbol)}${p.entry_fill_status === "pending" ? ' <span class="badge-muted">unfilled — order will be cancelled</span>' : ""}</td>
-            <td class="num">${fmt(p.quantity, 0)}</td>
+            <td>${esc(p.symbol)}${p.entry_fill_status === "pending" ? ' <span class="badge-muted">order still working — the unfilled rest will be cancelled</span>' : ""}</td>
+            <td class="num" title="Sells what is actually held (broker-filled, less any shares already sold)">${fmt(p.open_quantity ?? 0, 0)}${p.open_quantity !== p.quantity ? `<div class="badge-muted">of ${esc(p.quantity)} ordered</div>` : ""}</td>
             <td class="num">${fmt(p.entry_price)}</td><td class="num">${fmt(p.current_stop_loss ?? p.stop_loss)}</td>
             <td>${esc(strategyLabel(p.strategy_name) || "Manual")}</td>
           </tr>
