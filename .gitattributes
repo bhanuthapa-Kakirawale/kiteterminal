@@ -1,0 +1,5 @@
+# Vendored third-party files are served byte-for-byte and pinned by SRI hashes
+# in frontend/index.html; any line-ending conversion on checkout would change
+# their hash and the browser would refuse to run them.
+frontend/vendor/*.js -text
+frontend/vendor/*.txt -text

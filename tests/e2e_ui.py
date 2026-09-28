@@ -77,19 +77,23 @@ def main() -> None:
         page.wait_for_selector(".toast.success", timeout=15000)
         check("approval reports its outcome in a toast", symbol in page.inner_text(".toast.success"),
               page.inner_text(".toast.success"))
+        # Predicates are arrow functions, not bare expressions: Playwright
+        # eval()s a bare expression inside the page, which the terminal's
+        # CSP (script-src 'self', no 'unsafe-eval') rightly refuses.
         page.wait_for_function(
-            f"document.querySelectorAll('#ap-entries .approval-card').length === {entries - 1}", timeout=15000)
+            f"() => document.querySelectorAll('#ap-entries .approval-card').length === {entries - 1}", timeout=15000)
         check("approved signal leaves the inbox", True)
 
         page.locator('#ap-entries button[data-action="reject"]').first.click()
         page.wait_for_function(
-            f"document.querySelectorAll('#ap-entries .approval-card').length === {entries - 2}", timeout=15000)
+            f"() => document.querySelectorAll('#ap-entries .approval-card').length === {entries - 2}", timeout=15000)
         check("rejected signal leaves the inbox", True)
 
         page.locator('#ap-adjustments button[data-action="approve-adj"]').click()
         page.wait_for_selector("#app-confirm-dialog[open]")
         page.click("#app-confirm-ok")
-        page.wait_for_function("document.querySelectorAll('#ap-adjustments .approval-card').length === 0", timeout=15000)
+        page.wait_for_function("() => document.querySelectorAll('#ap-adjustments .approval-card').length === 0",
+                               timeout=15000)
         check("stop adjustment approved from the inbox", True)
 
         # ---- Signal Detail view ----------------------------------------
@@ -97,7 +101,7 @@ def main() -> None:
         detail_symbol = detail_card.locator(".ac-symbol").inner_text()
         detail_card.locator('button[data-action="chart"]').click()
         page.wait_for_selector("#signal-detail:not([hidden])", timeout=15000)
-        page.wait_for_function("document.querySelectorAll('#sd-chart canvas').length > 0", timeout=15000)
+        page.wait_for_function("() => document.querySelectorAll('#sd-chart canvas').length > 0", timeout=15000)
         page.wait_for_timeout(1200)
         check("signal detail opens from an approvals card", detail_symbol in page.inner_text("#sd-symbol"),
               page.inner_text("#sd-symbol"))
@@ -192,7 +196,8 @@ def main() -> None:
         nav("strategies")
         check("strategy description shown", len(page.inner_text("#strategy-info")) > 40)
         page.click("#scan-now-btn")
-        page.wait_for_function("document.querySelector('#scan-now-result').innerText.includes('evaluated')", timeout=30000)
+        page.wait_for_function("() => document.querySelector('#scan-now-result').innerText.includes('evaluated')",
+                               timeout=30000)
         check("scan summary explains what was evaluated", True, page.inner_text("#scan-now-result"))
         page.screenshot(path=str(out / "08-strategies.png"))
 

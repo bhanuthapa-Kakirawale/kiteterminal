@@ -4524,7 +4524,7 @@ function sdBuildChart() {
   if (!window.LightweightCharts) {
     el.sdChartNote.hidden = false;
     el.sdChartNote.textContent =
-      "The charting library could not be loaded from its CDN, so the chart cannot be drawn. "
+      "The charting library (/static/vendor/) could not be loaded, so the chart cannot be drawn. "
       + "The evidence panel on the right is served by this app and is unaffected.";
     return;
   }

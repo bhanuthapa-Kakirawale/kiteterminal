@@ -1,11 +1,16 @@
+import logging
 from datetime import datetime, timedelta, timezone
 
+from cryptography.fernet import InvalidToken
 from fastapi import Depends, HTTPException
 from kiteconnect import KiteConnect
 
 from backend import crypto
 from backend.accounts import get_account, get_default_account, get_trading_account
 from backend.db import get_connection
+from backend.redaction import register_secret
+
+logger = logging.getLogger(__name__)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -19,7 +24,25 @@ def _api_key(account) -> str:
 
 
 def _api_secret_decrypted(account) -> str:
-    return crypto.decrypt(account["api_secret_enc"])
+    secret = crypto.decrypt(account["api_secret_enc"])
+    register_secret(secret)
+    return secret
+
+
+def _access_token_decrypted(account) -> str | None:
+    """The account's Kite access token. It is stored only Fernet-encrypted in
+    accounts.access_token_enc (PK-18); sessions.access_token is always ''."""
+    ciphertext = account["access_token_enc"]
+    if not ciphertext:
+        return None
+    try:
+        token = crypto.decrypt(ciphertext)
+    except InvalidToken:
+        logger.warning("Stored access token for account %s cannot be decrypted; a fresh login is needed",
+                       account["id"])
+        return None
+    register_secret(token)
+    return token
 
 
 def _resolve_account(account_id: int | None):
@@ -37,7 +60,9 @@ def build_login_url(account_id: int | None = None) -> str:
 def exchange_request_token(request_token: str, account_id: int | None = None) -> dict:
     account = _resolve_account(account_id)
     kite = KiteConnect(api_key=_api_key(account))
+    register_secret(request_token)
     data = kite.generate_session(request_token, api_secret=_api_secret_decrypted(account))
+    register_secret(data["access_token"])
 
     login_time = datetime.now(IST).isoformat()
 
@@ -47,13 +72,14 @@ def exchange_request_token(request_token: str, account_id: int | None = None) ->
             "UPDATE sessions SET is_active = 0 WHERE is_active = 1 AND account_id = ?",
             (account["id"],),
         )
+        # The token itself is stored only encrypted, on the account row below;
+        # the session row keeps '' in its legacy NOT NULL column.
         conn.execute(
             """
             INSERT INTO sessions (access_token, public_token, user_id, user_name, login_time, account_id)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES ('', ?, ?, ?, ?, ?)
             """,
             (
-                data["access_token"],
                 data.get("public_token"),
                 data.get("user_id"),
                 data.get("user_name"),
@@ -102,8 +128,11 @@ def get_kite(account_id: int | None = None) -> KiteConnect:
     row = get_active_session(account["id"])
     if not is_session_fresh(row):
         raise NoActiveSessionError()
+    token = _access_token_decrypted(account)
+    if not token:
+        raise NoActiveSessionError()
     kite = KiteConnect(api_key=_api_key(account))
-    kite.set_access_token(row["access_token"])
+    kite.set_access_token(token)
     return kite
 
 

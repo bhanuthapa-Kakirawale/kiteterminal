@@ -1520,6 +1520,30 @@ def _ensure_watchlist_panels(conn: sqlite3.Connection) -> None:
         )
 
 
+def _scrub_plaintext_session_tokens(conn: sqlite3.Connection) -> None:
+    """PK-18 (audit P1-12): the Kite access token lives only encrypted, in
+    accounts.access_token_enc. sessions.access_token used to hold a plaintext
+    copy, which get_kite() read, so the encryption protected nothing.
+
+    Before blanking the column, an account whose encrypted token is missing
+    gets it from its newest active session, so someone who logged in today
+    stays logged in. Idempotent: a second run finds nothing to copy or blank.
+    """
+    rows = conn.execute(
+        """
+        SELECT s.account_id, s.access_token FROM sessions s JOIN accounts a ON a.id = s.account_id
+        WHERE s.is_active = 1 AND s.access_token != '' AND a.access_token_enc IS NULL
+        ORDER BY s.id DESC
+        """
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE accounts SET access_token_enc = ? WHERE id = ? AND access_token_enc IS NULL",
+            (crypto.encrypt(row["access_token"]), row["account_id"]),
+        )
+    conn.execute("UPDATE sessions SET access_token = '' WHERE access_token != ''")
+
+
 def init_db() -> None:
     crypto.ensure_encryption_key()
     conn = get_connection()
@@ -1566,6 +1590,7 @@ def init_db() -> None:
         _seed_strategy_configs(conn)
         _ensure_todays_actions_panel(conn)
         _seed_strategy_config_versions(conn)
+        _scrub_plaintext_session_tokens(conn)
         conn.commit()
 
         # Backfill runs after all schema/seed steps have committed, in its

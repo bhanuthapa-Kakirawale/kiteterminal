@@ -1,10 +1,33 @@
+# Secrets and local configuration. Only the placeholder template is tracked.
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
 .venv/
 __pycache__/
 *.pyc
+
+# Runtime database and every backup/snapshot of it: they hold trade history,
+# the encrypted API secret and (in pre-PK-18 copies) plaintext session tokens.
 backend/kite_terminal.db
 backend/kite_terminal.db-*
 backend/kite_terminal.db.bak
 backend/kite_terminal*.bak
 backend/kite_terminal*_bak
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.bak
+*_bak
+
 backend/ui_prefs.json
+
+# Captured live broker payloads (debugging) must never be committed.
+captures/
+*.har

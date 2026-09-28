@@ -241,7 +241,10 @@ def test_e_loopback_origins_are_accepted(env, base, origin):
     ("http://127.0.0.1:8000", "not a url"),
     ("http://127.0.0.1:8000", "http://192.168.1.10:8000"),   # LAN address, not loopback
     ("http://127.0.0.1:8000", "http://127.0.0.1.evil.example:8000"),
-    ("http://evil.example:8000", "http://evil.example:8000"),  # DNS rebinding: Origin == Host but foreign
+    # The DNS-rebinding request (Host and Origin both evil.example:8000) is
+    # now refused earlier, with INVALID_HOST, by the PK-18 Host guard; see
+    # test_security_hardening.py. The Origin layer's own verdict on it stays
+    # covered by test_e_is_terminal_origin below.
 ])
 def test_e_non_terminal_origins_are_rejected(env, base, origin):
     r = _bare(base).post("/api/ui-prefs", json={"theme": "dark"}, headers={**APP_HEADER, "Origin": origin})
@@ -257,6 +260,7 @@ def test_e_non_terminal_origins_are_rejected(env, base, origin):
     ("http://127.0.0.1:8443", "wss", "127.0.0.1:8443", False),
     ("http://127.0.0.1:8000", "http", "", False),              # no Host header: nothing to match
     ("http://127.0.0.1:99999", "http", "127.0.0.1:8000", False),
+    ("http://evil.example:8000", "http", "evil.example:8000", False),  # DNS rebinding: Origin == Host but foreign
 ])
 def test_e_is_terminal_origin(origin, scheme, host, expected):
     from backend.security import is_terminal_origin

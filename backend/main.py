@@ -11,9 +11,17 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
+from backend.redaction import install_log_redaction, redact_detail
+
+# Before anything can log a token: uvicorn's access log alone would print
+# /callback?request_token=... (PK-18).
+install_log_redaction()
+
 from fastapi import FastAPI
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import (
     automation,
@@ -25,9 +33,10 @@ from backend import (
     sector_mapping,
     trailing_engine,
 )
+from backend import server
 from backend.accounts import get_default_account
 from backend.db import init_db
-from backend.security import TerminalOriginGuard
+from backend.security import SecurityHeadersMiddleware, TerminalOriginGuard, TrustedHostGuard
 from backend.routes import (
     account_safety as account_safety_routes,
     auth,
@@ -53,7 +62,19 @@ logger = logging.getLogger(__name__)
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
-app = FastAPI(title="Kite Terminal")
+# No Swagger/ReDoc pages: they load their JavaScript from a public CDN, which
+# the Content-Security-Policy forbids (PK-18).
+app = FastAPI(title="Kite Terminal", docs_url=None, redoc_url=None)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def redacting_http_exception_handler(request, exc):
+    # Many error details quote a broker exception's text; none may carry a
+    # credential to the browser (PK-18). Unhandled exceptions never get here:
+    # they become a bare "Internal Server Error" with the traceback only in
+    # the (redacted) server log.
+    exc.detail = redact_detail(exc.detail)
+    return await http_exception_handler(request, exc)
 
 _BACKGROUND_LOOPS = {
     "trailing_task": trailing_engine.run_trailing_loop,
@@ -66,6 +87,10 @@ _BACKGROUND_LOOPS = {
 
 @app.on_event("startup")
 async def on_startup():
+    # First: an unsafe bind or worker count aborts startup before any
+    # background loop or broker session can start (PK-18).
+    install_log_redaction()  # again, in case the server replaced its handlers
+    server.enforce_runtime_policy()
     init_db()
     # PK-14: every watched/traded symbol gets its static sector before any
     # risk check runs — no Kite session needed. Never overwrites a manual one.
@@ -120,8 +145,13 @@ app.include_router(reconciliation_routes.router)
 app.include_router(automation_routes.router)
 app.include_router(account_safety_routes.router)
 
-# Rejects cross-origin writes and WebSocket handshakes before routing (P0-8).
+# Registered innermost first; each add_middleware wraps the previous, so a
+# request meets them in reverse order: security headers, then the Host check
+# (DNS rebinding, reads and writes, PK-18), then the cross-origin write and
+# WebSocket check (P0-8). All three answer before routing.
 app.add_middleware(TerminalOriginGuard)
+app.add_middleware(TrustedHostGuard)
+app.add_middleware(SecurityHeadersMiddleware)
 
 # Frontend is served same-origin from this app, so no CORS middleware is needed.
 # Its absence is part of the P0-8 defence: a cross-origin preflight for the

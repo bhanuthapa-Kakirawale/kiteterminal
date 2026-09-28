@@ -18,7 +18,7 @@ Zerodha.
 
 1. **Get Kite Connect API credentials** from the Kite Connect developer
    console (developers.kite.trade) — you need an API key and API secret.
-2. **Create a `.env` file** in the project root with:
+2. **Create a `.env` file** in the project root (copy `.env.example`) with:
    ```
    KITE_API_KEY=your_api_key
    KITE_API_SECRET=your_api_secret
@@ -35,9 +35,19 @@ Zerodha.
 4. **Start the server** from the project root:
    ```
    .venv\Scripts\activate
-   uvicorn backend.main:app --reload
+   python -m backend.server
    ```
-5. **Open the app** at `http://127.0.0.1:8000` (or whatever port you chose).
+   This binds to `127.0.0.1:8000` only, with auto-reload off and a single
+   worker. `--port 8001` picks another port. Do **not** use `--reload` or
+   `--workers` for real use: reload restarts the server whenever a file is
+   saved, which can land between an order and its protective stop, and a
+   second worker would run a second copy of every background loop. Reaching
+   the terminal from another machine (e.g. a cloud VM) is covered in
+   [DEPLOYMENT.md](DEPLOYMENT.md). It needs explicit settings, and the terminal
+   must never be exposed to the public internet.
+5. **Open the app** at `http://127.0.0.1:8000` or `http://localhost:8000`
+   (with your port). Other addresses are refused with `INVALID_HOST` unless
+   configured (see DEPLOYMENT.md).
 6. **Log in**: click Login, which redirects to Zerodha's Kite login page.
    After you authenticate, Kite redirects back to the app and your session
    is active. **You must log in again every trading day** — Kite Connect

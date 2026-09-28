@@ -192,7 +192,9 @@ settings, or execution code.
 
 ### 2.1 Environment sanity
 
-- [ ] App starts cleanly (`uvicorn backend.main:app`) with no startup errors.
+- [ ] App starts cleanly (`python -m backend.server`) with no startup errors,
+      and the startup log's `Security summary:` line shows `bind=127.0.0.1`,
+      `remote_exposure=no`, `reload=no`, `workers=1`.
 - [ ] Login flow completes and the session status shows active.
 - [ ] Instrument cache refreshes without error.
 - [ ] Watchlist and holdings both appear in the strategy scan universe.
