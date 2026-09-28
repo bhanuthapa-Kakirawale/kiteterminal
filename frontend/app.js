@@ -39,6 +39,14 @@ async function fetchJsonMutate(url, method, body) {
   return parsed.data;
 }
 
+// PK-16: reconciliation findings about a protective GTT, either direction
+// (app -> Kite and Kite -> app), get the structured Protection / GTT table;
+// everything else (and every row written before PK-16) keeps the plain list.
+const RECONCILIATION_GTT_CODES = new Set([
+  "ORPHAN_GTT", "GTT_ON_CLOSED_POSITION", "GTT_QUANTITY_TOO_HIGH", "GTT_QUANTITY_TOO_LOW", "GTT_MISSING",
+  "GTT_PRICE_MISMATCH", "MULTIPLE_ACTIVE_GTTS", "UNLINKED_POSSIBLE_GTT", "AMBIGUOUS_GTT_OWNERSHIP",
+]);
+
 const API = {
   status: () => fetch("/api/session/status").then((r) => r.json()),
   config: () => fetch("/api/config").then((r) => r.json()),
@@ -140,6 +148,7 @@ const API = {
   // Phase 8: reconciliation
   listMismatches: (resolved) => fetchJson(`/api/reconciliation/mismatches?resolved=${resolved ? "true" : "false"}`),
   markMismatchReviewed: (id) => fetchJsonMutate(`/api/reconciliation/${id}/mark-reviewed`, "POST"),
+  reconciliationStatus: () => fetchJson("/api/reconciliation/status"),
 
   // Phase 8: strategy versioning
   getStrategyVersions: (strategyName) => fetchJson(`/api/strategies/${encodeURIComponent(strategyName)}/versions`),
@@ -365,6 +374,10 @@ const el = {
 
   // Phase 8: reconciliation
   reconciliationList: document.getElementById("reconciliation-list"),
+  // PK-16: the Kite -> app protection view
+  reconciliationStatus: document.getElementById("reconciliation-status"),
+  reconciliationGtt: document.getElementById("reconciliation-gtt"),
+  reconciliationGttBody: document.querySelector("#reconciliation-gtt-table tbody"),
 
   // Phase 8: strategy versioning / last-disabled
   strategyLastDisabled: document.getElementById("strategy-last-disabled"),
@@ -503,6 +516,7 @@ const state = {
 
   // Phase 8: reconciliation
   reconciliationMismatches: [],
+  reconciliationStatus: null,
 
   // Approvals inbox / autopilot
   automationStatus: null,
@@ -825,9 +839,9 @@ function evaluateAlerts(view, totalValue, dayPnl, margins, sessionStatus) {
   for (const m of state.reconciliationMismatches || []) {
     alerts.push({
       id: `reconciliation-${m.id}`,
-      severity: "urgent",
+      severity: m.severity === "warning" ? "warning" : "urgent",
       message: m.detail,
-      scrollTargetSelector: "#reconciliation-list",
+      scrollTargetSelector: RECONCILIATION_GTT_CODES.has(m.issue_code) ? "#reconciliation-gtt" : "#reconciliation-list",
     });
   }
 
@@ -2480,21 +2494,84 @@ function reconciliationItemHtml(m) {
   `;
 }
 
+function reconciliationQty(value) {
+  return value == null ? "—" : esc(String(value));
+}
+
+function reconciliationGttRowHtml(m) {
+  const issue = (m.issue_code || "").replaceAll("_", " ");
+  return `
+    <tr title="${esc(m.detail)}">
+      <td>${esc(m.symbol || "—")}</td>
+      <td><strong>${esc(issue)}</strong><div class="reconciliation-detail">${esc(m.detail)}</div></td>
+      <td class="num">${reconciliationQty(m.expected_quantity)}</td>
+      <td class="num">${reconciliationQty(m.broker_quantity)}</td>
+      <td>${m.gtt_id == null ? "—" : esc(String(m.gtt_id))}</td>
+      <td>${esc(m.position_state || "—")}</td>
+      <td><span class="chip ${m.severity === "warning" ? "warn" : "live"}">${esc(m.severity || "urgent")}</span></td>
+      <td>${esc(m.suggested_action || "CHECK KITE")}</td>
+      <td><button class="btn btn-small" data-action="mark-reviewed" data-id="${m.id}">Mark Reviewed</button></td>
+    </tr>
+  `;
+}
+
+function renderReconciliationStatus() {
+  const s = state.reconciliationStatus;
+  if (!s || !s.checked_at) {
+    el.reconciliationStatus.textContent = "";
+    return;
+  }
+  const at = new Date(`${s.checked_at.replace(" ", "T")}Z`).toLocaleTimeString();
+  const parts = [];
+  if (s.gtt_book === "unavailable") {
+    parts.push(`GTT book UNAVAILABLE at ${at} — GTT checks did not run (${s.gtt_error || "unknown error"})`);
+  } else if (s.gtt_book === "ok") {
+    parts.push(`GTT book checked at ${at}: ${s.active_gtts} active GTT(s)`);
+  }
+  if (s.holdings === "unavailable") {
+    parts.push(`holdings UNAVAILABLE — shortfall check did not run (${s.holdings_error || "unknown error"})`);
+  }
+  el.reconciliationStatus.textContent = parts.join(" · ");
+  el.reconciliationStatus.classList.toggle("unavailable", s.gtt_book === "unavailable" || s.holdings === "unavailable");
+}
+
 function renderReconciliationList() {
-  el.reconciliationList.innerHTML = state.reconciliationMismatches.length
-    ? state.reconciliationMismatches.map(reconciliationItemHtml).join("")
-    : `<div class="empty-row">No unresolved mismatches</div>`;
+  const all = state.reconciliationMismatches;
+  const gtt = all.filter((m) => RECONCILIATION_GTT_CODES.has(m.issue_code));
+  const rest = all.filter((m) => !RECONCILIATION_GTT_CODES.has(m.issue_code));
+  el.reconciliationGtt.hidden = gtt.length === 0;
+  el.reconciliationGttBody.innerHTML = gtt.map(reconciliationGttRowHtml).join("");
+  el.reconciliationList.innerHTML = rest.length
+    ? rest.map(reconciliationItemHtml).join("")
+    : gtt.length ? "" : `<div class="empty-row">No unresolved mismatches</div>`;
+  renderReconciliationStatus();
 }
 
 async function loadReconciliationMismatches() {
   try {
-    state.reconciliationMismatches = await API.listMismatches(false);
+    const [rows, status] = await Promise.all([
+      API.listMismatches(false),
+      API.reconciliationStatus().catch(() => state.reconciliationStatus),
+    ]);
+    state.reconciliationMismatches = rows;
+    state.reconciliationStatus = status;
     renderReconciliationList();
     renderAll();
   } catch (e) {
     // leave prior state visible on a transient load failure
   }
 }
+
+el.reconciliationGtt.addEventListener("click", async (event) => {
+  const btn = event.target.closest('button[data-action="mark-reviewed"]');
+  if (!btn) return;
+  try {
+    await API.markMismatchReviewed(btn.dataset.id);
+    await loadReconciliationMismatches();
+  } catch (e) {
+    toast(e.message, { type: "error" });
+  }
+});
 
 el.reconciliationList.addEventListener("click", async (event) => {
   const btn = event.target.closest('button[data-action="mark-reviewed"]');

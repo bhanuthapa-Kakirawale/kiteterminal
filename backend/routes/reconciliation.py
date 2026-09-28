@@ -1,10 +1,19 @@
 from fastapi import APIRouter, Depends, HTTPException
 from kiteconnect import KiteConnect
 
+from backend import reconciliation
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
 
 router = APIRouter()
+
+
+@router.get("/api/reconciliation/status")
+def reconciliation_status(kite: KiteConnect = Depends(require_trading_account)):
+    """PK-16: what the last reconciliation cycle could read — so an
+    unreadable GTT book or holdings list is shown as "not checked", never
+    mistaken for "nothing wrong"."""
+    return {"data": reconciliation.cycle_status()}
 
 
 @router.get("/api/reconciliation/mismatches")

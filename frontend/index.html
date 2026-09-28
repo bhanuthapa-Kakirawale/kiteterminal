@@ -1140,6 +1140,22 @@
 
       <details class="table-section" open>
         <summary><h2>Reconciliation <span class="badge-muted">broker state vs. app state</span></h2></summary>
+        <div id="reconciliation-status" class="reconciliation-status"></div>
+        <div id="reconciliation-gtt" class="reconciliation-gtt" hidden>
+          <h3>Protection / GTT <span class="badge-muted">every active Kite GTT vs. the app's open positions</span></h3>
+          <div class="table-wrap">
+            <table id="reconciliation-gtt-table">
+              <thead>
+                <tr>
+                  <th>Symbol</th><th>Issue</th><th class="num">Expected qty</th><th class="num">Broker GTT qty</th>
+                  <th>GTT id</th><th>Position state</th><th>Severity</th><th>Suggested action</th><th></th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p class="reconciliation-note">Nothing here is cancelled or relinked automatically. Cancel a GTT in Kite, or in Orders &amp; Trades → GTTs.</p>
+        </div>
         <div id="reconciliation-list"></div>
       </details>
     </div>

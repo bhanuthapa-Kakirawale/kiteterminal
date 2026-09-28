@@ -1438,6 +1438,32 @@ def _ensure_instrument_tick_size_column(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE instrument_cache ADD COLUMN tick_size REAL")
 
 
+_RECONCILIATION_ISSUE_COLUMNS = [
+    ("issue_code", "TEXT"),
+    ("severity", "TEXT"),
+    ("symbol", "TEXT"),
+    ("gtt_id", "INTEGER"),
+    ("expected_quantity", "INTEGER"),
+    ("broker_quantity", "INTEGER"),
+    ("position_state", "TEXT"),
+    ("suggested_action", "TEXT"),
+]
+
+
+def _ensure_reconciliation_issue_columns(conn: sqlite3.Connection) -> None:
+    # PK-16: structured findings (ORPHAN_GTT, GTT_QUANTITY_TOO_HIGH, ...)
+    # alongside the free-text detail. check_type keeps its two-value CHECK
+    # (the broad order/position side); issue_code carries the specific
+    # finding, so no table rebuild is needed. All nullable: rows written
+    # before PK-16 keep NULLs and the UI falls back to their detail text.
+    for column, sql_type in _RECONCILIATION_ISSUE_COLUMNS:
+        if not _column_exists(conn, "reconciliation_log", column):
+            conn.execute(f"ALTER TABLE reconciliation_log ADD COLUMN {column} {sql_type}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reconciliation_log_issue ON reconciliation_log(issue_code, gtt_id)"
+    )
+
+
 def _ensure_watchlist_tag_column(conn: sqlite3.Connection) -> None:
     # Short free-text categorical label, separate from `notes` (free-form
     # commentary) — used only for the Watchlist's optional "group by tag"
@@ -1527,6 +1553,7 @@ def init_db() -> None:
         _ensure_instrument_tick_size_column(conn)
         _ensure_watchlist_tag_column(conn)
         _ensure_dashboard_panels_screen_column(conn)
+        _ensure_reconciliation_issue_columns(conn)
         conn.executescript(_ACCOUNT_ID_INDEXES)
         _seed_default_account(conn)
         _ensure_trading_account_type(conn)

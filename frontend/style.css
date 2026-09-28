@@ -993,6 +993,18 @@ th.num, td.num { text-align: right; }
   border-color: color-mix(in srgb, var(--pnl-negative) 45%, transparent);
   background: var(--pnl-negative-bg);
 }
+/* PK-16: Protection / GTT reconciliation table */
+.reconciliation-status { color: var(--text-secondary); font-size: 12.5px; margin-bottom: 8px; }
+.reconciliation-status.unavailable { color: var(--pnl-negative); font-weight: 700; }
+.reconciliation-gtt { margin-bottom: 12px; }
+.reconciliation-gtt h3 { margin: 4px 0 8px; font-size: 14px; }
+.reconciliation-gtt .table-wrap {
+  border: 1px solid color-mix(in srgb, var(--pnl-negative) 45%, transparent);
+  background: var(--surface);
+}
+.reconciliation-gtt td { vertical-align: top; }
+.reconciliation-detail { color: var(--text-secondary); font-size: 12px; margin-top: 3px; max-width: 520px; white-space: normal; }
+.reconciliation-note { color: var(--text-muted); font-size: 12px; margin: 6px 0 0; }
 
 .strategy-info { margin: 0 0 14px; color: var(--text-secondary); font-size: 13px; max-width: 980px; }
 .strategy-version-row { border: 1px solid var(--border); background: var(--surface-2); border-radius: var(--radius); padding: 9px 12px; margin-bottom: 8px; }

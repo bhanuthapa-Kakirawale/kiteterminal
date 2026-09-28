@@ -112,6 +112,11 @@ def env(tmp_path, monkeypatch):
     from backend import kite_client
     monkeypatch.setattr(kite_client, "get_kite", lambda account_id=None: fake)
 
+    # Reconciliation's cross-cycle sightings (PK-16) are process memory;
+    # FakeKite GTT ids and ticket ids restart in every test.
+    from backend import reconciliation
+    reconciliation.reset_cycle_memory()
+
     from backend.ticker import ticker_manager
     monkeypatch.setattr(ticker_manager, "start", lambda *a, **k: None)
     broadcasts: list[dict] = []
