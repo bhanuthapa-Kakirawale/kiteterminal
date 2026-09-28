@@ -19,6 +19,10 @@ class TicketCreateRequest(BaseModel):
     # No `source`/`strategy_name` field on purpose: every HTTP-created ticket
     # is stamped source='manual' server-side, so a browser client can never
     # claim to be the (future) strategy engine.
+    # transaction_type/product_type stay wide on purpose (PK-17): only BUY +
+    # CNC is accepted, but the route refuses the rest with a stable
+    # UNSUPPORTED_MANUAL_TRADE code (execution.unsupported_entry_message)
+    # rather than a generic schema error.
     symbol: str
     exchange: str = "NSE"
     transaction_type: Literal["BUY", "SELL"]
@@ -79,7 +83,8 @@ class BreakerResetRequest(BaseModel):
 
 class TicketEditRequest(BaseModel):
     # Same shape as TicketCreateRequest — a full replace, only ever allowed
-    # server-side when the ticket's current status is 'draft'.
+    # server-side when the ticket's current status is 'draft'. Same PK-17
+    # BUY + CNC rule, enforced in the route.
     symbol: str
     exchange: str = "NSE"
     transaction_type: Literal["BUY", "SELL"]

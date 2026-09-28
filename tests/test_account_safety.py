@@ -452,14 +452,13 @@ def test_12d_buy_whose_stop_is_already_crossed_is_rejected(live, ltp):
     assert ticket_row(live.db, tid)["stop_loss"] == 2900.0
 
 
-def test_12d_short_entry_whose_stop_is_already_crossed_is_rejected(live):
-    _risk(live, max_entry_price_deviation_pct=50.0)
-    live.kite.ltp_map["NSE:TCS"] = 3100.0
-    tid = _entry(live, transaction_type="SELL", entry_price=3000.0, stop_loss=3100.0, target_1=2700.0,
-                 product_type="MIS")
-    r = _confirm(live, tid)
-    assert r.status_code == 409 and _code(r) == "STOP_ALREADY_INVALID"
-    assert _orders(live) == []
+def test_12d_short_entry_whose_stop_is_already_crossed_is_rejected():
+    # PK-17: a short entry can no longer be created over HTTP (UNSUPPORTED_MANUAL_TRADE), so the SELL
+    # side of the stop check is exercised on check_price_sanity directly.
+    from backend import account_safety
+    ticket = {"transaction_type": "SELL", "symbol": "TCS", "entry_price": 3000.0, "stop_loss": 3100.0}
+    failures = account_safety.check_price_sanity(ticket, 3100.0, {"max_entry_price_deviation_pct": 50.0})
+    assert [f.code for f in failures] == ["STOP_ALREADY_INVALID"] and failures[0].permanent
 
 
 def test_12d_both_failures_are_reported(live):
@@ -995,7 +994,8 @@ def test_12h_live_entry_without_a_decided_variety_never_reaches_the_broker():
     from backend import execution
     from fake_kite import FakeKite
     kite = FakeKite()
-    ticket = {"mode": "live", "transaction_type": "BUY", "closes_ticket_id": None, "source": "manual"}
+    ticket = {"mode": "live", "transaction_type": "BUY", "product_type": "CNC", "closes_ticket_id": None,
+              "source": "manual"}
     with pytest.raises(ValueError):
         execution.execute_ticket(kite, ticket)
     assert kite.calls == []

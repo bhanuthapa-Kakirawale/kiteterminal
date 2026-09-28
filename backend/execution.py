@@ -265,11 +265,55 @@ def is_closing_sell(ticket_row) -> bool:
     )
 
 
+# ---- PK-17: supported trade lifecycle ---------------------------------------
+#
+# The terminal models exactly one position lifecycle: a LONG equity position,
+# CNC (delivery), opened by a BUY and closed by a SELL. Shorts (SELL to open,
+# BUY to cover), MIS (intraday square-off, leverage) and NRML are not
+# modelled — journal, open positions, exits and protective GTTs are all
+# long-only. A NEW position must therefore be BUY + CNC; anything else is
+# refused, never rewritten. Closing sells (is_closing_sell) are never
+# affected: they reduce a position that already exists. Checked at creation
+# and edit (routes/tickets.py), in the risk engine, at confirmation, and as a
+# last backstop in execute_ticket below.
+UNSUPPORTED_MANUAL_TRADE = "UNSUPPORTED_MANUAL_TRADE"
+SUPPORTED_ENTRY = ("BUY", "CNC")  # (transaction_type, product_type)
+
+
+def unsupported_entry_message(transaction_type: str, product_type: str) -> str | None:
+    """None if (transaction_type, product_type) opens a supported position;
+    otherwise the reason it is refused."""
+    if (transaction_type, product_type) == SUPPORTED_ENTRY:
+        return None
+    return (f"Unsupported new position: {transaction_type} + {product_type}. Manual entries currently support "
+            f"CNC long positions only (BUY + CNC). Use Exit / Quick Sell to close holdings.")
+
+
+def unsupported_new_position(ticket_row) -> str | None:
+    """The PK-17 refusal reason for a ticket that would open an unsupported
+    position; None for a supported entry or any closing sell."""
+    if is_closing_sell(ticket_row):
+        return None
+    return unsupported_entry_message(ticket_row["transaction_type"], ticket_row["product_type"])
+
+
 def execute_ticket(kite: KiteConnect, ticket: sqlite3.Row, entry_variety: str | None = None) -> ExecutionResult:
     """entry_variety ('regular' | 'amo') is the order variety the account
     safety gate decided for a live NEW entry (PK-12H) — an AMO only with the
     approver's explicit consent. It is never re-derived from the clock here.
     Exits keep resolving their own variety (AMO outside market hours)."""
+    unsupported = unsupported_new_position(ticket)
+    if unsupported is not None:
+        # PK-17 backstop, in dry run too: a ticket that would open an
+        # unsupported position (an older row, a manual DB edit, a path that
+        # skipped validation) never reaches the broker. A definite failure,
+        # not an exception — raising would make a live claim look like an
+        # UNKNOWN submission that order_monitor then goes looking for.
+        return ExecutionResult(
+            success=False, kite_order_id=None, kite_gtt_id=None,
+            status="failed", event_type="execution_failed",
+            message=f"{UNSUPPORTED_MANUAL_TRADE}: {unsupported} Refused before any broker call; nothing was sent.",
+        )
     if ticket["mode"] == "dry_run":
         return _simulate(ticket)
     if is_closing_sell(ticket):

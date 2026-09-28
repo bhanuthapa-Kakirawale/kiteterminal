@@ -121,6 +121,21 @@ def _run_risk_checks_and_transition(
         raise HTTPException(status_code=e.status_code, detail={"error_code": e.error_code, "message": e.message})
 
 
+def _refuse_unsupported_entry(req: TicketCreateRequest | TicketEditRequest) -> None:
+    """PK-17: a ticket created or edited here always opens a NEW position,
+    and only BUY + CNC has a modelled lifecycle. Refused, never rewritten —
+    sells go through Exit, Quick Action Sell or Emergency Exit instead. Runs
+    before any price check, instrument lookup, insert or broker call."""
+    message = execution.unsupported_entry_message(req.transaction_type, req.product_type)
+    if message is not None:
+        raise HTTPException(400, {
+            "error_code": execution.UNSUPPORTED_MANUAL_TRADE,
+            "message": message,
+            "transaction_type": req.transaction_type,
+            "product_type": req.product_type,
+        })
+
+
 def _validate_prices(req: TicketCreateRequest | TicketEditRequest) -> None:
     if req.transaction_type == "BUY":
         if not (req.stop_loss < req.entry_price < req.target_1):
@@ -160,6 +175,7 @@ def _create_ticket_internal(
     (source='alert_action') — same factor-out-the-shared-body pattern as
     confirm_and_execute_ticket below, which is likewise shared by the
     single-ticket confirm endpoint and Emergency Exit All's batch loop."""
+    _refuse_unsupported_entry(req)
     _validate_prices(req)
 
     instrument = instruments.get_instrument_by_symbol(req.symbol, req.exchange)
@@ -810,6 +826,30 @@ def _account_safety_bookkeeping(account: sqlite3.Row, ticket: sqlite3.Row, resul
                 logger.exception("Could not log the AMO approval of ticket %d", ticket["id"])
 
 
+def _refuse_unsupported_at_confirm(conn: sqlite3.Connection, ticket: sqlite3.Row, account_id: int) -> None:
+    """PK-17: a ticket awaiting approval that would open an unsupported
+    position (created before PK-17, or by a manual DB edit) is refused before
+    the claim, in either mode: rejected — it can never become valid — with
+    the reason in its events, and never sent. The row itself is kept."""
+    message = execution.unsupported_new_position(ticket)
+    if message is None:
+        return
+    if _transition(conn, ticket["id"], account_id, _CONFIRMABLE_STATUSES, "rejected"):
+        _log_event(conn, ticket["id"], "rejected",
+                   f"Refused at confirmation ({execution.UNSUPPORTED_MANUAL_TRADE}): {message} No order was sent.")
+        conn.commit()
+        _notify("rejected", ticket_id=ticket["id"])
+    else:
+        conn.rollback()
+        _raise_invalid_state(conn, ticket["id"], account_id, "confirm")
+    raise HTTPException(409, {
+        "error_code": execution.UNSUPPORTED_MANUAL_TRADE,
+        "message": f"{message} Nothing was executed — this ticket has been rejected.",
+        "transaction_type": ticket["transaction_type"],
+        "product_type": ticket["product_type"],
+    })
+
+
 def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, kite: KiteConnect, ticket_id: int,
                                expected_mode: str | None = None, allow_amo: bool = False) -> dict:
     """Shared confirm-and-execute body: transitions a pending_confirmation
@@ -828,6 +868,8 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
     ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
     if ticket["status"] not in _CONFIRMABLE_STATUSES:
         _raise_invalid_state(conn, ticket_id, account["id"], "confirm")
+    # PK-17: only a supported NEW position may go further; exits pass.
+    _refuse_unsupported_at_confirm(conn, ticket, account["id"])
 
     mode, mode_note = _claim_mode(conn, ticket, account["id"])
     new_entry = not execution.is_closing_sell(ticket)
@@ -1148,6 +1190,7 @@ def edit_ticket(ticket_id: int, req: TicketEditRequest, kite: KiteConnect = Depe
                 "message": "Exit / reduction tickets cannot be edited — reject it and create a new one instead.",
             })
 
+        _refuse_unsupported_entry(req)
         _validate_prices(req)
 
         instrument = instruments.get_instrument_by_symbol(req.symbol, req.exchange)

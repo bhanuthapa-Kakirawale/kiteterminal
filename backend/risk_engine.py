@@ -696,11 +696,19 @@ def run_checks(
     # total portfolio risk) don't meaningfully apply to it.
     # execution.is_closing_sell() is the single source of truth for which
     # SELL tickets this applies to (closes_ticket_id set, OR
-    # source='alert_action' — see that function's docstring); an ordinary
-    # manual SELL ticket (source='manual', no closes_ticket_id) is
-    # completely unaffected and still runs all six checks exactly as before.
+    # source='alert_action' — see that function's docstring). Any other SELL
+    # would open a short, which PK-17 refuses just below.
     if execution.is_closing_sell(ticket_row):
         return RiskCheckReport(checks=[_check_exit_or_reduction(conn, ticket_row, kite)])
+    # PK-17: a new position the terminal cannot manage (anything but BUY +
+    # CNC) fails here, before any broker call or sizing/exposure work —
+    # whether it came from a strategy, a reverted rejection or an older row.
+    unsupported = execution.unsupported_new_position(ticket_row)
+    if unsupported is not None:
+        return RiskCheckReport(checks=[CheckResult(
+            "supported_lifecycle", "Supported Trade Lifecycle", False, False, None, None, "pct", unsupported,
+            code=execution.UNSUPPORTED_MANUAL_TRADE,
+        )])
 
     settings = get_settings(conn, account["id"])
     # A batch caller (the strategy scan) passes one context for the whole

@@ -401,6 +401,7 @@
       </div>
       <details class="table-section" open>
         <summary><h2>Manual ticket</h2></summary>
+        <p class="muted-note">Manual entries currently support CNC long positions only. Use Exit / Quick Sell to close holdings.</p>
         <form id="ticket-form" class="ticket-form">
           <div class="field">
             <label for="ticket-symbol">Symbol</label>
@@ -411,7 +412,6 @@
             <label for="ticket-direction">Direction</label>
             <select id="ticket-direction" name="transaction_type" required>
               <option value="BUY">BUY</option>
-              <option value="SELL">SELL</option>
             </select>
           </div>
           <div class="field">
@@ -433,8 +433,6 @@
             <label for="ticket-product-type">Product</label>
             <select id="ticket-product-type" name="product_type" required>
               <option value="CNC">CNC</option>
-              <option value="MIS">MIS</option>
-              <option value="NRML">NRML</option>
             </select>
           </div>
           <div class="field">
@@ -1268,7 +1266,6 @@
         <label for="te-direction">Direction</label>
         <select id="te-direction" name="transaction_type" required>
           <option value="BUY">BUY</option>
-          <option value="SELL">SELL</option>
         </select>
       </div>
       <div class="field">
@@ -1290,8 +1287,6 @@
         <label for="te-product-type">Product</label>
         <select id="te-product-type" name="product_type" required>
           <option value="CNC">CNC</option>
-          <option value="MIS">MIS</option>
-          <option value="NRML">NRML</option>
         </select>
       </div>
       <div class="field">
@@ -1400,8 +1395,6 @@
           <label for="qa-buy-product-type">Product</label>
           <select id="qa-buy-product-type">
             <option value="CNC">CNC</option>
-            <option value="MIS">MIS</option>
-            <option value="NRML">NRML</option>
           </select>
         </div>
         <div class="field">
