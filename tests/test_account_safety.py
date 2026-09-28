@@ -687,12 +687,27 @@ def test_12f_tighter_of_amount_and_percentage_applies(live):
 
 
 def test_12f_unusable_portfolio_value_fails_closed_when_pct_is_enabled(live):
+    from backend import account_safety
     _risk(live, max_daily_loss_pct=1.0)
-    live.kite.margins_net = -13000.0                      # portfolio value 0
     tid = _entry(live)
+    live.kite.margins_net = -13000.0                      # portfolio value 0
     r = _confirm(live, tid)
-    assert r.status_code == 503 and _code(r) == "ACCOUNT_SAFETY_UNAVAILABLE"
+    # PK-15: a non-positive portfolio value now fails closed one step earlier,
+    # in risk revalidation (PORTFOLIO_EXPOSURE_UNAVAILABLE) — it used to pass
+    # every percentage check as 0% and reach this gate. Still 503, no order.
+    # (The ticket is created before the value breaks: creation refuses too.)
+    assert r.status_code == 503 and _code(r) == "RISK_REVALIDATION_UNAVAILABLE"
+    assert "PORTFOLIO_EXPOSURE_UNAVAILABLE" in r.json()["detail"]["message"]
     assert _orders(live) == []
+    # The account safety gate's own guard is unchanged.
+    from backend import risk_engine
+    conn = live.db.get_connection()
+    try:
+        settings = risk_engine.get_settings(conn, account_id(live.db))
+    finally:
+        conn.close()
+    with pytest.raises(ValueError, match="not usable"):
+        account_safety.daily_loss_limit_amount(settings, 0.0)
 
 
 def test_12f_pnl_that_cannot_be_computed_fails_closed(live, monkeypatch):

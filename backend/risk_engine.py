@@ -25,15 +25,100 @@ class RiskCheckUnavailableError(Exception):
         self.message = message
 
 
+PORTFOLIO_EXPOSURE_UNAVAILABLE = "PORTFOLIO_EXPOSURE_UNAVAILABLE"
+
+
 @dataclass
 class PortfolioContext:
+    """One broker snapshot of the CURRENT trading account (PK-15): every
+    exposure, sector and percentage check of one approval is evaluated
+    against it, so they agree with each other. Never a family/consolidated
+    view — risk capital is this account's alone.
+
+    broker_by_symbol: symbol -> {settled, t1, day_net, quantity, last_price,
+    average_price}; quantity = settled + t1 + day_net (never below 0).
+    portfolio_value = sum(quantity * last_price) + cash_component, where
+    cash_component = margins equity.net less equity.available.collateral."""
     portfolio_value: float
-    holdings_by_symbol: dict  # symbol -> {quantity, average_price, cost_value, last_price}
+    broker_by_symbol: dict
+    cash_component: float = 0.0
+    collateral_excluded: float = 0.0
+
+
+def _unavailable(message: str) -> RiskCheckUnavailableError:
+    return RiskCheckUnavailableError(
+        503, PORTFOLIO_EXPOSURE_UNAVAILABLE,
+        f"Portfolio exposure unavailable ({PORTFOLIO_EXPOSURE_UNAVAILABLE}): {message}")
+
+
+def _number(value, what: str) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise _unavailable(f"{what} is not a usable number ({value!r})")
+    return float(value)
+
+
+def _price(row: dict) -> float | None:
+    for key in ("last_price", "close_price"):
+        value = row.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
+            return float(value)
+    return None
+
+
+def broker_quantities(holdings: list, positions: dict) -> dict:
+    """Shares the broker says this account owns, per symbol — the one place
+    the Kite quantity fields are combined for exposure (PK-15):
+
+      holdings.quantity       settled demat shares. A sale made today is
+                              not deducted here — it shows as a negative
+                              CNC position (below). Pledged shares
+                              (collateral_quantity) are part of it and are
+                              not added again.
+      holdings.t1_quantity    bought, not yet settled (T+1). NOT inside
+                              quantity, so it is added: yesterday's buy is
+                              real exposure today.
+      positions net, CNC,     today's delivery change: quantity less
+      NSE/BSE                 overnight_quantity (overnight CNC shares are
+                              the T1 shares already in holdings). MIS/NRML
+                              (intraday, derivatives) are not delivery
+                              exposure and are left out.
+
+    Exit validation (get_held_quantity) and reconciliation keep their own,
+    broader all-product sum on purpose — narrowing an exit path is not an
+    exposure change."""
+    by_symbol: dict[str, dict] = {}
+
+    def entry(symbol: str) -> dict:
+        return by_symbol.setdefault(symbol, {"settled": 0, "t1": 0, "day_net": 0, "last_price": None,
+                                             "average_price": None})
+
+    for h in holdings or []:
+        e = entry(h["tradingsymbol"])
+        e["settled"] += int(_number(h.get("quantity"), f"{h['tradingsymbol']} holdings quantity"))
+        e["t1"] += int(_number(h.get("t1_quantity"), f"{h['tradingsymbol']} t1_quantity"))
+        e["last_price"] = e["last_price"] or _price(h)
+        e["average_price"] = e["average_price"] or h.get("average_price")
+    for p in (positions or {}).get("net") or []:
+        if p.get("product") != "CNC" or p.get("exchange", "NSE") not in ("NSE", "BSE"):
+            continue
+        e = entry(p["tradingsymbol"])
+        e["day_net"] += int(_number(p.get("quantity"), f"{p['tradingsymbol']} position quantity")
+                            - _number(p.get("overnight_quantity"), f"{p['tradingsymbol']} overnight_quantity"))
+        e["last_price"] = e["last_price"] or _price(p)
+        e["average_price"] = e["average_price"] or p.get("average_price")
+    for e in by_symbol.values():
+        e["quantity"] = max(0, e["settled"] + e["t1"] + e["day_net"])
+    return by_symbol
 
 
 def build_portfolio_context(kite: KiteConnect) -> PortfolioContext:
+    """One holdings(), positions() and margins() call each. Fails closed —
+    a new entry is never approved on a figure that could not be computed."""
     try:
         holdings = kite.holdings()
+        positions = kite.positions()
         margins = kite.margins()
     except TokenException:
         raise RiskCheckUnavailableError(
@@ -42,26 +127,31 @@ def build_portfolio_context(kite: KiteConnect) -> PortfolioContext:
     except KiteException as e:
         raise RiskCheckUnavailableError(502, "KITE_API_ERROR", str(e))
 
-    # Mark-to-market, matching the dashboard's existing "Portfolio Value" and
-    # "Available Margin" (equity.net) figures exactly, so the risk engine's
-    # numbers agree with what's already shown on screen.
-    holdings_value = sum(h["quantity"] * h["last_price"] for h in holdings)
-    available_margin = (margins.get("equity") or {}).get("net") or 0
-    portfolio_value = holdings_value + available_margin
+    try:
+        broker = broker_quantities(holdings, positions)
+        equity = (margins or {}).get("equity") or {}
+        # Kite's equity.net already includes the margin from pledged
+        # holdings (available.collateral); those holdings are counted at
+        # market value below, so their collateral is taken out once here.
+        net = _number(equity.get("net"), "margins equity.net")
+        collateral = max(0.0, _number((equity.get("available") or {}).get("collateral"),
+                                      "margins equity.available.collateral"))
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
+        raise _unavailable(f"the broker's portfolio data is malformed ({type(e).__name__}: {e})")
 
-    holdings_by_symbol = {
-        h["tradingsymbol"]: {
-            "quantity": h["quantity"],
-            "average_price": h["average_price"],
-            # Cost basis, not mark-to-market — this is added to a new ticket's
-            # own capital (entry_price * quantity, also a cost figure), so
-            # mixing MTM and cost in the same sum would be inconsistent.
-            "cost_value": h["quantity"] * h["average_price"],
-            "last_price": h["last_price"],
-        }
-        for h in holdings
-    }
-    return PortfolioContext(portfolio_value=portfolio_value, holdings_by_symbol=holdings_by_symbol)
+    holdings_value = 0.0
+    for symbol, e in broker.items():
+        if e["quantity"] == 0:
+            continue
+        if e["last_price"] is None:
+            raise _unavailable(f"{symbol} is held ({e['quantity']} shares) but has no market price")
+        holdings_value += e["quantity"] * e["last_price"]
+    cash = net - collateral
+    portfolio_value = holdings_value + cash
+    if not math.isfinite(portfolio_value) or portfolio_value <= 0:
+        raise _unavailable(f"portfolio value {portfolio_value:,.2f} is not positive")
+    return PortfolioContext(portfolio_value=portfolio_value, broker_by_symbol=broker,
+                            cash_component=cash, collateral_excluded=collateral)
 
 
 def get_settings(conn: sqlite3.Connection, account_id: int) -> sqlite3.Row:
@@ -118,38 +208,39 @@ def compute_suggested_exit_quantity(
     """For the Quick Action popup's concentration alert: how many shares to
     sell to bring this symbol back to exactly max_single_stock_exposure_pct
     of portfolio_value. Deliberately mirrors _check_single_stock_exposure's
-    own math (via _symbol_exposure, which also folds in same-day-executed
-    live tickets on top of holdings cost, not just bare holdings cost) so
-    the suggested quantity is self-consistent with what that check will
-    actually re-validate once the resulting ticket is created — using a
-    DIFFERENT (e.g. mark-to-market) basis here would suggest a quantity that
-    doesn't actually satisfy the real check.
+    own math (the same account_exposures figure: broker shares — settled,
+    T1 and today's — or the app's own, counted once, at market value, plus
+    entries still in flight) so the suggested quantity is self-consistent
+    with what that check will re-validate. The shares to sell are sized at
+    the market price, the same basis the exposure is measured on (PK-15;
+    it was cost before).
 
-    Note this basis (cost value / portfolio_value-including-margin) is NOT
-    the same as the Dashboard alert banner's own trigger, which compares
-    mark-to-market holding value against a holdings-only total
+    Note this is NOT the Dashboard alert banner's own trigger, which
+    compares holding value against a holdings-only total
     (CONFIG.concentration_alert_pct, a separate, simpler config knob from
     risk_settings.max_single_stock_exposure_pct used here) — the two are
     different metrics on purpose and the frontend shows both rather than
     conflating them."""
-    holding = ctx.holdings_by_symbol.get(symbol)
-    quantity_held = holding["quantity"] if holding else 0
-    average_price = holding["average_price"] if holding else 0.0
+    broker = ctx.broker_by_symbol.get(symbol) or {}
+    quantity_held = broker.get("quantity", 0)
+    last_price = broker.get("last_price") or 0.0
 
-    current_cost = _symbol_exposure(conn, account_id, symbol, ctx)
-    current_exposure_pct = (current_cost / ctx.portfolio_value * 100) if ctx.portfolio_value else 0.0
+    exposure = account_exposures(conn, account_id, ctx).get(symbol)
+    current_value = exposure.value if exposure else 0.0
+    current_exposure_pct = current_value / ctx.portfolio_value * 100
     target_pct = settings["max_single_stock_exposure_pct"]
-    target_cost = target_pct / 100 * ctx.portfolio_value
-    excess_cost = current_cost - target_cost
+    excess_value = current_value - target_pct / 100 * ctx.portfolio_value
 
-    if excess_cost <= 0 or average_price <= 0 or quantity_held <= 0:
+    if excess_value <= 0 or last_price <= 0 or quantity_held <= 0:
         suggested_qty = 0
     else:
-        suggested_qty = min(math.ceil(excess_cost / average_price), quantity_held)
+        suggested_qty = min(math.ceil(excess_value / last_price), quantity_held)
 
     return {
         "quantity_held": quantity_held,
-        "average_price": average_price,
+        "average_price": broker.get("average_price") or 0.0,
+        "last_price": last_price,
+        "exposure_basis": "market_value",
         "portfolio_value": ctx.portfolio_value,
         "current_exposure_pct": current_exposure_pct,
         "target_exposure_pct": target_pct,
@@ -167,6 +258,14 @@ class CheckResult:
     limit_value: float | int | None
     unit: str  # "ratio" | "pct" | "count"
     message: str
+    code: str | None = None             # a machine-readable refusal reason (e.g. SECTOR_MAPPING_REQUIRED)
+    current_value: float | None = None  # the exposure before this ticket, same unit as actual_value
+
+
+SECTOR_MAPPING_REQUIRED = "SECTOR_MAPPING_REQUIRED"
+# Exposure exactly AT a limit passes; this absorbs float noise in the
+# percentage (e.g. 20.000000000000004 for a true 20%).
+_PCT_EPSILON = 1e-9
 
 
 @dataclass
@@ -200,42 +299,79 @@ _IN_FLIGHT_ENTRY_WHERE = """
 """
 
 
+@dataclass
+class SymbolExposure:
+    symbol: str
+    broker_quantity: int     # settled + T1 + today's CNC change, per the broker (PortfolioContext)
+    app_held_quantity: int   # shares this app's open live positions hold (PK-13 open quantity)
+    pending_quantity: int    # may still be bought: in-flight/UNKNOWN entries, unfilled rest of working ones
+    held_quantity: int       # max(broker, app_held): one economic position, counted once
+    price: float | None      # broker market price; the app's entry price only if the broker has none
+    value: float             # held_quantity * price + pending_quantity at their planned entry prices
+
+
+def account_exposures(conn: sqlite3.Connection, account_id: int, ctx: PortfolioContext,
+                      exclude_ticket_id: int = 0) -> dict:
+    """Current exposure per symbol for the new-entry limits (PK-15): the
+    shares the account holds, counted ONCE, plus what may still be bought.
+
+    The broker is authoritative for shares held — including ones bought
+    outside this app, yesterday's (T1) and today's (positions). The app's
+    open positions (their PK-13 open quantity) cover the same shares, so the
+    two are never added: held = max(broker, app). The app side still
+    matters when the broker has not caught up yet (a fill it has not
+    reflected). An unknown open quantity counts as what it may hold.
+
+    On top of that, conservatively, everything that may still be bought:
+    every in-flight/UNKNOWN/needs_review live entry at its full quantity,
+    whatever its age (PK-4/PK-12 — it may already be live at the broker),
+    and the unfilled remainder of a working entry (PK-13 decision (a)). A
+    fill the monitor has not recorded yet may be counted twice for that
+    moment; it is never counted as zero.
+
+    Valuation — current market value: held shares at the broker's last
+    price (the app's average entry price only if the broker has none);
+    shares not yet bought at their planned entry price. Dry-run tickets
+    never count (mode='live'). The ticket being checked is excluded; each
+    check adds it once itself."""
+    rq = position_quantity.risk_quantity_sql()
+    held = f"MAX(0, COALESCE({position_quantity.open_quantity_sql()}, {rq}))"
+    rows = conn.execute(
+        f"""
+        SELECT symbol, SUM(held) AS held, SUM(held * entry_price) AS held_cost,
+               SUM(pending) AS pending, SUM(pending * entry_price) AS pending_value
+        FROM (
+            SELECT symbol, entry_price, {held} AS held, MAX(0, {rq} - {held}) AS pending
+            FROM trade_tickets WHERE {_OPEN_POSITION_WHERE}
+            UNION ALL
+            SELECT symbol, entry_price, 0 AS held, quantity AS pending
+            FROM trade_tickets WHERE {_IN_FLIGHT_ENTRY_WHERE}
+        )
+        GROUP BY symbol
+        """,
+        (account_id, account_id, exclude_ticket_id),
+    ).fetchall()
+    app = {r["symbol"]: r for r in rows}
+
+    exposures = {}
+    for symbol in sorted(set(app) | {s for s, b in ctx.broker_by_symbol.items() if b["quantity"] > 0}):
+        broker = ctx.broker_by_symbol.get(symbol) or {}
+        broker_quantity = broker.get("quantity", 0)
+        row = app.get(symbol)
+        app_held = int(row["held"] or 0) if row else 0
+        pending = int(row["pending"] or 0) if row else 0
+        held_quantity = max(broker_quantity, app_held)
+        price = broker.get("last_price") or (row["held_cost"] / app_held if app_held else None)
+        value = (held_quantity * price if held_quantity else 0.0) + (float(row["pending_value"] or 0) if row else 0.0)
+        exposures[symbol] = SymbolExposure(symbol, broker_quantity, app_held, pending, held_quantity, price, value)
+    return exposures
+
+
 def _symbol_exposure(conn: sqlite3.Connection, account_id: int, symbol: str, ctx: PortfolioContext,
                      exclude_ticket_id: int = 0) -> float:
-    # Existing holdings (any age) + same-day-executed *live* open tickets for
-    # this symbol. Only same-day tickets are added on top of holdings —
-    # summing ALL open tickets regardless of age would double-count every
-    # position older than a day, since nothing in this app ever marks a
-    # ticket "settled into holdings." This closes the same-day-stacking gap
-    # (several tickets placed before T+1 settlement shows up in holdings)
-    # without that double-count. mode='live' excludes dry-run "executed"
-    # tickets — those are simulations with zero real capital deployed and
-    # must not count against real exposure/risk limits.
-    holding = ctx.holdings_by_symbol.get(symbol)
-    holdings_value = holding["cost_value"] if holding else 0.0
-    cutoff = _same_day_ist_cutoff_utc()
-    # closes_ticket_id IS NULL: an executed exit ticket reduces exposure, so
-    # its own notional must never be added on top of the position it closed.
-    # PK-13: at the quantity the position can actually hold — its requested
-    # size while the entry order may still fill, what filled once it ended,
-    # less whatever its exits have already sold.
-    row = conn.execute(
-        f"""
-        SELECT COALESCE(SUM(entry_price * {position_quantity.risk_quantity_sql()}), 0) AS total
-        FROM trade_tickets
-        WHERE account_id = ? AND symbol = ? AND status = 'executed' AND mode = 'live'
-          AND closed_at IS NULL AND closes_ticket_id IS NULL AND executed_at >= ?
-        """,
-        (account_id, symbol, cutoff),
-    ).fetchone()
-    in_flight = conn.execute(
-        f"""
-        SELECT COALESCE(SUM(entry_price * quantity), 0) AS total FROM trade_tickets
-        WHERE {_IN_FLIGHT_ENTRY_WHERE} AND symbol = ? AND COALESCE(submitted_at, created_at) >= ?
-        """,
-        (account_id, exclude_ticket_id, symbol, cutoff),
-    ).fetchone()
-    return holdings_value + row["total"] + in_flight["total"]
+    """One symbol's account_exposures value (0 if it has none)."""
+    exposure = account_exposures(conn, account_id, ctx, exclude_ticket_id).get(symbol)
+    return exposure.value if exposure else 0.0
 
 
 # Single source of truth for "what counts as an open position" — used by
@@ -334,30 +470,52 @@ def _check_capital_per_trade(ticket_row: sqlite3.Row, ctx: PortfolioContext, set
     return CheckResult("max_capital_per_trade_pct", "Capital", passed, False, pct, limit, "pct", message)
 
 
-def _check_single_stock_exposure(conn: sqlite3.Connection, ticket_row: sqlite3.Row, ctx: PortfolioContext, settings: sqlite3.Row) -> CheckResult:
+def _check_single_stock_exposure(ticket_row: sqlite3.Row, ctx: PortfolioContext, settings: sqlite3.Row,
+                                 exposures: dict) -> CheckResult:
     capital = ticket_row["entry_price"] * ticket_row["quantity"]
-    existing = _symbol_exposure(conn, ticket_row["account_id"], ticket_row["symbol"], ctx, ticket_row["id"])
+    own = exposures.get(ticket_row["symbol"])
+    existing = own.value if own else 0.0
+    current = (existing / ctx.portfolio_value * 100) if ctx.portfolio_value else 0
     pct = ((existing + capital) / ctx.portfolio_value * 100) if ctx.portfolio_value else 0
     limit = settings["max_single_stock_exposure_pct"]
-    passed = pct <= limit
-    message = f"{ticket_row['symbol']} exposure would be {pct:.1f}% of portfolio, limit is {limit}%"
-    return CheckResult("max_single_stock_exposure_pct", "Single-stock exposure", passed, False, pct, limit, "pct", message)
+    passed = pct <= limit + _PCT_EPSILON
+    message = (f"{ticket_row['symbol']}: current {current:.1f}% → post-trade {pct:.1f}% of portfolio, "
+               f"limit {limit}%")
+    return CheckResult("max_single_stock_exposure_pct", "Single-stock exposure", passed, False, pct, limit, "pct",
+                       message, current_value=current)
 
 
-def _check_sector_exposure(conn: sqlite3.Connection, ticket_row: sqlite3.Row, ctx: PortfolioContext, settings: sqlite3.Row) -> CheckResult:
+def _check_sector_exposure(ticket_row: sqlite3.Row, ctx: PortfolioContext, settings: sqlite3.Row,
+                           exposures: dict) -> CheckResult:
+    """PK-14: the sector limit over every symbol that shares the ticket's
+    sector, plus the proposed order. A symbol with no sector FAILS CLOSED
+    (SECTOR_MAPPING_REQUIRED): it used to pass as 'skipped', which let
+    unmapped names stack up in one sector unchecked. Only position-opening
+    tickets reach here — closing sells (exits, Emergency Exit) never do.
+    Per-symbol exposure is PK-15's (account_exposures): broker shares incl.
+    T1 and today's, counted once with the app's, at market value."""
     limit = settings["max_sector_exposure_pct"]
-    sector = sector_mapping.get_sector(ticket_row["symbol"])
+    symbol = ticket_row["symbol"]
+    held = {s for s, e in exposures.items() if e.value > 0}
+    sectors = sector_mapping.resolve_sectors(held | {symbol})
+    sector = sectors.get(symbol.strip().upper())
     if sector is None:
-        message = "unknown sector, exposure check skipped (no mapping for this symbol)"
-        return CheckResult("max_sector_exposure_pct", "Sector exposure", True, True, None, limit, "pct", message)
+        message = (f"Sector: UNMAPPED — BLOCKED, a sector mapping is required for {symbol} before a new entry "
+                   f"(Settings → Sector mappings) [{SECTOR_MAPPING_REQUIRED}]")
+        return CheckResult("max_sector_exposure_pct", "Sector exposure · UNMAPPED", False, False, None, limit, "pct",
+                           message, code=SECTOR_MAPPING_REQUIRED)
 
     capital = ticket_row["entry_price"] * ticket_row["quantity"]
-    symbols = sector_mapping.symbols_in_sector(sector)
-    existing = sum(_symbol_exposure(conn, ticket_row["account_id"], s, ctx, ticket_row["id"]) for s in symbols)
+    existing = sum(exposures[s].value for s in sorted(held) if sectors.get(s) == sector)
+    current = (existing / ctx.portfolio_value * 100) if ctx.portfolio_value else 0
     pct = ((existing + capital) / ctx.portfolio_value * 100) if ctx.portfolio_value else 0
-    passed = pct <= limit
-    message = f"{sector} sector exposure would be {pct:.1f}% of portfolio, limit is {limit}%"
-    return CheckResult("max_sector_exposure_pct", "Sector exposure", passed, False, pct, limit, "pct", message)
+    passed = pct <= limit + _PCT_EPSILON
+    message = f"{sector} sector: current {current:.1f}% → post-trade {pct:.1f}% of portfolio, limit {limit}%"
+    unmapped = sorted(s for s, sec in sectors.items() if sec is None and s != symbol)
+    if unmapped:
+        message += f" (not counted, no sector mapped: {', '.join(unmapped)})"
+    return CheckResult("max_sector_exposure_pct", f"Sector exposure · {sector}", passed, False, pct, limit, "pct",
+                       message, current_value=current)
 
 
 def _check_open_positions(conn: sqlite3.Connection, ticket_row: sqlite3.Row, settings: sqlite3.Row) -> CheckResult:
@@ -548,7 +706,14 @@ def run_checks(
     # A batch caller (the strategy scan) passes one context for the whole
     # batch — holdings/margins can't change mid-scan since nothing executes.
     ctx = ctx or build_portfolio_context(kite)
+    if not (isinstance(ctx.portfolio_value, (int, float)) and math.isfinite(ctx.portfolio_value)
+            and ctx.portfolio_value > 0):
+        # Every percentage limit divides by it: never approve on 0% of nothing.
+        raise _unavailable(f"portfolio value {ctx.portfolio_value!r} is not positive")
     metrics = execution.compute_risk_metrics(dict(ticket_row))
+    # One exposure map (PK-15) feeds both exposure checks, from the same
+    # broker snapshot as the portfolio value they divide by.
+    exposures = account_exposures(conn, account["id"], ctx, ticket_row["id"])
 
     # All six checks always run and are always evaluated — never
     # short-circuited on the first failure — so a rejected ticket's breakdown
@@ -556,8 +721,8 @@ def run_checks(
     checks = [
         _check_risk_reward(metrics, settings),
         _check_capital_per_trade(ticket_row, ctx, settings),
-        _check_single_stock_exposure(conn, ticket_row, ctx, settings),
-        _check_sector_exposure(conn, ticket_row, ctx, settings),
+        _check_single_stock_exposure(ticket_row, ctx, settings, exposures),
+        _check_sector_exposure(ticket_row, ctx, settings, exposures),
         _check_open_positions(conn, ticket_row, settings),
         _check_total_portfolio_risk(conn, ticket_row, ctx, settings),
     ]

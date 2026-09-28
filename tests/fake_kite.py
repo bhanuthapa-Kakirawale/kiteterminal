@@ -27,6 +27,7 @@ class FakeKite:
         self._holdings = holdings if holdings is not None else []
         self._positions = positions if positions is not None else []
         self.margins_net = margins_net
+        self.margins_collateral = 0.0  # equity.available.collateral (pledged holdings), included in net
         self.ltp_map = dict(ltp or {})
         self.candles = candles or {}
         self._instruments = instruments or []
@@ -150,12 +151,19 @@ class FakeKite:
             last_price=last_price if last_price is not None else existing.get("last_price", price),
         )
 
-    def set_position(self, symbol, quantity, product="CNC", exchange="NSE"):
-        """Set (or, with quantity 0, remove) the broker's net position for symbol."""
+    def set_position(self, symbol, quantity, product="CNC", exchange="NSE", last_price=None, average_price=None,
+                     overnight_quantity=0):
+        """Set (or, with quantity 0, remove) the broker's net position for symbol.
+        Prices default to the symbol's LTP, as Kite reports them."""
         self._positions[:] = [p for p in self._positions if p["tradingsymbol"] != symbol]
         if quantity:
-            self._positions.append({"tradingsymbol": symbol, "exchange": exchange, "product": product,
-                                    "quantity": quantity})
+            price = self.ltp_map.get(f"{exchange}:{symbol}", 100.0)
+            self._positions.append({
+                "tradingsymbol": symbol, "exchange": exchange, "product": product, "quantity": quantity,
+                "overnight_quantity": overnight_quantity,
+                "last_price": last_price if last_price is not None else price,
+                "average_price": average_price if average_price is not None else price,
+            })
 
     # -- portfolio ---------------------------------------------------------
     def profile(self):
@@ -174,7 +182,11 @@ class FakeKite:
 
     def margins(self):
         self._record("margins")
-        return {"equity": {"net": self.margins_net}}
+        equity = {"net": self.margins_net}
+        if self.margins_collateral:
+            # Like Kite: equity.net already includes the margin from pledged holdings.
+            equity["available"] = {"collateral": self.margins_collateral}
+        return {"equity": equity}
 
     def ltp(self, keys):
         if isinstance(keys, str):

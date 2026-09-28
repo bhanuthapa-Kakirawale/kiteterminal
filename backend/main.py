@@ -67,6 +67,12 @@ _BACKGROUND_LOOPS = {
 @app.on_event("startup")
 async def on_startup():
     init_db()
+    # PK-14: every watched/traded symbol gets its static sector before any
+    # risk check runs — no Kite session needed. Never overwrites a manual one.
+    try:
+        sector_mapping.seed_known_symbols()
+    except Exception:
+        logger.exception("Sector mapping seed failed on startup")
     ticker_manager.set_loop(asyncio.get_running_loop())
     try:
         kite = kite_client.get_kite()

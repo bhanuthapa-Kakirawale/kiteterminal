@@ -51,11 +51,13 @@ def _open(env, position_id):
 
 
 def _risk(env):
-    """(open risk, same-day TCS exposure) as the new-entry limits see them."""
+    """(open risk, TCS exposure) as the new-entry limits see them, with
+    nothing held at the broker (PK-15: the context's broker map replaced
+    holdings_by_symbol; the app's own position still counts)."""
     from backend import risk_engine
     conn = _conn(env)
     try:
-        ctx = SimpleNamespace(holdings_by_symbol={})
+        ctx = SimpleNamespace(broker_by_symbol={})
         return (risk_engine._open_risk_sum(conn, account_id(env.db)),
                 risk_engine._symbol_exposure(conn, account_id(env.db), "TCS", ctx))
     finally:

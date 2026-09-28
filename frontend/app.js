@@ -908,7 +908,7 @@ async function openQuickActionModal(alert) {
       const reduction = await API.getPositionReduction(h.tradingsymbol);
       if (state.quickActionAlert === alert) { // modal wasn't closed/reopened while awaiting
         el.qaSellQty.value = reduction.suggested_qty || h.quantity;
-        el.qaHeader.innerHTML += `<div class="row"><span>Exposure (cost basis)</span>` +
+        el.qaHeader.innerHTML += `<div class="row"><span>Exposure (market value)</span>` +
           `<strong>${fmt(reduction.current_exposure_pct)}% → target ${fmt(reduction.target_exposure_pct)}%</strong></div>`;
         renderQaSellPreview();
       }
@@ -2862,13 +2862,16 @@ function executionNote(t) {
 function riskCheckRowHtml(c, { withLinks = false } = {}) {
   const icon = c.skipped ? "⚠" : c.passed ? "✓" : "✗";
   const cls = c.skipped ? "skipped" : c.passed ? "passed" : "failed";
-  // A skipped sector check is NOT a pass — the symbol simply has no sector
-  // mapped, so the limit was never applied. The detail panel says so and
-  // points at the screen where that is fixed.
-  const fix = withLinks && c.skipped && c.rule === "max_sector_exposure_pct"
+  // An unmapped sector blocks a new entry (PK-14, SECTOR_MAPPING_REQUIRED;
+  // older stored results show it as skipped). The detail panel points at
+  // the screen where it is fixed.
+  const unmapped = c.rule === "max_sector_exposure_pct" && (c.skipped || c.code === "SECTOR_MAPPING_REQUIRED");
+  const fix = withLinks && unmapped
     ? ` <a class="sd-fix-link" href="#settings" data-sd-close="1">Settings → Sector mappings</a>` : "";
   let value;
-  if (c.skipped || c.actual_value === null || c.actual_value === undefined) {
+  if (c.code === "SECTOR_MAPPING_REQUIRED") {
+    value = "Sector: UNMAPPED — BLOCKED, mapping required";
+  } else if (c.skipped || c.actual_value === null || c.actual_value === undefined) {
     // Non-numeric checks (e.g. an exit ticket's "position validated"
     // check) have no actual_value/limit_value to format — show the
     // message directly, same as the skipped-check path.
@@ -2877,6 +2880,8 @@ function riskCheckRowHtml(c, { withLinks = false } = {}) {
     value = `1:${c.actual_value.toFixed(2)} (min 1:${c.limit_value})`;
   } else if (c.unit === "count") {
     value = `${c.actual_value} of ${c.limit_value} max`;
+  } else if (c.current_value !== null && c.current_value !== undefined) {
+    value = `current ${c.current_value.toFixed(1)}% → ${c.actual_value.toFixed(1)}% (max ${c.limit_value}%)`;
   } else {
     value = `${c.actual_value.toFixed(1)}% (max ${c.limit_value}%)`;
   }
@@ -3582,7 +3587,7 @@ el.sectorMappingsBody.addEventListener("click", async (event) => {
 
 function renderUnmappedSymbols() {
   if (state.unmappedSymbols.length === 0) {
-    el.unmappedSymbolsList.innerHTML = `<span class="empty">None — every held symbol has a sector mapping.</span>`;
+    el.unmappedSymbolsList.innerHTML = `<span class="empty">None — every held or watched symbol has a sector.</span>`;
     return;
   }
   el.unmappedSymbolsList.innerHTML = state.unmappedSymbols

@@ -684,6 +684,7 @@ def _revalidate_at_confirm(conn: sqlite3.Connection, account: sqlite3.Row, kite:
     raise HTTPException(409, {
         "error_code": "RISK_REVALIDATION_FAILED", "message": message,
         "failed_checks": [c.rule for c in failed],
+        "failed_codes": [c.code for c in failed if c.code],
     })
 
 

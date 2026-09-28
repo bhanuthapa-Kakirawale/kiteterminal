@@ -307,7 +307,12 @@ def test_sector_mappings(env):
     c.post("/api/risk/sector-mappings", json={"symbol": "tcs", "sector": "IT"})
     assert any(m["symbol"] == "TCS" for m in c.get("/api/risk/sector-mappings").json()["data"])
     assert "IT" in c.get("/api/risk/sectors").json()["data"]
-    assert c.get("/api/risk/unmapped-symbols").json()["data"] == ["RELIANCE"]
+    # PK-14: "unmapped" means no sector anywhere — the held RELIANCE resolves
+    # through SECTOR_LOOKUP (it was listed before PK-14); a holding the
+    # lookup does not know is still listed.
+    assert c.get("/api/risk/unmapped-symbols").json()["data"] == []
+    env.kite.set_holding("NOSUCHCO", 3, average_price=10.0, last_price=10.0)
+    assert c.get("/api/risk/unmapped-symbols").json()["data"] == ["NOSUCHCO"]
     c.delete("/api/risk/sector-mappings/TCS")
     assert c.get("/api/risk/sector-mappings").json()["data"] == []
 

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from kiteconnect import KiteConnect
 from pydantic import BaseModel, Field
 
-from backend import data_jobs, instruments, watchlist
+from backend import data_jobs, instruments, sector_mapping, watchlist
 from backend.accounts import get_trading_account
 from backend.kite_client import require_trading_account
 from backend.ticker import collect_instrument_tokens, ticker_manager
@@ -58,6 +58,10 @@ async def add_watchlist_symbol(req: WatchlistAddRequest, kite: KiteConnect = Dep
             "message": f"'{instrument['tradingsymbol']}' is already on your watchlist.",
         }) from e
 
+    # PK-14: a newly watched symbol gets its static sector right away (a
+    # manual mapping is never overwritten); an unknown one shows up in
+    # Settings → unmapped symbols, and new entries in it are refused.
+    sector_mapping.seed_symbols([instrument["tradingsymbol"]])
     _resubscribe_ticker(kite, account["id"])
     await data_jobs.enqueue_backfill(instrument["instrument_token"], instrument["tradingsymbol"])
 

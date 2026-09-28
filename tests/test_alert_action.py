@@ -247,15 +247,17 @@ def test_position_reduction_suggests_quantity_to_hit_target_exposure(env):
     data = r.json()["data"]
     assert data["quantity_held"] == 100
     assert data["average_price"] == 1000.0
-    # cost value = 100 * 1000 = 100,000; portfolio_value = holdings MTM
-    # (100*1200=120,000) + margin (1,000,000) = 1,120,000 by default settings.
+    # PK-15: market value, not cost (was 100 * 1000 = 100,000). Exposure =
+    # 100 * 1200 = 120,000; portfolio_value = holdings MTM (120,000 + the
+    # default RELIANCE 13,000) + margin 1,000,000 = 1,133,000 → 10.59%.
+    assert data["exposure_basis"] == "market_value" and data["last_price"] == 1200.0
+    assert data["portfolio_value"] == 1_133_000.0
     settings = env.client.get("/api/risk/settings").json()["data"]
     target_pct = settings["max_single_stock_exposure_pct"]
-    expected_current_pct = 100_000 / data["portfolio_value"] * 100
-    assert data["current_exposure_pct"] == expected_current_pct
-    assert data["target_exposure_pct"] == target_pct
-    if expected_current_pct > target_pct:
-        assert 0 < data["suggested_qty"] <= 100
+    assert data["current_exposure_pct"] == 120_000 / 1_133_000 * 100
+    assert data["target_exposure_pct"] == target_pct == 10
+    # Excess 120,000 - 113,300 = 6,700, sold at the 1,200 market price → 6 shares.
+    assert data["suggested_qty"] == 6
 
 
 # ---------------------------------------------------------------- account-type gate
