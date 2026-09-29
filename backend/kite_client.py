@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 from cryptography.fernet import InvalidToken
 from fastapi import Depends, HTTPException
@@ -12,7 +12,7 @@ from backend.redaction import register_secret
 
 logger = logging.getLogger(__name__)
 
-IST = timezone(timedelta(hours=5, minutes=30))
+from backend.trading_calendar import IST  # PK-22C: one IST definition
 
 
 class NoActiveSessionError(Exception):

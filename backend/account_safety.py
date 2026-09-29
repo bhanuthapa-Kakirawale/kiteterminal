@@ -47,7 +47,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from kiteconnect import KiteConnect
 
-from backend import config, execution, market, risk_engine, system_events
+from backend import config, execution, market, obs, risk_engine, system_events, trading_calendar
 from backend.db import get_connection
 from backend.ticker import ticker_manager
 
@@ -114,10 +114,10 @@ def _to_utc_sql(at: datetime) -> str:
 
 
 def ist_day_start_utc(now: datetime) -> str:
-    """Start of `now`'s IST trading date, in the UTC text format the ticket
-    timestamps use."""
-    midnight = market.as_ist(now).replace(hour=0, minute=0, second=0, microsecond=0)
-    return _to_utc_sql(midnight)
+    """Start of `now`'s IST date, in the UTC text format the ticket
+    timestamps use. The daily counts reset at IST midnight — a calendar
+    day, deliberately not a trading session (unchanged by PK-22)."""
+    return trading_calendar.ist_day_start_utc_sql(now)
 
 
 def _notify() -> None:
@@ -164,6 +164,8 @@ def set_trading_lock(conn: sqlite3.Connection, account_id: int, locked: bool, re
                                 f"{detail}. Reason: {reason or '(none given)'}")
     conn.commit()
     if changed:
+        obs.log_event(logger, "safety.trading_locked" if locked else "safety.trading_unlocked", "warning",
+                      account_id=account_id, reason=reason)
         _notify()
     return changed
 
@@ -185,6 +187,7 @@ def reset_breaker(conn: sqlite3.Connection, account_id: int, reason: str | None)
                                 f"Broker circuit breaker reset manually. Reason: {reason or '(none given)'}")
     conn.commit()
     if was_open:
+        obs.log_event(logger, "safety.breaker_reset", "warning", account_id=account_id, reason=reason)
         _notify()
     return was_open
 
@@ -250,6 +253,7 @@ def record_broker_failure(account_id: int, source: str, detail: str) -> None:
         if conn is not None:
             conn.close()
     if tripped:
+        obs.log_event(logger, "safety.breaker_tripped", "error", account_id=account_id, source=source)
         _notify()
 
 
@@ -602,4 +606,8 @@ def status(conn: sqlite3.Connection, account_id: int) -> dict:
         "market_open": market_open,
         "amo_confirmation_required": not market_open,
         "trading_date_ist": now.date().isoformat(),
+        # PK-22C: the browser only knows weekends and hours; the server knows
+        # NSE holidays, so the header chip defers to these.
+        "session_state": trading_calendar.session_state(now),
+        "holiday_name": trading_calendar.holiday_name(now.date()),
     }

@@ -2,9 +2,10 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from pathlib import Path
 
-from backend import crypto
+from backend import config, crypto
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +173,10 @@ CREATE TABLE IF NOT EXISTS dashboard_panels (
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_panels_account_type ON dashboard_panels(account_id, panel_type);
+-- Its uniqueness index, (account_id, screen, panel_type), is created by
+-- _ensure_dashboard_panels_screen_column once the screen column exists. The
+-- original (account_id, panel_type) index is deliberately NOT created here:
+-- recreating it on every start undid that migration (PK-22B).
 
 CREATE TABLE IF NOT EXISTS risk_settings_history (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -461,8 +465,12 @@ _ACCOUNT_ID_MIGRATIONS = [
 
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # PK-22F: an explicit lock wait (the implicit default was Python's 5 s).
+    # The UI, the order monitor, trailing and reconciliation share this file;
+    # a writer briefly holding the lock makes others wait, not fail.
+    conn = sqlite3.connect(DB_PATH, timeout=config.SQLITE_BUSY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={int(config.SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
@@ -1082,10 +1090,13 @@ def _ensure_account_safety_settings_columns(conn: sqlite3.Connection) -> None:
 
 
 def _seed_risk_settings(conn: sqlite3.Connection) -> None:
+    # WHERE NOT EXISTS rather than INSERT OR IGNORE: an ignored insert still
+    # advances the AUTOINCREMENT counter, so every start used to write (PK-22).
     conn.execute(
         """
-        INSERT OR IGNORE INTO risk_settings (account_id)
-        SELECT id FROM accounts WHERE account_type = 'trading'
+        INSERT INTO risk_settings (account_id)
+        SELECT a.id FROM accounts a WHERE a.account_type = 'trading'
+          AND NOT EXISTS (SELECT 1 FROM risk_settings r WHERE r.account_id = a.id)
         """
     )
 
@@ -1165,10 +1176,11 @@ def _seed_strategy_configs(conn: sqlite3.Connection) -> None:
         for strategy_name, default_params in _DEFAULT_STRATEGY_PARAMS.items():
             conn.execute(
                 """
-                INSERT OR IGNORE INTO strategy_configs (account_id, strategy_name, enabled, params)
-                VALUES (?, ?, 0, ?)
+                INSERT INTO strategy_configs (account_id, strategy_name, enabled, params)
+                SELECT ?, ?, 0, ?
+                WHERE NOT EXISTS (SELECT 1 FROM strategy_configs WHERE account_id = ? AND strategy_name = ?)
                 """,
-                (account["id"], strategy_name, json.dumps(default_params)),
+                (account["id"], strategy_name, json.dumps(default_params), account["id"], strategy_name),
             )
 
 
@@ -1566,7 +1578,7 @@ def _ensure_paper_tables(conn: sqlite3.Connection) -> None:
     # about a live ticket or a live broker id changes; dry-run tickets refer
     # to them by 'PAPER-O-<id>' / 'PAPER-G-<id>' in kite_order_id /
     # kite_gtt_id. Only CREATE ... IF NOT EXISTS: idempotent, no rebuild.
-    conn.executescript(_PAPER_TABLES)
+    _execute_script(conn, _PAPER_TABLES)
 
 
 def _ensure_watchlist_tag_column(conn: sqlite3.Connection) -> None:
@@ -1592,10 +1604,11 @@ def _ensure_dashboard_panels_screen_column(conn: sqlite3.Connection) -> None:
         # coexisting with a same-named Watchlist-screen panel_type; scope
         # uniqueness to (account_id, screen, panel_type) instead.
         conn.execute("DROP INDEX IF EXISTS idx_dashboard_panels_account_type")
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_panels_account_screen_type "
-            "ON dashboard_panels(account_id, screen, panel_type)"
-        )
+    # Outside the column check: a fresh database also needs the scoped index.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_panels_account_screen_type "
+        "ON dashboard_panels(account_id, screen, panel_type)"
+    )
 
 
 _DEFAULT_WATCHLIST_PANELS = [
@@ -1649,55 +1662,355 @@ def _scrub_plaintext_session_tokens(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE sessions SET access_token = '' WHERE access_token != ''")
 
 
+# ---- PK-22A: versioned, transactional migrations ------------------------------
+#
+# Every schema change is an ordered, named migration applied once and recorded
+# in schema_version, each inside its own transaction (with its version row), so
+# a crash mid-migration leaves the database at the previous version and the
+# next start resumes. A database recorded by NEWER code (or by a different
+# migration history) is refused before anything is written.
+#
+# Version 1 is everything before PK-22: the introspective _ensure_* steps.
+# They stay idempotent, so a database of any age (or a brand-new one) is
+# brought to the same place by them; afterwards they never run again.
+# Startup invariants (seeds, the PK-18 token scrub, the closed-trade
+# backfill) still run on every start: they are data-only and write nothing
+# when there is nothing to do.
+
+SCHEMA_VERSION_DDL = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    version        INTEGER PRIMARY KEY,
+    migration_name TEXT NOT NULL,
+    applied_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    duration_ms    INTEGER
+)
+"""
+
+
+class DatabaseSchemaUnsupported(RuntimeError):
+    """The database was migrated by a version of the code this one does not
+    know. Refused rather than guessed at."""
+    error_code = "DATABASE_SCHEMA_UNSUPPORTED"
+
+
+class DatabaseMigrationFailed(RuntimeError):
+    error_code = "DATABASE_MIGRATION_FAILED"
+
+
+def _execute_script(conn: sqlite3.Connection, script: str) -> None:
+    """executescript() COMMITs first, which would end a migration's
+    transaction half-way; this runs the same statements one by one."""
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            conn.execute(buffer)
+            buffer = ""
+    leftover = [part.strip() for part in buffer.splitlines() if part.strip()]
+    if any(not part.startswith("--") for part in leftover):
+        raise ValueError(f"Incomplete SQL statement in script: {buffer[:80]!r}")
+
+
+def _m001_baseline(conn: sqlite3.Connection) -> None:
+    _execute_script(conn, SCHEMA)
+    _run_column_migrations(conn)
+    _ensure_closes_ticket_id_column(conn)
+    _ensure_risk_rejected_status(conn)
+    _ensure_risk_rejected_event_type(conn)
+    _ensure_archived_column(conn)
+    _ensure_archived_event_type(conn)
+    _ensure_rule_checklist_column(conn)
+    _ensure_entry_evaluation_column(conn)
+    _ensure_kite_chart_columns(conn)
+    _ensure_kite_chart_event_type(conn)
+    _ensure_stop_adjusted_breakeven_event_type(conn)
+    _ensure_submission_unknown_event_type(conn)
+    _ensure_account_safety_event_types(conn)
+    _ensure_starting_capital_column(conn)
+    _ensure_account_safety_settings_columns(conn)
+    _ensure_strategy_version_column(conn)
+    _ensure_closed_trades_strategy_version_column(conn)
+    _ensure_strategy_configs_versioning_columns(conn)
+    _ensure_backtest_runs_rigor_columns(conn)
+    _ensure_backtest_pk21_columns(conn)
+    _ensure_execution_tracking_columns(conn)
+    _ensure_alert_action_source(conn)
+    # PK-22 fix: that rebuild copies an explicit column list that predates
+    # these three columns, so on a database old enough to need it they were
+    # added above and then dropped again, never to return. Re-ensured here
+    # (no-ops on every other database). Found by the synthetic old-database
+    # migration test.
+    _ensure_entry_evaluation_column(conn)
+    _ensure_kite_chart_columns(conn)
+    _ensure_submission_tracking_columns(conn)
+    _ensure_filled_quantity_column(conn)
+    _ensure_single_exit_owner_index(conn)
+    _ensure_closed_trades_one_per_position_index(conn)
+    _ensure_instrument_tick_size_column(conn)
+    _ensure_watchlist_tag_column(conn)
+    _ensure_dashboard_panels_screen_column(conn)
+    _ensure_reconciliation_issue_columns(conn)
+    _ensure_paper_tables(conn)
+    _execute_script(conn, _ACCOUNT_ID_INDEXES)
+
+
+def _m002_drop_legacy_dashboard_index(conn: sqlite3.Connection) -> None:
+    # Before PK-22, SCHEMA re-created the (account_id, panel_type) unique
+    # index on every start after the screen migration had dropped it, so
+    # every restarted database carries it again. It forbids the same
+    # panel_type on two screens, which the screen-scoped index exists to allow.
+    conn.execute("DROP INDEX IF EXISTS idx_dashboard_panels_account_type")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_panels_account_screen_type "
+        "ON dashboard_panels(account_id, screen, panel_type)"
+    )
+
+
+def _m003_query_indexes(conn: sqlite3.Connection) -> None:
+    # PK-22B/G (audit P2-2). Only indexes a measured hot path needs; see the
+    # PK-22 report for the EXPLAIN QUERY PLAN / timing evidence.
+    #  * closes_ticket_id — every "exits of this position" lookup: the
+    #    correlated open-quantity subquery (position_quantity), the NOT IN of
+    #    risk_engine._OPEN_POSITION_WHERE, the monitor/trailing/reconciliation
+    #    per-position exit checks. The existing partial exit-owner index only
+    #    covers in-flight exits.
+    #  * (account_id, mode, status) — the monitor, trailing, reconciliation and
+    #    risk queries all filter an account's tickets by mode and status.
+    #  * kite_order_id / kite_gtt_id — GET /api/orders and /api/gtts map every
+    #    broker id back to its ticket; the cancel routes look one up.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_tickets_closes_ticket ON trade_tickets(closes_ticket_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trade_tickets_account_mode_status ON trade_tickets(account_id, mode, status)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_tickets_kite_order ON trade_tickets(kite_order_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_tickets_kite_gtt ON trade_tickets(kite_gtt_id)")
+
+
+_OHLC_INTEGRITY_TABLES = """
+CREATE TABLE IF NOT EXISTS ohlc_history_status (
+    instrument_token INTEGER PRIMARY KEY,
+    symbol           TEXT NOT NULL,
+    provider         TEXT NOT NULL DEFAULT 'kite',
+    first_date       TEXT,
+    last_date        TEXT,
+    bar_count        INTEGER NOT NULL DEFAULT 0,
+    downloaded_at    TEXT,
+    refreshed_at     TEXT,
+    data_hash        TEXT,
+    status           TEXT NOT NULL DEFAULT 'OK' CHECK (status IN ('OK', 'SUSPECT', 'NEEDS_REFRESH')),
+    status_reason    TEXT,
+    status_at        TEXT,
+    verified_gaps    TEXT
+);
+CREATE TABLE IF NOT EXISTS symbol_transitions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    instrument_token INTEGER NOT NULL,
+    old_symbol       TEXT NOT NULL,
+    new_symbol       TEXT NOT NULL,
+    detected_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    source           TEXT NOT NULL,
+    UNIQUE (instrument_token, old_symbol, new_symbol)
+);
+"""
+
+
+def _m004_ohlc_history_integrity(conn: sqlite3.Connection) -> None:
+    # PK-22D: per-instrument history metadata and trust status (see
+    # backend/ohlc_integrity.py), backfilled for every instrument already
+    # stored, with the corporate-action gap scan run once. ohlc_meta keeps
+    # its one job (how far back history was requested) unchanged.
+    from backend import ohlc_integrity
+    _execute_script(conn, _OHLC_INTEGRITY_TABLES)
+    ohlc_integrity.backfill_all(conn)
+
+
+# (version, name, function) — append only; never renumber or rename a
+# released migration: the name is checked against every database's history.
+MIGRATIONS: list[tuple[int, str, object]] = [
+    (1, "baseline_pk0_pk21", _m001_baseline),
+    (2, "pk22_drop_legacy_dashboard_index", _m002_drop_legacy_dashboard_index),
+    (3, "pk22_query_indexes", _m003_query_indexes),
+    (4, "pk22_ohlc_history_integrity", _m004_ohlc_history_integrity),
+]
+LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
+
+# What the last init_db() in this process did (diagnostics, tests).
+last_init: dict = {}
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone() is not None
+
+
+def migration_history(conn: sqlite3.Connection) -> list[dict]:
+    if not _table_exists(conn, "schema_version"):
+        return []
+    return [dict(r) for r in conn.execute(
+        "SELECT version, migration_name, applied_at, duration_ms FROM schema_version ORDER BY version"
+    ).fetchall()]
+
+
+def _check_history(history: list[dict]) -> int:
+    """The current version, or DatabaseSchemaUnsupported when the history is
+    not a prefix of this code's MIGRATIONS."""
+    known = {version: name for version, name, _ in MIGRATIONS}
+    newest = history[-1] if history else None
+    if newest is not None and newest["version"] > LATEST_SCHEMA_VERSION:
+        raise DatabaseSchemaUnsupported(
+            f"DATABASE_SCHEMA_UNSUPPORTED: the database is at schema version {newest['version']} "
+            f"({newest['migration_name']}), newer than this code supports ({LATEST_SCHEMA_VERSION}). "
+            "Run the newer version of Kite Terminal, or restore a backup taken for this version."
+        )
+    for expected, row in enumerate(history, start=1):
+        version, name = row["version"], row["migration_name"]
+        if version != expected or known.get(version) != name:
+            raise DatabaseSchemaUnsupported(
+                f"DATABASE_SCHEMA_UNSUPPORTED: schema_version row {version} ({name!r}) does not match this "
+                f"code's migration {expected} ({known.get(expected)!r}). The database was migrated by "
+                "different code; refusing to guess."
+            )
+    return newest["version"] if newest else 0
+
+
+def schema_status(conn: sqlite3.Connection) -> dict:
+    """Read-only summary for diagnostics/readiness. Never raises."""
+    history = migration_history(conn)
+    try:
+        current = _check_history(history)
+        supported, error = True, None
+    except DatabaseSchemaUnsupported as e:
+        current = history[-1]["version"] if history else 0
+        supported, error = False, str(e)
+    pending = [{"version": v, "name": n} for v, n, _ in MIGRATIONS if v > current] if supported else []
+    return {
+        "current_version": current,
+        "latest_version": LATEST_SCHEMA_VERSION,
+        "pending": pending,
+        "history": history,
+        "supported": supported,
+        "error": error,
+        "up_to_date": supported and not pending,
+    }
+
+
+def _database_file(conn: sqlite3.Connection) -> Path | None:
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        if row[1] == "main" and row[2]:
+            return Path(row[2])
+    return None
+
+
+def _has_user_tables(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
+    ).fetchone() is not None
+
+
+def backup_database(conn: sqlite3.Connection, destination: Path) -> Path:
+    """Online-backup `conn`'s database to `destination` (never overwritten:
+    a timestamp is appended if it exists) and prove the copy is intact."""
+    if destination.exists():
+        stamp = time.strftime("%Y%m%d%H%M%S")
+        destination = destination.with_name(f"{destination.name}.{stamp}")
+    target = sqlite3.connect(destination)
+    try:
+        conn.backup(target)
+        result = target.execute("PRAGMA integrity_check").fetchone()[0]
+    finally:
+        target.close()
+    if result != "ok":
+        raise DatabaseMigrationFailed(
+            f"DATABASE_MIGRATION_FAILED: the pre-migration backup {destination.name} failed its integrity "
+            f"check ({result}); nothing was migrated."
+        )
+    return destination
+
+
+def _foreign_key_violations(conn: sqlite3.Connection) -> int:
+    return len(conn.execute("PRAGMA foreign_key_check").fetchall())
+
+
+def migrate(conn: sqlite3.Connection) -> list[int]:
+    """Applies every pending migration; returns the versions applied."""
+    current = _check_history(migration_history(conn))  # refuses before any write
+    pending = [m for m in MIGRATIONS if m[0] > current]
+    if not pending:
+        return []
+
+    target_version = pending[-1][0]
+    db_file = _database_file(conn)
+    if db_file is not None and _has_user_tables(conn):
+        backup = backup_database(conn, db_file.with_name(f"{db_file.name}.pre_schema_v{target_version}_bak"))
+        logger.info("event=migration.backup schema_from=%d schema_to=%d backup=%s",
+                    current, target_version, backup.name)
+
+    applied: list[int] = []
+    previous_isolation = conn.isolation_level
+    conn.isolation_level = None  # explicit BEGIN/COMMIT below
+    try:
+        for version, name, apply in pending:
+            violations_before = _foreign_key_violations(conn)
+            # Table rebuilds need FK enforcement off, and the PRAGMA is a
+            # no-op inside a transaction, so it is set around it.
+            conn.execute("PRAGMA foreign_keys=OFF")
+            started = time.perf_counter()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(SCHEMA_VERSION_DDL)
+                apply(conn)
+                violations_after = _foreign_key_violations(conn)
+                if violations_after > violations_before:
+                    raise DatabaseMigrationFailed(
+                        f"DATABASE_MIGRATION_FAILED: migration {version} ({name}) would add "
+                        f"{violations_after - violations_before} foreign key violation(s)."
+                    )
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                conn.execute(
+                    "INSERT INTO schema_version (version, migration_name, duration_ms) VALUES (?, ?, ?)",
+                    (version, name, duration_ms),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                logger.exception("event=migration.failed version=%d name=%s (rolled back)", version, name)
+                raise
+            finally:
+                conn.execute("PRAGMA foreign_keys=ON")
+            applied.append(version)
+            logger.info("event=migration.applied version=%d name=%s duration_ms=%d", version, name, duration_ms)
+        conn.execute("PRAGMA optimize")
+    finally:
+        conn.isolation_level = previous_isolation
+    return applied
+
+
+def _run_startup_invariants(conn: sqlite3.Connection) -> None:
+    """Data-only steps run on every start. None issues DDL, and none writes
+    when there is nothing to do (a second start changes no row)."""
+    _seed_default_account(conn)
+    _ensure_trading_account_type(conn)
+    _seed_execution_settings(conn)
+    _seed_risk_settings(conn)
+    _seed_account_safety_state(conn)
+    _seed_dashboard_panels(conn)
+    _ensure_watchlist_summary_panel(conn)
+    _ensure_watchlist_panels(conn)
+    _seed_strategy_configs(conn)
+    _ensure_todays_actions_panel(conn)
+    _seed_strategy_config_versions(conn)
+    _scrub_plaintext_session_tokens(conn)
+
+
 def init_db() -> None:
     crypto.ensure_encryption_key()
     conn = get_connection()
     try:
-        conn.executescript(SCHEMA)
-        _run_column_migrations(conn)
-        _ensure_closes_ticket_id_column(conn)
-        _ensure_risk_rejected_status(conn)
-        _ensure_risk_rejected_event_type(conn)
-        _ensure_archived_column(conn)
-        _ensure_archived_event_type(conn)
-        _ensure_rule_checklist_column(conn)
-        _ensure_entry_evaluation_column(conn)
-        _ensure_kite_chart_columns(conn)
-        _ensure_kite_chart_event_type(conn)
-        _ensure_stop_adjusted_breakeven_event_type(conn)
-        _ensure_submission_unknown_event_type(conn)
-        _ensure_account_safety_event_types(conn)
-        _ensure_starting_capital_column(conn)
-        _ensure_account_safety_settings_columns(conn)
-        _ensure_strategy_version_column(conn)
-        _ensure_closed_trades_strategy_version_column(conn)
-        _ensure_strategy_configs_versioning_columns(conn)
-        _ensure_backtest_runs_rigor_columns(conn)
-        _ensure_backtest_pk21_columns(conn)
-        _ensure_execution_tracking_columns(conn)
-        _ensure_alert_action_source(conn)
-        _ensure_submission_tracking_columns(conn)
-        _ensure_filled_quantity_column(conn)
-        _ensure_single_exit_owner_index(conn)
-        _ensure_closed_trades_one_per_position_index(conn)
-        _ensure_instrument_tick_size_column(conn)
-        _ensure_watchlist_tag_column(conn)
-        _ensure_dashboard_panels_screen_column(conn)
-        _ensure_reconciliation_issue_columns(conn)
-        _ensure_paper_tables(conn)
-        conn.executescript(_ACCOUNT_ID_INDEXES)
-        _seed_default_account(conn)
-        _ensure_trading_account_type(conn)
-        _seed_execution_settings(conn)
-        _seed_risk_settings(conn)
-        _seed_account_safety_state(conn)
-        _seed_dashboard_panels(conn)
-        _ensure_watchlist_summary_panel(conn)
-        _ensure_watchlist_panels(conn)
-        _seed_strategy_configs(conn)
-        _ensure_todays_actions_panel(conn)
-        _seed_strategy_config_versions(conn)
-        _scrub_plaintext_session_tokens(conn)
+        applied = migrate(conn)
+        changes_before = conn.total_changes
+        _run_startup_invariants(conn)
         conn.commit()
 
         # Backfill runs after all schema/seed steps have committed, in its
@@ -1706,5 +2019,11 @@ def init_db() -> None:
         from backend import journal
         journal.backfill_closed_trades(conn)
         conn.commit()
+        last_init.clear()
+        last_init.update({
+            "applied_migrations": applied,
+            "startup_row_changes": conn.total_changes - changes_before,
+            "schema_version": LATEST_SCHEMA_VERSION,
+        })
     finally:
         conn.close()

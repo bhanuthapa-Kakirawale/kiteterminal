@@ -143,3 +143,27 @@ BACKTEST_COST_DEFAULTS = {
 # (split/bonus). ohlc_daily carries no adjustment metadata, so this is a
 # warning only — it never changes a fill (PK-21M; detection per audit P2-5).
 SUSPECT_CORPORATE_ACTION_GAP_PCT = 25.0
+
+# PK-22F: how long a connection waits for another writer's lock before
+# raising "database is locked" (sqlite3 timeout + PRAGMA busy_timeout).
+SQLITE_BUSY_TIMEOUT_SECONDS = 10.0
+
+# PK-22D: a stored daily close that the provider now reports differently by
+# more than this (on 2+ dates, by one consistent factor) means Kite has
+# back-adjusted the history (split/bonus): the symbol is marked NEEDS_REFRESH.
+HISTORY_ADJUSTMENT_TOLERANCE_PCT = 2.0
+
+# PK-22E: rotating log file (enabled by the launcher, KITE_TERMINAL_LOG_FILE).
+# Disk use is bounded at LOG_FILE_MAX_BYTES x (LOG_FILE_BACKUP_COUNT + 1).
+LOG_FILE_MAX_BYTES = 10 * 1024 * 1024
+LOG_FILE_BACKUP_COUNT = 10
+
+# PK-22F: how long shutdown waits for the cancelled background loops.
+WORKER_SHUTDOWN_TIMEOUT_SECONDS = 10.0
+
+# PK-22F: per-browser-socket outbox bounds (backend/tick_queue.py). Ticks
+# coalesce to the latest per instrument (at most WS_MAX_COALESCED_TOKENS);
+# more than WS_MAX_PENDING_EVENTS undelivered events close the socket so the
+# client reconnects and resyncs, rather than losing one.
+WS_MAX_PENDING_EVENTS = 1000
+WS_MAX_COALESCED_TOKENS = 5000

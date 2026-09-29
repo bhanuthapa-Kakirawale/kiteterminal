@@ -20,7 +20,7 @@ import json
 import logging
 from datetime import datetime, time, timedelta, timezone
 
-from backend import config, data_jobs, execution, kite_client, market, risk_engine, strategy_engine
+from backend import config, data_jobs, execution, kite_client, market, risk_engine, strategy_engine, worker_health
 from backend.accounts import get_default_account
 from backend.db import get_connection
 from backend.ticker import ticker_manager
@@ -107,14 +107,25 @@ def _mark_interrupted_runs() -> None:
         conn.close()
 
 
+def _due_now() -> bool:
+    return is_due() and _session_available()
+
+
 async def run_automation_loop() -> None:
-    _mark_interrupted_runs()
+    # PK-22F: the one-time "mark interrupted runs" step is inside the retry
+    # loop — a database lock at startup used to end this task for good,
+    # silently — and the DB reads run off the event loop.
+    interrupted_marked = False
     while True:
         try:
-            if is_due() and _session_available():
-                session = market.last_complete_session_date()
-                late = market.now_ist() - scheduled_at(session) > timedelta(minutes=30)
-                await run_pipeline("catch_up" if late else "scheduled")
+            with worker_health.cycle("automation"):
+                if not interrupted_marked:
+                    await asyncio.to_thread(_mark_interrupted_runs)
+                    interrupted_marked = True
+                if await asyncio.to_thread(_due_now):
+                    session = market.last_complete_session_date()
+                    late = market.now_ist() - scheduled_at(session) > timedelta(minutes=30)
+                    await run_pipeline("catch_up" if late else "scheduled")
         except Exception:
             logger.exception("Autopilot scheduler tick failed")
         await asyncio.sleep(config.AUTOMATION_POLL_SECONDS)

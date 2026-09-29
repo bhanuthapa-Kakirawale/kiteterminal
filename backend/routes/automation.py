@@ -1,9 +1,7 @@
-import asyncio
-
 from fastapi import APIRouter, Depends, HTTPException
 from kiteconnect import KiteConnect
 
-from backend import automation
+from backend import automation, workers
 from backend.kite_client import require_trading_account
 
 router = APIRouter()
@@ -18,5 +16,5 @@ def automation_status(kite: KiteConnect = Depends(require_trading_account)):
 async def automation_run_now(kite: KiteConnect = Depends(require_trading_account)):
     if automation.is_running():
         raise HTTPException(409, {"error_code": "ALREADY_RUNNING", "message": "The autopilot is already running."})
-    asyncio.create_task(automation.run_pipeline("manual"))
+    workers.supervisor.spawn("autopilot_manual", automation.run_pipeline("manual"))
     return {"data": {"started": True}}

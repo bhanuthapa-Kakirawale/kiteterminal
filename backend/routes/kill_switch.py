@@ -9,6 +9,7 @@ from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
 from backend.models import EmergencyExitConfirmRequest
+from backend.obs import log_event
 from backend.routes.tickets import _transition, confirm_and_execute_ticket
 
 logger = logging.getLogger(__name__)
@@ -276,6 +277,9 @@ def _summary_detail(positions: list, results: list[dict], summary: dict) -> str:
 
 
 def _log_summary_event(conn, account, detail: str) -> None:
+    # PK-22E: the structured line first — it survives even if the DB event
+    # below cannot be written.
+    log_event(logger, "emergency_exit.completed", "warning", account_id=account["id"], summary=detail)
     # A failure to write the audit event must not hide the per-position
     # results from the user — the orders were already requested.
     try:

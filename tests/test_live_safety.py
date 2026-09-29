@@ -28,7 +28,9 @@ import requests
 from fastapi.testclient import TestClient
 from kiteconnect.exceptions import NetworkException
 
-from conftest import displayed_mode, TERMINAL_ORIGIN, account_id, set_mode, terminal_client, ticket_row
+from conftest import (
+    displayed_mode, TERMINAL_ORIGIN, account_id, as_pre_pk22_database, set_mode, terminal_client, ticket_row,
+)
 from test_baseline_api import _insert_ticket, _manual_ticket
 from test_review_changes import _breakeven_proposal
 
@@ -1613,6 +1615,7 @@ def test_p0_4_exit_owner_index_migration_is_idempotent_and_tolerates_legacy_dupl
     dup = [_pending_exit(env, buy_id, status="executed", mode="live", executed_at="2026-09-02 04:00:00",
                          entry_fill_status="pending")
            for _ in range(2)]
+    as_pre_pk22_database(env.db)  # PK-22: the legacy migration runs once per database
     env.db.init_db()
     assert not index_exists()
     assert "Not creating idx_trade_tickets_one_exit_owner" in caplog.text
@@ -1624,6 +1627,7 @@ def test_p0_4_exit_owner_index_migration_is_idempotent_and_tolerates_legacy_dupl
         conn.commit()
     finally:
         conn.close()
+    as_pre_pk22_database(env.db)
     env.db.init_db()
     assert index_exists()
 

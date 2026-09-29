@@ -1,0 +1,108 @@
+{
+  "_about": "NSE Capital Market (equity) trading holidays on weekdays, plus exchange sessions held outside the regular calendar. Loaded by backend/trading_calendar.py; never fetched at runtime. Weekends are always closed and are not listed. Yearly update: add the new year from NSE's 'Trading holidays for the calendar year' circular (published each December) and any later amendment circular, then run: python -m backend.trading_calendar check --verify-db <copy of the DB>.",
+  "segment": "NSE Capital Market",
+  "verified_against_ohlc_through": "2026-09-22",
+  "years": {
+    "2023": {
+      "source": "NSE/CMTR/54757 (circular 150/2022, 08-Dec-2022)",
+      "amendments": ["Bakri Id moved from 28-Jun-2023 to 29-Jun-2023 by NSE circular of June 2023"],
+      "holidays": [
+        {"date": "2023-01-26", "name": "Republic Day"},
+        {"date": "2023-03-07", "name": "Holi"},
+        {"date": "2023-03-30", "name": "Ram Navami"},
+        {"date": "2023-04-04", "name": "Mahavir Jayanti"},
+        {"date": "2023-04-07", "name": "Good Friday"},
+        {"date": "2023-04-14", "name": "Dr. Baba Saheb Ambedkar Jayanti"},
+        {"date": "2023-05-01", "name": "Maharashtra Day"},
+        {"date": "2023-06-29", "name": "Bakri Id"},
+        {"date": "2023-08-15", "name": "Independence Day"},
+        {"date": "2023-09-19", "name": "Ganesh Chaturthi"},
+        {"date": "2023-10-02", "name": "Mahatma Gandhi Jayanti"},
+        {"date": "2023-10-24", "name": "Dussehra"},
+        {"date": "2023-11-14", "name": "Diwali-Balipratipada"},
+        {"date": "2023-11-27", "name": "Gurunanak Jayanti"},
+        {"date": "2023-12-25", "name": "Christmas"}
+      ]
+    },
+    "2024": {
+      "source": "NSE/CMTR/59722 (circular 154/2023, 12-Dec-2023)",
+      "amendments": [
+        "22-Jan-2024 declared a holiday (Maharashtra public holiday); 20-Jan-2024 (Saturday) traded as a full session",
+        "20-May-2024 General Elections (Mumbai)",
+        "20-Nov-2024 Maharashtra Legislative Assembly Elections"
+      ],
+      "holidays": [
+        {"date": "2024-01-22", "name": "Special holiday (Maharashtra public holiday)"},
+        {"date": "2024-01-26", "name": "Republic Day"},
+        {"date": "2024-03-08", "name": "Mahashivratri"},
+        {"date": "2024-03-25", "name": "Holi"},
+        {"date": "2024-03-29", "name": "Good Friday"},
+        {"date": "2024-04-11", "name": "Id-Ul-Fitr (Ramadan Eid)"},
+        {"date": "2024-04-17", "name": "Shri Ram Navmi"},
+        {"date": "2024-05-01", "name": "Maharashtra Day"},
+        {"date": "2024-05-20", "name": "General Elections (Mumbai)"},
+        {"date": "2024-06-17", "name": "Bakri Id"},
+        {"date": "2024-07-17", "name": "Moharram"},
+        {"date": "2024-08-15", "name": "Independence Day/Parsi New Year"},
+        {"date": "2024-10-02", "name": "Mahatma Gandhi Jayanti"},
+        {"date": "2024-11-01", "name": "Diwali Laxmi Pujan"},
+        {"date": "2024-11-15", "name": "Gurunanak Jayanti"},
+        {"date": "2024-11-20", "name": "Maharashtra Legislative Assembly Elections"},
+        {"date": "2024-12-25", "name": "Christmas"}
+      ]
+    },
+    "2025": {
+      "source": "NSE/CMTR/65587 (circular 170/2024, 13-Dec-2024)",
+      "amendments": [],
+      "holidays": [
+        {"date": "2025-02-26", "name": "Mahashivratri"},
+        {"date": "2025-03-14", "name": "Holi"},
+        {"date": "2025-03-31", "name": "Id-Ul-Fitr (Ramadan Eid)"},
+        {"date": "2025-04-10", "name": "Shri Mahavir Jayanti"},
+        {"date": "2025-04-14", "name": "Dr. Baba Saheb Ambedkar Jayanti"},
+        {"date": "2025-04-18", "name": "Good Friday"},
+        {"date": "2025-05-01", "name": "Maharashtra Day"},
+        {"date": "2025-08-15", "name": "Independence Day"},
+        {"date": "2025-08-27", "name": "Ganesh Chaturthi"},
+        {"date": "2025-10-02", "name": "Mahatma Gandhi Jayanti/Dussehra"},
+        {"date": "2025-10-21", "name": "Diwali Laxmi Pujan"},
+        {"date": "2025-10-22", "name": "Diwali-Balipratipada"},
+        {"date": "2025-11-05", "name": "Prakash Gurpurb Sri Guru Nanak Dev"},
+        {"date": "2025-12-25", "name": "Christmas"}
+      ]
+    },
+    "2026": {
+      "source": "NSE/CMTR/71775 (circular 172/2025, 12-Dec-2025)",
+      "amendments": ["15-Jan-2026 Municipal Corporation Elections (Maharashtra)"],
+      "holidays": [
+        {"date": "2026-01-15", "name": "Municipal Corporation Elections (Maharashtra)"},
+        {"date": "2026-01-26", "name": "Republic Day"},
+        {"date": "2026-03-03", "name": "Holi"},
+        {"date": "2026-03-26", "name": "Shri Ram Navami"},
+        {"date": "2026-03-31", "name": "Shri Mahavir Jayanti"},
+        {"date": "2026-04-03", "name": "Good Friday"},
+        {"date": "2026-04-14", "name": "Dr. Baba Saheb Ambedkar Jayanti"},
+        {"date": "2026-05-01", "name": "Maharashtra Day"},
+        {"date": "2026-05-28", "name": "Bakri Id"},
+        {"date": "2026-06-26", "name": "Muharram"},
+        {"date": "2026-09-14", "name": "Ganesh Chaturthi"},
+        {"date": "2026-10-02", "name": "Mahatma Gandhi Jayanti"},
+        {"date": "2026-10-20", "name": "Dussehra"},
+        {"date": "2026-11-10", "name": "Diwali-Balipratipada"},
+        {"date": "2026-11-24", "name": "Prakash Gurpurb Sri Guru Nanak Dev"},
+        {"date": "2026-12-25", "name": "Christmas"}
+      ]
+    }
+  },
+  "special_sessions": [
+    {"date": "2023-11-12", "kind": "muhurat", "note": "Muhurat Trading (Diwali Laxmi Pujan, Sunday)"},
+    {"date": "2024-01-20", "kind": "special_live", "note": "Saturday full trading session (22-Jan-2024 was declared a holiday)"},
+    {"date": "2024-03-02", "kind": "special_live", "note": "Saturday special live session (disaster-recovery site switchover)"},
+    {"date": "2024-05-18", "kind": "special_live", "note": "Saturday special live session (disaster-recovery site switchover)"},
+    {"date": "2024-11-01", "kind": "muhurat", "note": "Muhurat Trading on the Diwali Laxmi Pujan holiday"},
+    {"date": "2025-02-01", "kind": "special_live", "note": "Saturday live session for the Union Budget"},
+    {"date": "2025-10-21", "kind": "muhurat", "note": "Muhurat Trading on the Diwali Laxmi Pujan holiday"},
+    {"date": "2026-02-01", "kind": "special_live", "note": "Sunday live session for the Union Budget"},
+    {"date": "2026-11-08", "kind": "muhurat", "note": "Muhurat Trading (Diwali Laxmi Pujan, Sunday); timings to be notified by NSE"}
+  ]
+}

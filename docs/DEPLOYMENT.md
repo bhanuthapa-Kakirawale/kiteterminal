@@ -49,6 +49,7 @@ All settings are environment variables, which can go in `.env`; see
 | `KITE_TERMINAL_TRUSTED_PROXY_IPS` | *(empty)* | IP addresses or networks of a TLS reverse proxy whose `X-Forwarded-Proto`/`-For` may be trusted. |
 | `KITE_TERMINAL_DEV_RELOAD` | `0` | Development only: restart on file changes (`--dev-reload`). |
 | `KITE_TERMINAL_WORKERS` | `1` | Must be 1. |
+| `KITE_TERMINAL_LOG_FILE` | `logs/kite_terminal.log` (launcher) | PK-22: rotating log file, 10 MB × 11 files at most. `off` disables it (console only). Bare `uvicorn` and the tests log to the console unless it is set. |
 | `KITE_TERMINAL_ENCRYPTION_KEY` | generated | Fernet key for the stored secret and token. The app appends a generated key to `.env` if none is set. For a VM, supply it from the service environment instead. A value already in the environment is never overridden by `.env`. |
 
 ## Mode A — Local desktop (default)
@@ -180,6 +181,78 @@ Anyone who can read both the `.env` and the database can decrypt the stored
 secret. Keeping the encryption key in the service environment, outside the
 application directory, separates the two.
 
+## Operations (PK-22)
+
+### Health, readiness and diagnostics
+
+| Endpoint | Meaning |
+|---|---|
+| `GET /api/health` | Liveness: the process serves requests and the database answers. Always 200 while up. |
+| `GET /api/ready` | Readiness to trade: 200 when ready, **503** with `blockers` otherwise. The market does not have to be open. Blockers: schema not current or unsupported, database integrity failure, a critical worker (order monitor, trailing, reconciliation) not running, no valid Kite session for today, trading lock, open circuit breaker. |
+| `GET /api/diagnostics` | Everything the **System Diagnostics** page shows. Read-only; no broker call; no credential. |
+
+All three answer only on an allowed Host, like every other route. A supervisor
+or uptime check can poll `/api/health`; check `/api/ready` before trading.
+
+### Logs
+
+The launcher writes `logs/kite_terminal.log` (git-ignored) and rotates it at
+10 MB, keeping 10 older files, so disk use is bounded at about 110 MB. The
+PK-18 redaction filter applies to the file exactly as to the console. Critical
+flows write one structured line each (`event=order.submitting ticket_id=…
+order_tag=… cid=…`); `cid` is the correlation id of the HTTP request (echoed
+in the `X-Request-ID` response header) or of the background cycle (`om-…`,
+`tr-…`, `rc-…`). To trace one approval: grep its `cid`, then its `ticket_id`
+and `order_id` for what the order monitor did with it later.
+
+### Database migrations and backups
+
+The schema is versioned (`schema_version` table). On start, the app applies
+only migrations it has not applied before, each in its own transaction, and
+first copies the database to `kite_terminal.db.pre_schema_v<N>_bak` (checked
+with `integrity_check`). A database written by a **newer** version is refused
+with `DATABASE_SCHEMA_UNSUPPORTED` and nothing is changed: run the newer code,
+or restore the matching backup.
+
+Maintenance (stop the app first for `vacuum`):
+
+```
+python -m backend.db_maintenance status      # schema version, pending migrations, size
+python -m backend.db_maintenance integrity   # PRAGMA integrity_check + foreign_key_check
+python -m backend.db_maintenance backup      # online backup to kite_terminal.db.manual_<time>_bak
+python -m backend.db_maintenance analyze     # refresh query-planner statistics
+python -m backend.db_maintenance vacuum      # compact the file (app stopped!)
+```
+
+Nothing runs `VACUUM` automatically; `PRAGMA optimize` runs only after a
+migration was applied.
+
+### NSE holiday calendar — yearly update
+
+`backend/calendar_data/nse_equity_holidays.json` lists NSE's weekday trading
+holidays per year from the official "Trading holidays for the calendar year"
+circular (published each December) and its amendments. Each December:
+
+1. Add the new year with its circular reference, from nseindia.com.
+2. Add any mid-year amendment circular (for example an election holiday).
+3. Validate, and cross-check against stored candles on a **copy** of the DB:
+   `python -m backend.trading_calendar check --verify-db <copy.db>`.
+
+If a year is missing, weekdays are assumed to trade (as before PK-22) and
+readiness reports the warning `CALENDAR_YEAR_UNCOVERED`. Special sessions
+(Muhurat trading, a weekend budget session) are listed but their hours are not
+modelled: the app treats the market as closed during them.
+
+### Historical price data
+
+A symbol whose stored history Kite has since back-adjusted (a split or bonus)
+is flagged `NEEDS_REFRESH`; an unexplained gap of more than 25% is `SUSPECT`.
+Both are excluded from backtests with the reason, and `NEEDS_REFRESH` symbols
+are skipped by the live scan. Nothing is rewritten automatically: rebuild a
+flagged symbol from **System Diagnostics → Historical price data → Rebuild
+history** (needs a Kite session), which re-downloads its whole history and
+replaces it in one transaction.
+
 ## Checklist before going live on a VM
 
 - [ ] The firewall allows only SSH or VPN inbound, and port 8000 is not publicly reachable. Check from outside, for example with an online port check against the static IP.
@@ -187,3 +260,5 @@ application directory, separates the two.
 - [ ] The Kite redirect URL matches the host the browser uses.
 - [ ] `.env` and the DB are readable only by the service user, and the backups are protected.
 - [ ] The process runs under a supervisor with restart-on-crash, as a single instance.
+- [ ] `GET /api/ready` returns 200 (after logging in to Kite), and System Diagnostics shows no blockers.
+- [ ] `logs/` is on a disk with room for ~110 MB, and readable only by the service user.

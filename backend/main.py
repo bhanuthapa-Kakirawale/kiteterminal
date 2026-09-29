@@ -6,15 +6,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+from backend import obs  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format=obs.LOG_FORMAT)
+# PK-22E: every line carries its correlation id; with KITE_TERMINAL_LOG_FILE
+# set (the launcher's default) it also goes to a bounded, rotating file.
+obs.use_correlation_formatter()
+obs.install_file_logging()
 
 from backend.redaction import install_log_redaction, redact_detail
 
 # Before anything can log a token: uvicorn's access log alone would print
-# /callback?request_token=... (PK-18).
+# /callback?request_token=... (PK-18). Also covers the file handler above.
 install_log_redaction()
 
 from fastapi import FastAPI
@@ -25,23 +28,30 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import (
     automation,
+    config,
     data_jobs,
+    db,
     instruments,
     kite_client,
     order_monitor,
     reconciliation,
     sector_mapping,
     trailing_engine,
+    version,
+    workers,
 )
 from backend import server
 from backend.accounts import get_default_account
 from backend.db import init_db
+from backend.obs import CorrelationIdMiddleware, log_event
 from backend.security import SecurityHeadersMiddleware, TerminalOriginGuard, TrustedHostGuard
 from backend.routes import (
     account_safety as account_safety_routes,
     auth,
     automation as automation_routes,
     dashboard_panels,
+    data_health as data_health_routes,
+    diagnostics as diagnostics_routes,
     instruments as instruments_routes,
     journal as journal_routes,
     kill_switch,
@@ -65,7 +75,7 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
 # No Swagger/ReDoc pages: they load their JavaScript from a public CDN, which
 # the Content-Security-Policy forbids (PK-18).
-app = FastAPI(title="Kite Terminal", docs_url=None, redoc_url=None)
+app = FastAPI(title="Kite Terminal", version=version.APP_VERSION, docs_url=None, redoc_url=None)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -77,12 +87,13 @@ async def redacting_http_exception_handler(request, exc):
     exc.detail = redact_detail(exc.detail)
     return await http_exception_handler(request, exc)
 
+# The supervisor's names; diagnostics and readiness report them by these.
 _BACKGROUND_LOOPS = {
-    "trailing_task": trailing_engine.run_trailing_loop,
-    "data_job_worker_task": data_jobs.run_job_worker,
-    "reconciliation_task": reconciliation.run_reconciliation_loop,
-    "order_monitor_task": order_monitor.run_order_monitor_loop,
-    "automation_task": automation.run_automation_loop,
+    "trailing": trailing_engine.run_trailing_loop,
+    "data_jobs": data_jobs.run_job_worker,
+    "reconciliation": reconciliation.run_reconciliation_loop,
+    "order_monitor": order_monitor.run_order_monitor_loop,
+    "automation": automation.run_automation_loop,
 }
 
 
@@ -90,9 +101,15 @@ _BACKGROUND_LOOPS = {
 async def on_startup():
     # First: an unsafe bind or worker count aborts startup before any
     # background loop or broker session can start (PK-18).
-    install_log_redaction()  # again, in case the server replaced its handlers
+    obs.install_file_logging()  # again, in case the server replaced its handlers
+    install_log_redaction()
     server.enforce_runtime_policy()
+    # A database written by newer code is refused here, before any loop
+    # starts (DATABASE_SCHEMA_UNSUPPORTED, PK-22A).
     init_db()
+    log_event(logger, "startup.database", schema_version=db.LATEST_SCHEMA_VERSION,
+              applied_migrations=",".join(map(str, db.last_init.get("applied_migrations", []))) or "none",
+              startup_row_changes=db.last_init.get("startup_row_changes"))
     # PK-14: every watched/traded symbol gets its static sector before any
     # risk check runs — no Kite session needed. Never overwrites a manual one.
     try:
@@ -112,21 +129,26 @@ async def on_startup():
     except Exception:
         logger.exception("Failed to start ticker/instrument cache on startup")
 
-    for name, loop in _BACKGROUND_LOOPS.items():
-        setattr(app.state, name, asyncio.create_task(loop()))
+    # PK-22F: started through the supervisor — never twice in one process.
+    workers.supervisor.start(_BACKGROUND_LOOPS)
     # A due autopilot run syncs market data as its first step; otherwise
     # refresh holdings/watchlist history once at startup.
-    if not automation.is_due():
-        app.state.startup_sync_task = asyncio.create_task(data_jobs.sync_all_symbols())
+    try:
+        due = automation.is_due()
+    except Exception:
+        logger.exception("Could not read the autopilot schedule at startup")
+        due = True  # its loop decides once it can read it; no duplicate sync meanwhile
+    if not due:
+        workers.supervisor.spawn("startup_sync", data_jobs.sync_all_symbols())
+    log_event(logger, "startup.complete", version=version.APP_VERSION, commit=version.commit_short())
 
 
 @app.on_event("shutdown")
-def on_shutdown():
+async def on_shutdown():
     ticker_manager.stop()
-    for task_name in (*_BACKGROUND_LOOPS, "startup_sync_task"):
-        task = getattr(app.state, task_name, None)
-        if task is not None:
-            task.cancel()
+    # Cancel AND await every loop and tracked task (bounded), so nothing
+    # keeps running after the app reports it has stopped.
+    await workers.supervisor.stop(timeout=config.WORKER_SHUTDOWN_TIMEOUT_SECONDS)
 
 
 app.include_router(auth.router)
@@ -146,6 +168,8 @@ app.include_router(positions_routes.router)
 app.include_router(reconciliation_routes.router)
 app.include_router(automation_routes.router)
 app.include_router(account_safety_routes.router)
+app.include_router(diagnostics_routes.router)
+app.include_router(data_health_routes.router)
 
 # Registered innermost first; each add_middleware wraps the previous, so a
 # request meets them in reverse order: security headers, then the Host check
@@ -154,6 +178,8 @@ app.include_router(account_safety_routes.router)
 app.add_middleware(TerminalOriginGuard)
 app.add_middleware(TrustedHostGuard)
 app.add_middleware(SecurityHeadersMiddleware)
+# Outermost (PK-22E): even a refused request gets a correlation id.
+app.add_middleware(CorrelationIdMiddleware)
 
 # Frontend is served same-origin from this app, so no CORS middleware is needed.
 # Its absence is part of the P0-8 defence: a cross-origin preflight for the

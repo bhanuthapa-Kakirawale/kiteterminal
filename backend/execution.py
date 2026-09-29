@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -7,7 +8,14 @@ from kiteconnect.exceptions import InputException, OrderException, PermissionExc
 
 from backend import config, instruments, market, paper_broker
 from backend.db import get_connection
+from backend.obs import log_event
 from backend.ticker import ticker_manager
+
+logger = logging.getLogger(__name__)
+
+# PK-22E: severity of the structured order.result line per outcome.
+_RESULT_SEVERITY = {"executed": "info", "execution_failed": "warning", "submission_unknown": "warning",
+                    "protection_failed": "error"}
 
 
 def get_execution_mode() -> str:
@@ -330,16 +338,43 @@ def execute_ticket(kite: KiteConnect, ticket: sqlite3.Row, entry_variety: str | 
             success=False, kite_order_id=None, kite_gtt_id=None,
             status="failed", event_type="execution_failed", message=f"{e} Refused before any broker call.",
         )
-    if is_closing_sell(ticket):
+    side = "exit" if is_closing_sell(ticket) else "entry"
+    ids = _log_ids(ticket, side)
+    log_event(logger, "order.submitting", quantity=_log_field(ticket, "quantity"),
+              order_type=_log_field(ticket, "entry_order_type"), **ids)
+    if side == "exit":
         result = _execute_exit(kite, ticket)
     else:
         result = _execute_live(kite, ticket, _entry_variety(kite, entry_variety))
+    log_event(logger, "order.result", _RESULT_SEVERITY.get(result.event_type, "info"),
+              outcome=result.event_type, status=result.status, order_id=result.kite_order_id,
+              gtt_id=result.kite_gtt_id, variety=result.order_variety, **ids)
     if paper_broker.is_paper_broker(kite):
         result.message = f"{PAPER_NOTE} {result.message}"
     return result
 
 
 PAPER_NOTE = "PAPER (dry run — simulated broker, no real order):"
+
+
+def _log_field(ticket, key: str):
+    try:
+        return ticket[key]
+    except (KeyError, IndexError):
+        return None
+
+
+def _log_ids(ticket, side: str) -> dict:
+    """The structured-log identifiers of a ticket. Logging must never be able
+    to fail an execution, so a missing field is simply absent."""
+    def field_of(key):
+        return _log_field(ticket, key)
+    try:
+        tag = _order_tag(ticket)
+    except Exception:
+        tag = None
+    return dict(account_id=field_of("account_id"), ticket_id=field_of("id"), symbol=field_of("symbol"),
+                mode=field_of("mode"), order_tag=tag, side=side, position_id=field_of("closes_ticket_id"))
 
 
 def _entry_variety(kite: KiteConnect, entry_variety: str | None) -> str:

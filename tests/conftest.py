@@ -39,7 +39,10 @@ def terminal_client(app, **kwargs):
 
 
 def last_weekday(d: date) -> date:
-    while d.weekday() >= 5:
+    """The last NSE trading day on or before d (weekends and, since PK-22,
+    exchange holidays skipped)."""
+    from backend import trading_calendar
+    while not trading_calendar.is_trading_day(d):
         d -= timedelta(days=1)
     return d
 
@@ -142,6 +145,19 @@ def market_open(monkeypatch):
     monkeypatch.setattr(market, "is_market_open", lambda at=None: True)
 
 
+def as_pre_pk22_database(db) -> None:
+    """Makes the test database look as if pre-PK-22 code last started it (no
+    schema_version), so the next init_db() runs the legacy migrations again.
+    Since PK-22 they run once per database; a test that edits the schema to
+    simulate an old database uses this before restarting."""
+    conn = db.get_connection()
+    try:
+        conn.execute("DROP TABLE IF EXISTS schema_version")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def account_id(db) -> int:
     conn = db.get_connection()
     try:
@@ -180,4 +196,5 @@ def ticket_row(db, ticket_id: int) -> dict:
 
 
 __all__ = ["FakeKite", "make_candles", "seed_ohlc", "add_watch", "account_id", "set_mode", "displayed_mode", "ticket_row",
+           "as_pre_pk22_database",
            "last_weekday", "IST", "TERMINAL_ORIGIN", "TERMINAL_HEADERS", "terminal_client"]

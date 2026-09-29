@@ -28,6 +28,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping, MutableMapping, Sequence
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ ENV_TRUSTED_PROXY_IPS = "KITE_TERMINAL_TRUSTED_PROXY_IPS"
 # Exported by the launcher so the app process (and a reload child) can report
 # and re-check exactly what it was started with.
 RUNTIME_PREFIX = "KITE_TERMINAL_RUNTIME_"
+DEFAULT_LOG_FILE = Path(__file__).resolve().parent.parent / "logs" / "kite_terminal.log"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
@@ -258,6 +260,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Refusing to start: {e}", file=sys.stderr)
         return 2
     export_runtime(config, os.environ)
+    # PK-22E: the launcher logs to a bounded, rotating file unless told
+    # otherwise (KITE_TERMINAL_LOG_FILE=off, or another path).
+    os.environ.setdefault("KITE_TERMINAL_LOG_FILE", str(DEFAULT_LOG_FILE))
 
     import uvicorn
 

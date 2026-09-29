@@ -431,6 +431,9 @@ def launcher(monkeypatch):
         monkeypatch.delenv(f"KITE_TERMINAL_{name}", raising=False)
     for name in ("HOST", "PORT", "RELOAD", "WORKERS", "TRUSTED_PROXY_IPS"):
         monkeypatch.setenv(server.RUNTIME_PREFIX + name, "placeholder")  # restored after the test
+    # PK-22E: the launcher sets a default log file; restored after the test.
+    monkeypatch.setenv("KITE_TERMINAL_LOG_FILE", "placeholder")
+    monkeypatch.delenv("KITE_TERMINAL_LOG_FILE")
     return server, calls, os.environ
 
 

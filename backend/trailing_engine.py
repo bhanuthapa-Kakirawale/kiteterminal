@@ -4,7 +4,7 @@ import logging
 import re
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from kiteconnect.exceptions import GeneralException, InputException, OrderException, TokenException
 
@@ -12,13 +12,14 @@ from backend import (
     config, execution, instruments, kite_client, market, order_monitor, paper_broker, position_quantity,
     reconciliation, risk_engine,
 )
+from backend import obs, worker_health
 from backend.accounts import get_default_account
 from backend.db import get_connection
 from backend.ticker import ticker_manager
 
 logger = logging.getLogger(__name__)
 
-IST = timezone(timedelta(hours=5, minutes=30))
+from backend.trading_calendar import IST  # PK-22C: one IST definition
 _SQL_TIME = "%Y-%m-%d %H:%M:%S"
 # Tag the app puts on every order it places itself (execution.order_tag_for).
 # Kite's GTT-placed orders carry no tag, so a tagged order is never a GTT's.
@@ -33,11 +34,15 @@ _last_active_count = 0
 
 
 async def run_trailing_loop() -> None:
+    cycle_no = 0
     while True:
-        try:
-            await _tick_once()
-        except Exception:
-            logger.exception("Trailing engine tick failed")
+        cycle_no += 1
+        with obs.correlation(f"tr-{cycle_no}"):  # PK-22E
+            try:
+                with worker_health.cycle("trailing"):  # PK-22F
+                    await _tick_once()
+            except Exception:
+                logger.exception("Trailing engine tick failed")
         ticker_manager.broadcast({
             "type": "trailing_heartbeat",
             "last_run_at": datetime.now(IST).isoformat(),
@@ -98,12 +103,25 @@ def _tick_sync() -> None:
         except kite_client.NoActiveSessionError:
             return  # heartbeat still fires — UI can tell "ran but skipped" from "not running"
 
+        # PK-22F: the live and paper books fail independently — an
+        # unreadable live GTT book no longer skips the paper positions (and
+        # vice versa). A dead session still ends the cycle.
+        failure = None
         if live:
-            _tick_mode(conn, kite, live)
+            try:
+                _tick_mode(conn, kite, live)
+            except TokenException:
+                raise
+            except Exception as e:
+                conn.rollback()
+                logger.exception("GTT watcher: the live half of the cycle failed; continuing with paper")
+                failure = e
         if paper:
             # Market data is read from Kite; every GTT call goes to the paper
             # broker, on this cycle's connection.
             _tick_mode(conn, paper_broker.PaperBroker(conn, account["id"], market_data=kite), paper)
+        if failure is not None:
+            raise failure  # recorded as a failed cycle, after paper has run
     finally:
         conn.close()
 
@@ -114,7 +132,12 @@ def _tick_mode(conn: sqlite3.Connection, kite, tickets: list[sqlite3.Row]) -> No
         paper_broker.check_mode(kite, ticket["mode"])
     # One GTT book per cycle for every position. Without it nothing can be
     # judged, so a failure here ends the cycle.
-    gtt_book = {g["id"]: g for g in kite.get_gtts()}
+    raw_book = kite.get_gtts()
+    # PK-22F: a malformed row in the broker's GTT book is skipped (and
+    # logged), not allowed to end the cycle for every position.
+    gtt_book = {g["id"]: g for g in raw_book if isinstance(g, dict) and g.get("id") is not None}
+    if len(gtt_book) != len(raw_book):
+        logger.warning("event=trailing.malformed_gtts skipped=%d", len(raw_book) - len(gtt_book))
     gtt_status = {gtt_id: g.get("status", "active") for gtt_id, g in gtt_book.items()}
     ltp_data = _trailing_ltps(kite, tickets, gtt_status)
 
@@ -748,7 +771,7 @@ def _try_activate(conn: sqlite3.Connection, ticket: sqlite3.Row, ltp: float) -> 
 def _try_ratchet(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, ltp: float) -> None:
     current_stop = ticket["current_stop_loss"]
     distance = ticket["trailing_distance"]
-    tick = instruments.get_tick_size(ticket["symbol"], ticket["exchange"])
+    tick = instruments.get_tick_size(ticket["symbol"], ticket["exchange"], conn)
 
     # Snapped onto the tick grid (Kite rejects off-grid trigger prices), in
     # the direction that keeps the trail distance at least as wide as asked.

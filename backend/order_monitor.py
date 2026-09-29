@@ -72,18 +72,25 @@ its own broker (paper_broker.check_mode).
 import asyncio
 import logging
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
-from backend import config, execution, kite_client, paper_broker, position_quantity, reconciliation, risk_engine
+from kiteconnect.exceptions import TokenException
+
+from backend import (
+    config, execution, kite_client, obs, paper_broker, position_quantity, reconciliation, risk_engine, worker_health,
+)
+from backend.obs import log_event
 from backend.accounts import get_default_account
 from backend.db import get_connection
+from backend.trading_calendar import IST
 from backend.ticker import ticker_manager
 
 logger = logging.getLogger(__name__)
 
 TERMINAL_STATUSES = {"COMPLETE", "CANCELLED", "REJECTED"}
 _SQL_TIME = "%Y-%m-%d %H:%M:%S"
-_IST = timezone(timedelta(hours=5, minutes=30))
+_IST = IST  # PK-22C: one IST definition (trading_calendar)
 
 
 def _utc_now() -> datetime:
@@ -91,15 +98,22 @@ def _utc_now() -> datetime:
 
 
 async def run_order_monitor_loop() -> None:
+    cycle_no = 0
     while True:
-        try:
-            await asyncio.to_thread(check_pending_orders)
-        except Exception:
-            logger.exception("Order monitor cycle failed")
-        try:
-            await asyncio.to_thread(check_paper_orders)
-        except Exception:
-            logger.exception("Paper order monitor cycle failed")
+        cycle_no += 1
+        # PK-22E/F: one correlation id per cycle; health recorded per cycle.
+        # The live and paper halves fail independently.
+        with obs.correlation(f"om-{cycle_no}"):
+            try:
+                with worker_health.cycle("order_monitor"):
+                    await asyncio.to_thread(check_pending_orders)
+            except Exception:
+                logger.exception("Order monitor cycle failed")
+            try:
+                with worker_health.cycle("order_monitor_paper"):
+                    await asyncio.to_thread(check_paper_orders)
+            except Exception:
+                logger.exception("Paper order monitor cycle failed")
         await asyncio.sleep(config.ORDER_MONITOR_INTERVAL_SECONDS)
 
 
@@ -188,10 +202,16 @@ def check_pending_orders(kite=None, mode: str = "live") -> dict:
         # A cycle never pairs a mode with the other mode's broker.
         paper_broker.check_mode(kite, mode)
         try:
-            orders = kite.orders()
+            raw_orders = kite.orders()
         except Exception:
             logger.exception("Order monitor: could not fetch the order book")
             return {"checked": 0, "updated": 0, "skipped": "order_book_unavailable"}
+        # PK-22F: a malformed row in the broker's book is skipped, never
+        # allowed to abort the cycle for every other ticket.
+        orders = [o for o in raw_orders if isinstance(o, dict) and o.get("order_id")]
+        if len(orders) != len(raw_orders):
+            logger.warning("event=order_monitor.malformed_orders skipped=%d mode=%s",
+                           len(raw_orders) - len(orders), mode)
         book = {o["order_id"]: o for o in orders}
 
         # Unknown submissions first: one adopted here is 'executed' and
@@ -199,34 +219,15 @@ def check_pending_orders(kite=None, mode: str = "live") -> dict:
         # through the normal fill lifecycle in this same cycle.
         for ticket in unresolved:
             checked += 1
-            updates.extend(_reconcile_submission(conn, kite, ticket, orders, now))
-            conn.commit()
+            with _one_ticket(conn, ticket, mode):
+                updates.extend(_reconcile_submission(conn, kite, ticket, orders, now))
+                conn.commit()
 
         today_cutoff = risk_engine._same_day_ist_cutoff_utc()
         for ticket in pending_tickets(conn, account["id"], mode):
             checked += 1
-            order = book.get(ticket["kite_order_id"]) or _order_from_history(kite, ticket["kite_order_id"])
-            if order is None:
-                # The broker's order book only covers the current session. An
-                # order from an earlier session that it no longer knows about
-                # can't be confirmed either way — stop polling it forever.
-                if (ticket["executed_at"] or "") < today_cutoff:
-                    updates.append(_mark_unconfirmed(conn, ticket))
-                    conn.commit()
-                continue
-            if order.get("status") not in TERMINAL_STATUSES:
-                if int(order.get("filled_quantity") or 0) > 0:
-                    if execution.is_closing_sell(ticket):
-                        updates.append(_flag_partial_exit_in_progress(conn, kite, ticket, order))
-                    else:
-                        updates.append(_entry_fill_in_progress(conn, kite, ticket, order))
-                    conn.commit()
-                continue
-            if execution.is_closing_sell(ticket):
-                updates.append(_resolve_exit(conn, kite, ticket, order))
-            else:
-                updates.append(_resolve_entry(conn, kite, ticket, order))
-            conn.commit()
+            with _one_ticket(conn, ticket, mode):
+                updates.extend(_follow_pending(conn, kite, ticket, book, today_cutoff))
     finally:
         conn.close()
 
@@ -238,6 +239,57 @@ def check_pending_orders(kite=None, mode: str = "live") -> dict:
     if updates:
         ticker_manager.broadcast({"type": "tickets_changed", "reason": "order_update"})
     return {"checked": checked, "updated": len(updates)}
+
+
+@contextmanager
+def _one_ticket(conn: sqlite3.Connection, ticket: sqlite3.Row, mode: str):
+    """PK-22F: one ticket's failure (a malformed order, a transient DB lock,
+    a broker error while removing a GTT) rolls back that ticket alone and the
+    cycle continues with the next; it is retried on the next cycle. A dead
+    session (TokenException) fails every later call too: it ends the cycle."""
+    try:
+        yield
+    except TokenException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        logger.exception("event=order_monitor.ticket_failed ticket_id=%s symbol=%s mode=%s order_id=%s "
+                         "(rolled back; continuing with the other tickets)",
+                         ticket["id"], ticket["symbol"], mode, ticket["kite_order_id"])
+
+
+def _follow_pending(conn: sqlite3.Connection, kite, ticket: sqlite3.Row, book: dict, today_cutoff: str) -> list:
+    order = book.get(ticket["kite_order_id"]) or _order_from_history(kite, ticket["kite_order_id"])
+    if order is None:
+        # The broker's order book only covers the current session. An
+        # order from an earlier session that it no longer knows about
+        # can't be confirmed either way — stop polling it forever.
+        if (ticket["executed_at"] or "") < today_cutoff:
+            update = _mark_unconfirmed(conn, ticket)
+            conn.commit()
+            return [update]
+        return []
+    if order.get("status") not in TERMINAL_STATUSES:
+        if int(order.get("filled_quantity") or 0) > 0:
+            if execution.is_closing_sell(ticket):
+                update = _flag_partial_exit_in_progress(conn, kite, ticket, order)
+            else:
+                update = _entry_fill_in_progress(conn, kite, ticket, order)
+            conn.commit()
+            return [update]
+        return []
+    if execution.is_closing_sell(ticket):
+        update = _resolve_exit(conn, kite, ticket, order)
+    else:
+        update = _resolve_entry(conn, kite, ticket, order)
+    conn.commit()
+    if update is not None:
+        log_event(logger, "order.resolved", account_id=ticket["account_id"], ticket_id=ticket["id"],
+                  symbol=ticket["symbol"], mode=ticket["mode"], order_id=ticket["kite_order_id"],
+                  status=order.get("status"), filled=order.get("filled_quantity"),
+                  side="exit" if execution.is_closing_sell(ticket) else "entry")
+    return [update]
 
 
 def _order_from_history(kite, order_id: str) -> dict | None:

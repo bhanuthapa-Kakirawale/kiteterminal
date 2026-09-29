@@ -173,6 +173,10 @@
         <span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg></span>
         <span class="nav-label">Settings</span>
       </button>
+      <button class="nav-item" data-section-id="diagnostics">
+        <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M3 12h4l2-5 4 10 2-5h6"/></svg></span>
+        <span class="nav-label">Diagnostics</span>
+      </button>
     </nav>
 
     <main id="content-area">
@@ -542,6 +546,19 @@
           </table>
         </div>
       </details>
+    </div>
+
+    <div class="view" id="view-diagnostics" hidden>
+      <div class="page-head">
+        <div>
+          <h1>System Diagnostics</h1>
+          <p class="page-sub">Read-only health of the terminal: readiness to trade, database, workers, calendar and data.</p>
+        </div>
+        <div class="page-actions">
+          <button id="diagnostics-refresh-btn" class="btn btn-ghost btn-small" type="button">Re-check (incl. DB integrity)</button>
+        </div>
+      </div>
+      <div id="diagnostics-root"></div>
     </div>
 
     <div class="view" id="view-settings" hidden>
@@ -1535,6 +1552,7 @@
           integrity="sha384-KkYqTZlM13Zya6fVUF3IGCBOQ1ehFeJVVgxaVvD/0MebineF9EI8Jkd3NnWNChqN"></script>
   <!-- PK-19: renderers for the server-derived lifecycle; app.js uses them. -->
   <script src="/static/lifecycle.js"></script>
+  <script src="/static/diagnostics.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

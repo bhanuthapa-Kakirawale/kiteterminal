@@ -1609,3 +1609,17 @@ body.sd-open { overflow: hidden; }
   .sd-actions-right { margin-left: 0; width: 100%; }
   .sd-zone { right: 56px; }
 }
+
+/* PK-22H: System Diagnostics (read-only) */
+.diag-verdict { padding: 12px 16px; border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 16px; }
+.diag-ready { background: var(--pnl-positive-bg); color: var(--pnl-positive); }
+.diag-not-ready { background: var(--pnl-negative-bg); color: var(--pnl-negative); }
+.diag-issues { margin: 4px 0 12px; padding-left: 20px; }
+.diag-issues li { margin: 4px 0; }
+.diag-blocker strong { color: var(--pnl-negative); }
+.diag-warning strong { color: var(--accent-amber); }
+.diag-none, .diag-counts { color: var(--text-secondary); margin: 4px 0 8px; }
+.diag-error { color: var(--pnl-negative); }
+.diag-kv td:first-child { width: 40%; color: var(--text-secondary); font-weight: 500; }
+.diag-row-bad td { color: var(--pnl-negative); }
+#view-diagnostics h3 { font-size: 0.9rem; margin: 8px 0 4px; }

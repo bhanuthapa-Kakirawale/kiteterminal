@@ -56,13 +56,15 @@ def test_round_to_tick():
 def test_market_clock():
     from backend import market
     ist = market.IST
-    monday_10 = datetime(2026, 9, 14, 10, 0, tzinfo=ist)
+    # PK-22: an ordinary trading Monday. (It was 2026-09-14 — Ganesh
+    # Chaturthi, an NSE holiday, now that the calendar knows holidays.)
+    monday_10 = datetime(2026, 9, 21, 10, 0, tzinfo=ist)
     assert market.is_market_open(monday_10)
-    assert not market.is_market_open(datetime(2026, 9, 14, 16, 0, tzinfo=ist))
-    assert not market.is_market_open(datetime(2026, 9, 12, 11, 0, tzinfo=ist))  # Saturday
-    assert market.last_complete_session_date(monday_10) == date(2026, 9, 11)
-    assert market.last_complete_session_date(datetime(2026, 9, 14, 15, 31, tzinfo=ist)) == date(2026, 9, 14)
-    assert market.last_complete_session_date(datetime(2026, 9, 13, 12, 0, tzinfo=ist)) == date(2026, 9, 11)
+    assert not market.is_market_open(datetime(2026, 9, 21, 16, 0, tzinfo=ist))
+    assert not market.is_market_open(datetime(2026, 9, 19, 11, 0, tzinfo=ist))  # Saturday
+    assert market.last_complete_session_date(monday_10) == date(2026, 9, 18)
+    assert market.last_complete_session_date(datetime(2026, 9, 21, 15, 31, tzinfo=ist)) == date(2026, 9, 21)
+    assert market.last_complete_session_date(datetime(2026, 9, 20, 12, 0, tzinfo=ist)) == date(2026, 9, 18)
 
 
 # ---------------------------------------------------------------- execution

@@ -17,6 +17,7 @@ from backend import (
 from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
+from backend.obs import log_event
 from backend.models import (
     AlertActionSellRequest,
     TicketConfirmRequest,
@@ -946,6 +947,11 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
         _raise_invalid_state(conn, ticket_id, account["id"], "confirm")
     _log_event(conn, ticket_id, "confirmed", f"Confirmed in {mode} mode{mode_note}")
     conn.commit()
+    # PK-22E: the claim, traceable by this request's cid, the ticket id and
+    # the order tag the broker order will carry.
+    log_event(logger, "approval.claimed", account_id=account["id"], ticket_id=ticket_id, symbol=ticket["symbol"],
+              mode=mode, order_tag=submission["order_tag"], position_id=ticket["closes_ticket_id"],
+              variety=variety)
 
     ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
     ctx = None
@@ -977,6 +983,8 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
         # needs_review). Its state is newer, so it is never overwritten.
         conn.rollback()
         _reconcile_late_result(conn, ticket, result)
+        log_event(logger, "approval.result_superseded", "warning", account_id=account["id"], ticket_id=ticket_id,
+                  symbol=ticket["symbol"], mode=ticket["mode"], order_id=result.kite_order_id)
     _account_safety_bookkeeping(account, ticket, result, variety)
 
     # PK-8: an exit closes its position only once its fill is proven. An

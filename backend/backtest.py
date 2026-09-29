@@ -68,7 +68,9 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from backend import backtest_analytics, backtest_costs, config, indicators, instruments, market, risk_engine
+from backend import (
+    backtest_analytics, backtest_costs, config, indicators, instruments, market, ohlc_integrity, risk_engine,
+)
 from backend.paper_broker import fill_price
 from backend.strategies import STRATEGIES
 
@@ -564,6 +566,16 @@ def run_backtest(
     cfg = cfg or BacktestConfig.from_overrides()
     start_date, end_date = str(start_date)[:10], str(end_date)[:10]
 
+    # PK-22D: history known or suspected to be stale (an unadjusted split or
+    # bonus) is never simulated silently — the symbol is excluded, with why.
+    flagged = ohlc_integrity.flagged(conn, [token for token, _ in symbols])
+    excluded = [
+        {"symbol": symbol, "instrument_token": token, "status": flagged[token]["status"],
+         "reason": json.loads(flagged[token]["status_reason"]) if flagged[token]["status_reason"] else None,
+         "status_at": flagged[token]["status_at"]}
+        for token, symbol in symbols if token in flagged
+    ]
+    symbols = [(token, symbol) for token, symbol in symbols if token not in flagged]
     frames, missing = load_frames(symbols, end_date)
     sim = simulate_with_metrics(module, frames, params, cfg, start_date, end_date)
     metrics = sim["metrics"]
@@ -580,8 +592,14 @@ def run_backtest(
         "survivorship_bias": UNIVERSE_BIAS.get(universe_source, "unverified"),
         "warning": UNIVERSE_WARNINGS.get(universe_source, UNIVERSE_WARNINGS["user_supplied"]),
         "symbols_without_data": missing,
+        "excluded_symbols": excluded,
     }
     warnings = [universe["warning"]]
+    for e in excluded:
+        warnings.append(
+            f"{e['symbol']} EXCLUDED: its stored price history is {e['status']} "
+            f"({(e['reason'] or {}).get('code', 'flagged')}) — rebuild it from System Diagnostics to include it."
+        )
     if not cfg.costs_enabled:
         warnings.append("Transaction costs are DISABLED for this run — net equals gross before slippage.")
     if missing:

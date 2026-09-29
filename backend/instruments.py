@@ -1,4 +1,5 @@
 import logging
+import sqlite3
 
 from kiteconnect import KiteConnect
 
@@ -94,15 +95,20 @@ def search_instruments(query: str, limit: int = 20) -> list[dict]:
         conn.close()
 
 
-def get_tick_size(symbol: str, exchange: str = "NSE") -> float:
-    conn = get_connection()
+def get_tick_size(symbol: str, exchange: str = "NSE", conn: sqlite3.Connection | None = None) -> float:
+    """`conn`: reuse the caller's connection — a per-position loop otherwise
+    opens one connection per position (PK-22G, measured in reconciliation)."""
+    own = conn is None
+    if own:
+        conn = get_connection()
     try:
         row = conn.execute(
             "SELECT tick_size FROM instrument_cache WHERE tradingsymbol = ? AND exchange = ?",
             (symbol.strip().upper(), exchange),
         ).fetchone()
     finally:
-        conn.close()
+        if own:
+            conn.close()
     tick = row["tick_size"] if row is not None else None
     return tick if tick and tick > 0 else market.DEFAULT_TICK_SIZE
 

@@ -1,11 +1,9 @@
 import json
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 
-import numpy as np
-
-from backend import execution, position_quantity, risk_engine
+from backend import execution, position_quantity, risk_engine, trading_calendar
 
 logger = logging.getLogger(__name__)
 
@@ -124,8 +122,10 @@ def record_closed_trade(conn: sqlite3.Connection, sell_ticket_id: int) -> int | 
     # The fill, not the order: an AMO exit placed tonight fills tomorrow.
     exit_date = (sell["filled_at"] or sell["executed_at"] or sell["created_at"])[:10]
     holding_calendar_days = (datetime.fromisoformat(exit_date) - datetime.fromisoformat(entry_date)).days
-    holding_trading_days = (
-        int(np.busday_count(entry_date, exit_date)) if exit_date >= entry_date else 0
+    # NSE sessions in [entry, exit) — numpy.busday_count's convention, but
+    # holiday-aware (PK-22C). Rows journaled before PK-22 keep their value.
+    holding_trading_days = trading_calendar.trading_days_between(
+        date.fromisoformat(entry_date), date.fromisoformat(exit_date)
     )
 
     checklist = json.loads(sell["rule_checklist"]) if sell["rule_checklist"] else None

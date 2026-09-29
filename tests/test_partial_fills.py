@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 from kiteconnect.exceptions import InputException
 
-from conftest import account_id, displayed_mode, set_mode, ticket_row
+from conftest import account_id, as_pre_pk22_database, displayed_mode, set_mode, ticket_row
 from test_baseline_api import _insert_ticket, _manual_ticket
 from test_live_safety import (  # noqa: F401 — market_open is a fixture
     _closed_trades_for, _monitor, _precondition, _protective_oco_gtt, _rows, _sells, _urgent_updates, market_open,
@@ -618,6 +618,7 @@ def test_migration_backfills_only_certain_fills_and_is_idempotent(env, monkeypat
     finally:
         conn.close()
 
+    as_pre_pk22_database(env.db)  # PK-22: the legacy migration runs once per database
     db.init_db()
     after_first = {k: ticket_row(env.db, v)["filled_quantity"] for k, v in rows.items()}
     assert after_first == {"dry": 5, "legacy": 5, "filled": 5, "pending": 0, "partial": None,

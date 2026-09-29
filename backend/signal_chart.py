@@ -20,7 +20,7 @@ from datetime import date
 
 import pandas as pd
 
-from backend import config, execution, indicators, kite_chart, market
+from backend import config, execution, indicators, kite_chart, market, trading_calendar
 from backend.strategies import STRATEGIES
 
 logger = logging.getLogger(__name__)
@@ -185,7 +185,9 @@ def _staleness(signal_date: str | None, last_candle_date: str | None) -> dict:
         result["data_is_stale"] = age > config.MAX_DATA_STALENESS_DAYS
     if signal_date:
         signal_day = date.fromisoformat(str(signal_date)[:10])
-        result["signal_age_sessions"] = (last_session - signal_day).days
+        # Sessions, not calendar days: a Friday signal read on Monday evening
+        # is one session old, and an exchange holiday is not a session (PK-22C).
+        result["signal_age_sessions"] = trading_calendar.trading_days_between(signal_day, last_session)
         # A signal computed from an older candle than the latest available one
         # is cancelled the moment the next scan runs — its limit price and stop
         # came from a close that is no longer current.

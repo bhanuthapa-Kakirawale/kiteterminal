@@ -4,7 +4,7 @@ import logging
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse
 
-from backend import automation, data_jobs, instruments, kite_client, sector_mapping
+from backend import automation, data_jobs, instruments, kite_client, sector_mapping, workers
 from backend.accounts import get_default_account
 from backend.db import get_connection
 from backend.ticker import collect_instrument_tokens, ticker_manager
@@ -34,7 +34,7 @@ async def callback(request: Request):
         logger.exception("Kite login token exchange failed")
         return RedirectResponse(url="/?login_error=1")
 
-    asyncio.create_task(_after_login())
+    workers.supervisor.spawn("after_login", _after_login())
     return RedirectResponse(url="/")
 
 

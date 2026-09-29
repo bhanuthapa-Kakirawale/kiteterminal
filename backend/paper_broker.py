@@ -67,7 +67,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from kiteconnect.exceptions import GeneralException, InputException
 
-from backend import config, instruments, market
+from backend import config, instruments, market, trading_calendar
 from backend.db import get_connection
 
 logger = logging.getLogger(__name__)
@@ -146,14 +146,8 @@ def _ist_text(utc_sql: str | None) -> str | None:
 def _next_session(at: datetime) -> date:
     """The trading session an After-Market Order placed at `at` waits for:
     today's if placed before the open of a trading day, else the next
-    trading day's (weekends only — the holiday calendar is PK-22)."""
-    d = at.date()
-    if market.is_trading_day(d) and at.time() < market.MARKET_OPEN:
-        return d
-    d += timedelta(days=1)
-    while not market.is_trading_day(d):
-        d += timedelta(days=1)
-    return d
+    trading day's — NSE holidays skipped (PK-22C)."""
+    return trading_calendar.next_session_date(at)
 
 
 def _session_over(order, now: datetime) -> bool:
@@ -164,7 +158,7 @@ def _session_over(order, now: datetime) -> bool:
 
 
 def _today_cutoff_utc(now: datetime) -> str:
-    return _utc_sql(now.replace(hour=0, minute=0, second=0, microsecond=0))
+    return trading_calendar.ist_day_start_utc_sql(now)
 
 
 # ---- pricing -------------------------------------------------------------------
@@ -569,16 +563,30 @@ def evaluate(account_id: int, market_data, now: datetime | None = None) -> dict:
 
         # Orders that existed before this cycle fill first; an order a GTT
         # places below waits for the next observed price.
+        # PK-22F: each order / GTT is its own transaction; one that raises
+        # is rolled back alone and retried next cycle.
         for order in eligible:
             price = prices.get(f"{order['exchange']}:{order['tradingsymbol']}")
-            if price is not None and _try_fill(conn, order, price, now):
-                summary["filled"] += 1
-            conn.commit()
+            try:
+                if price is not None and _try_fill(conn, order, price, now):
+                    summary["filled"] += 1
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                summary["errors"] = summary.get("errors", 0) + 1
+                logger.exception("event=paper.fill_failed paper_order_id=%s symbol=%s (rolled back)",
+                                 order["paper_order_id"], order["tradingsymbol"])
         for gtt in gtts:
             price = prices.get(f"{gtt['exchange']}:{gtt['tradingsymbol']}")
-            if price is not None and _try_trigger(conn, account_id, gtt, price, now):
-                summary["triggered"] += 1
-            conn.commit()
+            try:
+                if price is not None and _try_trigger(conn, account_id, gtt, price, now):
+                    summary["triggered"] += 1
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                summary["errors"] = summary.get("errors", 0) + 1
+                logger.exception("event=paper.trigger_failed gtt_id=%s symbol=%s (rolled back)",
+                                 gtt["paper_gtt_id"], gtt["tradingsymbol"])
         return summary
     finally:
         conn.close()

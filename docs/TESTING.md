@@ -40,6 +40,19 @@ step, and writes `e2e_results.json` with pass/fail results.
   captured into a list for assertions. Startup background loops (trailing,
   reconciliation, etc.) are **not** run during tests — each test controls
   its own scenario explicitly.
+- **Clocks and the NSE calendar (PK-22).** Tests never depend on today's
+  date: pin `market.is_market_open` (`market_open` fixture),
+  `market.last_complete_session_date`, `paper_broker._now` or
+  `account_safety.now_ist`, and use explicit IST datetimes. The real NSE
+  holiday file is loaded by default (2026-09-14 is a holiday); swap in a
+  synthetic calendar with `trading_calendar.use_calendar(holidays=[...])`.
+  `conftest.last_weekday` returns the last *trading* day.
+- **Old databases (PK-22).** Migrations run once per database. A test that
+  edits the schema to imitate an old database calls
+  `conftest.as_pre_pk22_database(db)` before `init_db()`, so the legacy
+  migrations run again. `tests/test_platform_pk22.py` also migrates a
+  synthetic early-era database and, when present, a copy of
+  `backend/kite_terminal.db.pre_pk22_bak` (skipped otherwise).
 - **`tests/fake_kite.py`** — a full in-memory stand-in for
   `kiteconnect.KiteConnect`: holdings/positions/margins/LTP,
   order placement/history/cancel (with deterministic order IDs and an

@@ -5,7 +5,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from backend import config, execution, instruments, kite_client, market, position_quantity, risk_engine
+from kiteconnect.exceptions import TokenException
+
+from backend import (
+    config, execution, instruments, kite_client, market, obs, position_quantity, risk_engine, worker_health,
+)
 from backend.accounts import get_default_account
 from backend.db import get_connection
 
@@ -78,12 +82,20 @@ async def run_reconciliation_loop() -> None:
     """Same infinite-loop-+-sleep shape as trailing_engine.run_trailing_loop
     (Phase 3). Only checks the trading account (Part B.4 — investment
     accounts have no tickets to reconcile against)."""
+    cycle_no = 0
     while True:
-        try:
-            await asyncio.to_thread(_run_cycle)
-        except Exception:
-            logger.exception("Reconciliation cycle failed")
+        cycle_no += 1
+        with obs.correlation(f"rc-{cycle_no}"):  # PK-22E
+            try:
+                with worker_health.cycle("reconciliation"):  # PK-22F
+                    await asyncio.to_thread(_run_cycle)
+            except Exception:
+                logger.exception("Reconciliation cycle failed")
         await asyncio.sleep(config.RECONCILIATION_INTERVAL_SECONDS)
+
+
+class ReconciliationChecksFailed(RuntimeError):
+    """Some checks of a cycle raised; the others' findings were kept."""
 
 
 def cycle_status() -> dict:
@@ -107,10 +119,15 @@ class BrokerSnapshot:
 
     def load_gtts(self, kite) -> None:
         try:
-            self.gtts = list(kite.get_gtts())
+            raw = list(kite.get_gtts())
         except Exception as e:
             logger.exception("Could not fetch get_gtts()")
             self.gtts, self.gtt_error = None, f"{type(e).__name__}: {e}"
+            return
+        # PK-22F: a malformed row is skipped, not allowed to end the cycle.
+        self.gtts = [g for g in raw if isinstance(g, dict) and g.get("id") is not None]
+        if len(self.gtts) != len(raw):
+            logger.warning("event=reconciliation.malformed_gtts skipped=%d", len(raw) - len(self.gtts))
 
     def load_held(self, kite) -> None:
         """Shares the broker shows per symbol. Unsettled (T+1) delivery
@@ -125,11 +142,20 @@ class BrokerSnapshot:
             self.held, self.held_error = None, f"{type(e).__name__}: {e}"
             return
         held: dict[str, int] = {}
+        skipped = 0
         for h in holdings:
+            if not isinstance(h, dict) or not h.get("tradingsymbol"):
+                skipped += 1
+                continue
             qty = (h.get("quantity") or 0) + (h.get("t1_quantity") or 0)
             held[h["tradingsymbol"]] = held.get(h["tradingsymbol"], 0) + qty
         for p in positions:
+            if not isinstance(p, dict) or not p.get("tradingsymbol"):
+                skipped += 1
+                continue
             held[p["tradingsymbol"]] = held.get(p["tradingsymbol"], 0) + (p.get("quantity") or 0)
+        if skipped:
+            logger.warning("event=reconciliation.malformed_holdings skipped=%d", skipped)
         self.held = held
 
 
@@ -148,11 +174,15 @@ def _run_cycle() -> None:
         before = _row_count(conn)
         snapshot = BrokerSnapshot()
         snapshot.load_gtts(kite)
-        _check_order_status(conn, kite, account)
+        # PK-22F: each check in its own savepoint — one check that raises
+        # (a malformed broker row, a transient lock) rolls back only its own
+        # findings; the others are kept and the cycle still completes.
+        failed: list[str] = []
+        _isolated(conn, "order_status", failed, _check_order_status, kite, account)
         if snapshot.gtts is not None:
-            _check_gtt_state(conn, kite, account, snapshot)
-            _check_broker_gtts(conn, account, snapshot)
-        _check_position_state(conn, kite, account, snapshot)
+            _isolated(conn, "gtt_state", failed, _check_gtt_state, kite, account, snapshot)
+            _isolated(conn, "broker_gtts", failed, _check_broker_gtts, account, snapshot)
+        _isolated(conn, "position_state", failed, _check_position_state, kite, account, snapshot)
         conn.commit()
         last_cycle.update(
             checked_at=_now(),
@@ -161,9 +191,30 @@ def _run_cycle() -> None:
             holdings_error=snapshot.held_error,
             active_gtts=None if snapshot.gtts is None else len(_active(snapshot.gtts)),
             new_findings=_row_count(conn) - before,
+            failed_checks=failed,
         )
+        if failed:
+            raise ReconciliationChecksFailed(f"check(s) failed and were rolled back: {', '.join(failed)}")
     finally:
         conn.close()
+
+
+def _isolated(conn: sqlite3.Connection, name: str, failed: list[str], check, *args) -> None:
+    savepoint = f"reconcile_{name}"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        check(conn, *args)
+    except TokenException:
+        conn.execute(f"ROLLBACK TO {savepoint}")
+        conn.execute(f"RELEASE {savepoint}")
+        raise  # the session is gone: every later check would fail too
+    except Exception:
+        conn.execute(f"ROLLBACK TO {savepoint}")
+        conn.execute(f"RELEASE {savepoint}")
+        failed.append(name)
+        logger.exception("event=reconciliation.check_failed check=%s (rolled back; other checks continue)", name)
+        return
+    conn.execute(f"RELEASE {savepoint}")
 
 
 def _now() -> str:
@@ -226,8 +277,10 @@ def log_mismatch(conn: sqlite3.Connection, ticket_id: int | None, check_type: st
         (ticket_id, check_type, expected, actual, detail, issue_code, severity, symbol, gtt_id, expected_quantity,
          broker_quantity, position_state, suggested_action),
     )
-    logger.warning("Reconciliation mismatch (%s%s): expected=%r actual=%r — %s", check_type,
-                   f"/{issue_code}" if issue_code else "", expected, actual, detail)
+    # PK-22E: the finding's stable identifiers first, then the free text.
+    logger.warning("event=reconciliation.finding check=%s issue_code=%s ticket_id=%s symbol=%s gtt_id=%s "
+                   "severity=%s cid=%s: expected=%r actual=%r — %s", check_type, issue_code or "-", ticket_id,
+                   symbol or "-", gtt_id, severity or "-", obs.correlation_id.get(), expected, actual, detail)
     return True
 
 
@@ -430,7 +483,7 @@ def _check_gtt_price(conn: sqlite3.Connection, ticket: sqlite3.Row, gtt: dict) -
     if broker_stop is None or basis is None:
         _price_seen.pop(ticket["id"], None)
         return
-    tick = instruments.get_tick_size(ticket["symbol"], ticket["exchange"])
+    tick = instruments.get_tick_size(ticket["symbol"], ticket["exchange"], conn)
     expected = market.round_to_tick(basis, tick)
     if abs(float(broker_stop) - expected) <= tick / 2 + 1e-9:
         _price_seen.pop(ticket["id"], None)

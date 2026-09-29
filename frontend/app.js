@@ -756,14 +756,19 @@ function minutesUntilMidnightIST() {
   return (24 * 3600000 - msIntoDay) / 60000;
 }
 
-// NSE hours 9:15-15:30 IST, Mon-Fri. No holiday calendar — a simple time
-// check is enough for this indicator's purpose.
+// NSE hours 9:15-15:30 IST, Mon-Fri. Exchange holidays come from the server
+// (PK-22C: /api/account-safety/status carries today's session_state), which
+// owns the NSE calendar; the browser only checks weekday and time.
 function computeMarketStatus() {
   const istMs = Date.now() + 5.5 * 3600 * 1000;
   const d = new Date(istMs);
   const day = d.getUTCDay(); // IST-shifted date, so getUTCDay() reads as IST weekday
   const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
   if (day === 0 || day === 6) return "closed";
+  const safety = state.accountSafety;
+  if (safety && safety.session_state === "HOLIDAY" && safety.trading_date_ist === d.toISOString().slice(0, 10)) {
+    return "closed";
+  }
   if (mins >= 555 && mins < 930) return "open"; // 9:15-15:30
   if (mins >= 540 && mins < 555) return "pre_open"; // 9:00-9:15 (approximate)
   return "closed";
@@ -774,6 +779,7 @@ function renderMarketStatus() {
   const labels = { open: "Market Open", pre_open: "Pre-Open", closed: "Market Closed" };
   el.marketStatusBadge.hidden = false;
   el.marketStatusBadge.textContent = labels[status];
+  el.marketStatusBadge.title = state.accountSafety?.holiday_name ? `NSE holiday: ${state.accountSafety.holiday_name}` : "";
   el.marketStatusBadge.className = `market-status-badge ${status}`;
   el.marketClosedNote.hidden = status !== "closed";
 }
@@ -2955,9 +2961,16 @@ function connectTickWs() {
 
   ws.onopen = () => {
     console.log("[ws] connected");
+    const isReconnect = wsOpenedAt > 0;
     wsOpenedAt = Date.now();
     setFeedStatus(false);
     markStale(false);
+    // PK-22F: events sent while the socket was down (or dropped by the
+    // server's overflow close, code 1013) are not replayed: re-read state.
+    if (isReconnect) {
+      scheduleRefresh();
+      loadAccountSafety();
+    }
   };
 
   ws.onmessage = (event) => {
@@ -4050,6 +4063,7 @@ const SECTIONS = [
   { id: "todays-actions", el: document.getElementById("view-todays-actions") },
   { id: "journal", el: document.getElementById("view-journal") },
   { id: "settings", el: document.getElementById("view-settings") },
+  { id: "diagnostics", el: document.getElementById("view-diagnostics") },
 ];
 
 function showSection(id) {
@@ -4065,8 +4079,14 @@ function showSection(id) {
   if (id === "approvals") loadApprovals();
   if (id === "orders-trades") refreshOrderBooks();
   if (id === "positions") loadAppPositions();
+  if (id === "diagnostics") window.KTDiagnostics.load(document.getElementById("diagnostics-root"));
   window.scrollTo({ top: 0 });
 }
+
+// PK-22H: re-check forces a fresh database integrity check.
+document.getElementById("diagnostics-refresh-btn").addEventListener("click", () => {
+  window.KTDiagnostics.load(document.getElementById("diagnostics-root"), { refresh: true });
+});
 
 document.querySelectorAll(".nav-item").forEach((btn) => {
   btn.addEventListener("click", () => showSection(btn.dataset.sectionId));

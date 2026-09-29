@@ -2,14 +2,13 @@ import json
 import math
 import sqlite3
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 from kiteconnect import KiteConnect
 from kiteconnect.exceptions import KiteException, TokenException
 
-from backend import execution, position_quantity, sector_mapping
-
-IST = timezone(timedelta(hours=5, minutes=30))
+from backend import execution, position_quantity, sector_mapping, trading_calendar
+from backend.trading_calendar import IST  # noqa: F401  (kept importable from here)
 
 
 class RiskCheckUnavailableError(Exception):
@@ -280,9 +279,10 @@ class RiskCheckReport:
         return [asdict(c) for c in self.checks]
 
 
-def _same_day_ist_cutoff_utc() -> str:
-    midnight_ist = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)
-    return midnight_ist.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+def _same_day_ist_cutoff_utc(now: datetime | None = None) -> str:
+    """Start of today's IST date as UTC ticket-timestamp text (PK-22: one
+    implementation, trading_calendar.ist_day_start_utc_sql; `now` pins it)."""
+    return trading_calendar.ist_day_start_utc_sql(now)
 
 
 # Entries claimed for execution whose broker outcome is not yet recorded as

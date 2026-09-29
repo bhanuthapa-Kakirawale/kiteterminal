@@ -31,3 +31,6 @@ backend/ui_prefs.json
 # Captured live broker payloads (debugging) must never be committed.
 captures/
 *.har
+
+# PK-22E: rotating application logs (python -m backend.server)
+logs/

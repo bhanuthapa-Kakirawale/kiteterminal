@@ -6,7 +6,9 @@ from datetime import date
 from kiteconnect import KiteConnect
 from kiteconnect.exceptions import KiteException
 
-from backend import config, execution, indicators, instruments, kite_chart, market, position_quantity, risk_engine
+from backend import (
+    config, execution, indicators, instruments, kite_chart, market, ohlc_integrity, position_quantity, risk_engine,
+)
 from backend.db import get_connection
 from backend.strategies import STRATEGIES
 from backend.watchlist import list_watchlist
@@ -225,7 +227,18 @@ def run_entry_scan(
     min_history = max(params.get("trend_filter_period", 2), 2)
 
     candidates = []
-    for w in list_watchlist(account["id"]):
+    watchlist = list_watchlist(account["id"])
+    # PK-22D: a symbol whose stored history the provider has contradicted
+    # (Kite back-adjusted it after a split/bonus) is not scanned until it is
+    # rebuilt — its SMA/ATR/Donchian would be computed across a false gap.
+    # A data-eligibility gate only: no strategy rule changes.
+    stale_history = ohlc_integrity.flagged(conn, [w["instrument_token"] for w in watchlist],
+                                           statuses=(ohlc_integrity.NEEDS_REFRESH,))
+    diag["history_needs_refresh"] = []
+    for w in watchlist:
+        if w["instrument_token"] in stale_history:
+            diag["history_needs_refresh"].append(w["symbol"])
+            continue
         df = indicators.load_ohlc_frame(w["instrument_token"])
         if len(df) < min_history:
             diag["insufficient_history"].append(w["symbol"])
