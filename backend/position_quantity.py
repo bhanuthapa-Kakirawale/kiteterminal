@@ -24,8 +24,8 @@ Every module takes these figures from here — the arithmetic lives nowhere
 else. The one-entry / one-exit-at-a-time model is kept: at most one exit
 owns a position while its order is in flight (execution.EXIT_IN_FLIGHT_SQL).
 
-This module imports only execution at load time (risk_engine imports it);
-the rest is imported where it is used.
+This module imports only execution and paper_broker at load time
+(risk_engine imports it); the rest is imported where it is used.
 """
 
 import logging
@@ -33,9 +33,17 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 
-from backend import execution
+from backend import execution, paper_broker
 
 logger = logging.getLogger(__name__)
+
+
+def broker_tracked(position) -> bool:
+    """PK-20: the position's orders and GTT live at a broker the app
+    follows — Kite for a live position, the paper broker for a dry-run one
+    opened since PK-20 (its entry order id is a paper id). A dry-run
+    position from before PK-20 was simulated without any order or GTT."""
+    return position["mode"] == "live" or paper_broker.is_paper_id(position["kite_order_id"])
 
 # reconciliation.POSITION_QUANTITY_REVIEW — spelled out because this module
 # only imports reconciliation lazily (reconciliation imports this one).
@@ -244,8 +252,11 @@ def sync_protection(conn: sqlite3.Connection, kite, position_id: int, reason: st
     per distinct state). The caller commits."""
     with protection_lock(position_id):
         position = conn.execute("SELECT * FROM trade_tickets WHERE id = ?", (position_id,)).fetchone()
-        if position is None or position["closed_at"] is not None or position["mode"] != "live":
+        if position is None or position["closed_at"] is not None or not broker_tracked(position):
             return SyncResult("no_position")
+        # PK-20: a paper position's GTT is resized through the paper broker,
+        # a live one's through Kite — never the other way round.
+        paper_broker.check_mode(kite, position["mode"])
         symbol, gtt_id = position["symbol"], position["kite_gtt_id"]
         desired = protection_quantity(conn, position)
 
@@ -384,9 +395,11 @@ def remove_protective_gtt(conn: sqlite3.Connection, kite, exit_ticket_id: int | 
     is an urgent warning. A GTT that has already triggered may have sold a
     second time: flagged, nothing deleted, nothing sent. (Moved here from
     order_monitor by PK-13; behaviour unchanged.)"""
-    position = conn.execute("SELECT symbol, kite_gtt_id FROM trade_tickets WHERE id = ?", (position_id,)).fetchone()
+    position = conn.execute("SELECT symbol, kite_gtt_id, mode FROM trade_tickets WHERE id = ?",
+                            (position_id,)).fetchone()
     if position is None or position["kite_gtt_id"] is None:
         return "", False
+    paper_broker.check_mode(kite, position["mode"])  # PK-20: never across modes
     exit_ticket = (conn.execute("SELECT kite_order_id, rule_checklist FROM trade_tickets WHERE id = ?",
                                 (exit_ticket_id,)).fetchone() if exit_ticket_id is not None else None)
     gtt_id, symbol = position["kite_gtt_id"], position["symbol"]

@@ -98,6 +98,28 @@
       : `<span class="chip dry" data-mode="dry_run">DRY RUN</span>`;
   }
 
+  // PK-20: a dry-run position's orders are PAPER orders at the simulated
+  // broker. The order and its status are the server's (paper_order).
+  const PAPER_ORDER_LABELS = {
+    OPEN: "OPEN", PARTIAL: "PARTIAL", COMPLETE: "COMPLETE", CANCELLED: "CANCELLED", REJECTED: "REJECTED",
+    AMO: "AMO — next session",
+  };
+
+  function paperOrderLine(lc) {
+    const o = lc && lc.paper_order;
+    if (!o) return "";
+    const qty = o.status === "PARTIAL" ? ` ${o.filled_quantity}/${o.quantity}` : "";
+    return `<div class="lc-qty-sub lc-paper" data-paper-order="${esc(o.status)}" title="Paper order at the `
+      + `simulated broker — no real order exists">PAPER ${esc(o.side)} ${esc(o.order_id)} · `
+      + `${esc(PAPER_ORDER_LABELS[o.status] || o.status)}${esc(qty)}</div>`;
+  }
+
+  // The working paper order a Cancel button acts on, if any.
+  function cancellablePaperOrder(lc) {
+    const o = lc && lc.paper_order;
+    return o && ["OPEN", "PARTIAL", "AMO"].includes(o.status) ? o : null;
+  }
+
   // Quantities are the server's (PK-13); only their layout is decided here.
   function quantityCell(lc) {
     if (!lc) return "—";
@@ -175,7 +197,15 @@
       + `data-position-id="${esc(lc.position_id)}">Exit</button>`,
     REVIEW_EXIT: (lc) => `<button class="row-action-btn" data-action="position-review-exit" `
       + `data-ticket-id="${esc(lc.pending_exit_ticket_id)}">Review exit #${esc(lc.pending_exit_ticket_id)}</button>`,
-    CANCEL_ORDER: () => `<button class="row-action-btn" data-action="position-orders">Cancel order…</button>`,
+    CANCEL_ORDER: (lc) => {
+      const paper = cancellablePaperOrder(lc);
+      // PK-20: a paper order is cancelled here, at the paper broker; a live
+      // one on the Orders page. Either way the order monitor resolves it.
+      return paper
+        ? `<button class="row-action-btn" data-action="paper-cancel" data-order-id="${esc(paper.order_id)}">`
+          + `Cancel paper order</button>`
+        : `<button class="row-action-btn" data-action="position-orders">Cancel order…</button>`;
+    },
     VIEW_RECONCILIATION: () => `<button class="row-action-btn" data-action="position-reconciliation">`
       + `Reconciliation</button>`,
     VIEW_JOURNAL: () => `<button class="row-action-btn" data-action="position-journal">Journal</button>`,
@@ -208,7 +238,7 @@
       <td><strong>${esc(lc.symbol)}</strong>${lc.strategy_name
         ? `<div class="lc-qty-sub">${esc(lc.strategy_name.replace(/_/g, " "))}</div>` : ""}</td>
       <td>${lifecycleBadge(lc)}</td>
-      <td>${modeChip(lc.mode)}</td>
+      <td>${modeChip(lc.mode)}${paperOrderLine(lc)}</td>
       <td class="num">${quantityCell(lc)}</td>
       <td class="num">${num(entry)}${lc.entry_fill_price == null ? `<div class="lc-qty-sub">ref.</div>` : ""}</td>
       <td class="num" data-field="ltp">${num(ltp)}</td>
@@ -240,8 +270,8 @@
   }
 
   const api = {
-    esc, ticketStateBadge, lifecycleBadge, protectionBadge, modeChip, quantityCell, activeExitCell, issueBadges,
-    reviewCell, actionButtons, unrealisedPnl, pnlCell, activeRowCells, closedRowCells,
+    esc, ticketStateBadge, lifecycleBadge, protectionBadge, modeChip, paperOrderLine, quantityCell, activeExitCell,
+    issueBadges, reviewCell, actionButtons, unrealisedPnl, pnlCell, activeRowCells, closedRowCells,
   };
   root.KTLifecycle = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;

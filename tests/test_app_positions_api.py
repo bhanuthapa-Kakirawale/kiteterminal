@@ -145,7 +145,8 @@ def test_query_count_does_not_grow_with_positions(env, monkeypatch, path):
         _held_position(env, 5, closed_at="2026-09-10 05:00:00", kite_gtt_id=None)
     many = _count_selects(env, monkeypatch, path)
     assert many == one, (one, many)
-    assert one <= 4
+    # PK-19's four, plus PK-20's one batched read of the paper order book.
+    assert one <= 5
 
 
 def test_reconciliation_issues_are_attached_structurally(env):
@@ -201,14 +202,22 @@ def test_live_exit_through_the_normal_approval_is_exiting_then_closed(env, marke
     assert _closed_trades_for(env, buy_id)[0]["exit_price"] == 3120.0
 
 
-def test_dry_run_position_can_be_exited_and_closes_on_approval(env):
+def test_dry_run_position_can_be_exited_and_closes_on_the_paper_fill(env, market_open):
+    # PK-20 (was: "closes on approval"): approval makes it EXITING; only the
+    # paper broker's fill closes and journals it — the PK-8 rule, in dry run.
     set_mode(env.db, "live")  # the global switch never decides an exit's mode (PK-3)
     dry_id = _insert_ticket(env.db, mode="dry_run", entry_fill_status="filled", filled_quantity=5,
                             filled_price=3000.0, kite_gtt_id=None)
     t = _exit(env, dry_id).json()["data"]
     assert t["mode"] == "dry_run"
     done = env.client.post(f"/api/tickets/{t['id']}/confirm").json()["data"]
-    assert done["status"] == "executed" and done["lifecycle"]["lifecycle_state"] == "CLOSED"
+    assert done["status"] == "executed" and done["lifecycle"]["lifecycle_state"] == "EXITING"
+    assert _closed_trades_for(env, dry_id) == []
+
+    from backend import order_monitor
+    order_monitor.check_paper_orders(env.kite)
+    closed = {p["position_id"]: p for p in env.client.get("/api/app-positions?view=closed").json()["data"]}
+    assert closed[dry_id]["lifecycle_state"] == "CLOSED"
     assert env.kite.calls_to("place_order") == []
     assert len(_closed_trades_for(env, dry_id)) == 1
 

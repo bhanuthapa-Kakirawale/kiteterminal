@@ -451,8 +451,9 @@ def decide_variety(now: datetime, allow_amo: bool) -> tuple[str | None, SafetyFa
     if allow_amo:
         return VARIETY_AMO, None
     return None, SafetyFailure(AMO_CONFIRMATION_REQUIRED,
-                               "The market is closed. A live entry now would be queued overnight as an After-Market "
-                               "Order — approve again with 'Send as AMO' ticked to do that. Nothing was executed.")
+                               "The market is closed. An entry now would be queued overnight as an After-Market "
+                               "Order (a paper AMO in dry run) — approve again with 'Send as AMO' ticked to do that. "
+                               "Nothing was executed.")
 
 
 def fetch_ltp(kite: KiteConnect, ticket: sqlite3.Row) -> float:
@@ -508,9 +509,14 @@ def precheck(conn: sqlite3.Connection, account_id: int, ticket: sqlite3.Row, mod
     decision.add(check_stale_signal(ticket, now))
     if live:
         decision.add(check_breaker(state))
-        variety, failure = decide_variety(now, allow_amo)
-        decision.add(failure)
-        decision.variety = variety
+    # PK-20: a dry-run entry is a paper ORDER, subject to the same session
+    # rules (PK-12H): a regular order only while the market is open, an AMO
+    # only with the approver's explicit consent. The breaker and the daily
+    # loss / entry / notional limits above stay live-only — paper activity
+    # never consumes or trips them.
+    variety, failure = decide_variety(now, allow_amo)
+    decision.add(failure)
+    decision.variety = variety
     return decision
 
 

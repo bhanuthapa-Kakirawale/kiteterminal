@@ -8,7 +8,8 @@ from kiteconnect import KiteConnect
 from kiteconnect.exceptions import KiteException
 
 from backend import (
-    account_safety, execution, instruments, journal, kite_chart, lifecycle, position_quantity, reconciliation,
+    account_safety, execution, instruments, kite_chart, lifecycle, paper_broker, position_quantity,
+    reconciliation,
     risk_engine,
     signal_chart,
     system_events,
@@ -654,16 +655,15 @@ def _refuse_exit_claim(conn: sqlite3.Connection, account: sqlite3.Row, ticket: s
 def _update_if_still_claimed(conn: sqlite3.Connection, ticket: sqlite3.Row, **columns) -> bool:
     """Compare-and-set for confirmation-time revalidation: applies only while
     the ticket is still exactly as this request claimed it — 'confirmed' and
-    'submitting' (live) or never submitted (dry run). If order_monitor has
-    since marked the claim unknown/needs_review, that state is never
-    overwritten. Kept separate from execution.update_ticket_if, which is the
-    post-broker-call outcome write."""
+    'submitting' (live, and since PK-20 dry run: a paper order is tracked
+    the same way). If order_monitor has since marked the claim
+    unknown/needs_review, that state is never overwritten. Kept separate
+    from execution.update_ticket_if, which is the post-broker-call outcome
+    write."""
     assignments = ", ".join(f"{name} = ?" for name in columns)
-    submission = "submission_state = ?" if ticket["mode"] == "live" else "submission_state IS NULL"
-    params = (execution.SUBMITTING,) if ticket["mode"] == "live" else ()
     return conn.execute(
-        f"UPDATE trade_tickets SET {assignments} WHERE id = ? AND status = 'confirmed' AND {submission}",
-        (*columns.values(), ticket["id"], *params),
+        f"UPDATE trade_tickets SET {assignments} WHERE id = ? AND status = 'confirmed' AND submission_state = ?",
+        (*columns.values(), ticket["id"], execution.SUBMITTING),
     ).rowcount == 1
 
 
@@ -909,16 +909,15 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
         if mode == "live":
             entry_limit = account_safety.daily_entry_claim_condition(
                 risk_engine.get_settings(conn, account["id"]), account["id"], ticket_id, account_safety.now_ist())
-    # A live claim also records the order tag and 'submitting' in the same
+    # The claim also records the order tag and 'submitting' in the same
     # write, before any broker call: if this process dies mid-submission, the
-    # database alone tells order_monitor what to look for (PK-2).
-    submission = {}
-    if mode == "live":
-        submission = dict(
-            order_tag=execution.order_tag_for(ticket_id, ticket["created_at"]),
-            submission_state=execution.SUBMITTING,
-            submitted_at=execution.utc_now_sql(),
-        )
+    # database alone tells order_monitor what to look for (PK-2). PK-20: a
+    # dry-run claim too — its paper order is followed exactly like a live one.
+    submission = dict(
+        order_tag=execution.order_tag_for(ticket_id, ticket["created_at"]),
+        submission_state=execution.SUBMITTING,
+        submitted_at=execution.utc_now_sql(),
+    )
     # The conditional UPDATE, not the check above, is the execution lock: two
     # requests can both pass the check, but only one can move the ticket out
     # of pending_confirmation. The loser never reaches the broker. The
@@ -957,11 +956,13 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
     if new_entry:
         # PK-12: the account safety gate has the last word before the broker.
         _account_safety_final_gate(conn, account, kite, ticket, ctx)
+    # PK-20: the broker of the ticket's own mode — Kite for live, the paper
+    # broker (on this request's connection, so the paper order is written in
+    # the same transaction as the ticket's outcome) for dry run.
+    broker = paper_broker.broker_for(ticket["mode"], kite, conn, account["id"])
     try:
-        result = execution.execute_ticket(kite, ticket, entry_variety=variety)
+        result = execution.execute_ticket(broker, ticket, entry_variety=variety)
     except Exception as e:
-        if ticket["mode"] != "live":
-            raise
         # We cannot tell how far execution got, so this is an UNKNOWN
         # outcome — never a 500 that leaves the ticket for nobody to follow up.
         logger.exception("Execution of ticket %d raised", ticket_id)
@@ -978,18 +979,12 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
         _reconcile_late_result(conn, ticket, result)
     _account_safety_bookkeeping(account, ticket, result, variety)
 
+    # PK-8: an exit closes its position only once its fill is proven. An
+    # exit the broker accepted is EXITING — the position stays open,
+    # protected and unjournaled, and order_monitor.py closes it when the
+    # broker reports the full quantity COMPLETE. PK-20: a dry-run exit too —
+    # its paper order fills only when the paper exchange observes a price.
     ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
-    # PK-8: an exit closes its position only once its fill is proven. A live
-    # exit Kite accepted is EXITING — the position stays open, protected and
-    # unjournaled, and order_monitor.py closes it when the broker reports the
-    # full quantity COMPLETE. Only a dry-run exit is filled here (simulated),
-    # so only it is closed now, through the same journal path. Only the
-    # writer that won the outcome may do this.
-    if (won and ticket["transaction_type"] == "SELL" and ticket["closes_ticket_id"] is not None
-            and ticket["status"] == "executed" and ticket["entry_fill_status"] == "filled"):
-        journal.close_position_for_exit(conn, ticket_id, ticket["closes_ticket_id"],
-                                        ticket["filled_at"] or execution.utc_now_sql())
-        ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
 
     _notify("executed", ticket_id=ticket_id, status=ticket["status"], success=result.success)
     data = _with_lifecycle(conn, ticket)
@@ -1008,28 +1003,24 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
 
 def _record_execution_result(conn: sqlite3.Connection, ticket: sqlite3.Row, result: execution.ExecutionResult) -> bool:
     """Writes the broker result only if the ticket is still the one this
-    request claimed. A live claim is 'submitting'; order_monitor may since
-    have marked a stale claim 'unknown' — definite broker evidence from this
-    request still upgrades that. Returns False once the monitor has resolved
-    the ticket itself (adopted / not_found / needs_review)."""
-    live = ticket["mode"] == "live"
-    claimed = (execution.SUBMITTING, execution.UNKNOWN) if live else (None,)
+    request claimed. A claim is 'submitting' (live, and dry run since PK-20);
+    order_monitor may since have marked a stale claim 'unknown' — definite
+    broker evidence from this request still upgrades that. Returns False
+    once the monitor has resolved the ticket itself (adopted / not_found /
+    needs_review)."""
+    claimed = (execution.SUBMITTING, execution.UNKNOWN)
 
     if result.event_type in ("executed", "protection_failed"):
-        # A live order is 'pending' until order_monitor.py sees the broker's
-        # fill; a dry-run simulation is filled at its reference price.
-        filled_now = result.entry_fill_status == "filled"
-        now = execution.utc_now_sql()
+        # The order is 'pending' until order_monitor.py sees the broker's —
+        # or the paper broker's — fill. Nothing is ever filled here: no fill
+        # price, time or quantity is known yet (PK-13, PK-20).
         return execution.update_ticket_if(
             conn, ticket["id"], status_in=("confirmed",), submission_state_in=claimed,
             status=result.status, kite_order_id=result.kite_order_id, kite_gtt_id=result.kite_gtt_id,
-            current_stop_loss=ticket["stop_loss"], executed_at=now,
+            current_stop_loss=ticket["stop_loss"], executed_at=execution.utc_now_sql(),
             order_variety=result.order_variety, entry_fill_status=result.entry_fill_status,
-            filled_price=ticket["entry_price"] if filled_now else None,
-            filled_at=now if filled_now else None,
-            # PK-13: nothing has filled at the broker yet; a simulation fills all.
-            filled_quantity=ticket["quantity"] if filled_now else 0,
-            submission_state=execution.ACKNOWLEDGED if live else None,
+            filled_price=None, filled_at=None, filled_quantity=0,
+            submission_state=execution.ACKNOWLEDGED,
         )
     if result.event_type == "submission_unknown":
         # Status stays 'confirmed': still owned by execution, never
@@ -1042,7 +1033,7 @@ def _record_execution_result(conn: sqlite3.Connection, ticket: sqlite3.Row, resu
     return execution.update_ticket_if(
         conn, ticket["id"], status_in=("confirmed",), submission_state_in=claimed,
         status=result.status, order_variety=result.order_variety,
-        submission_state=execution.REJECTED if live else None,
+        submission_state=execution.REJECTED,
     )
 
 
@@ -1134,16 +1125,19 @@ def start_trailing(ticket_id: int, kite: KiteConnect = Depends(require_trading_a
     conn = get_connection()
     try:
         ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
+        # PK-20: a paper position trails its paper GTT exactly like a live
+        # one; a legacy dry-run position has no GTT to trail.
+        broker_tracked = ticket["mode"] == "live" or paper_broker.is_paper_id(ticket["kite_order_id"])
         if not (
             ticket["trailing_trigger"] == "manual"
             and ticket["status"] == "executed"
-            and ticket["mode"] == "live"
+            and broker_tracked
             and ticket["closed_at"] is None
         ):
             raise HTTPException(409, {
                 "error_code": "CONFLICT_INVALID_STATE",
-                "message": "Manual trailing can only be started on an executed, live, "
-                           "still-open ticket with trailing_trigger='manual'",
+                "message": "Manual trailing can only be started on an executed, still-open live or paper "
+                           "ticket with trailing_trigger='manual'",
             })
         conn.execute("UPDATE trade_tickets SET trailing_active = 1 WHERE id = ?", (ticket_id,))
         _log_event(conn, ticket_id, "trailing_adjusted", "Trailing manually activated by user")

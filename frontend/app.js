@@ -2155,6 +2155,18 @@ async function onPositionAction(event) {
       openDetailDialog(await API.getTicket(btn.dataset.ticketId));
     } else if (action === "position-orders") {
       showSection("orders-trades");
+    } else if (action === "paper-cancel") {
+      // PK-20: cancels at the paper broker. As for Kite (PK-9), the request
+      // is not the outcome — the order monitor resolves the position.
+      if (!(await confirmAction({
+        title: "Cancel paper order?", message: `Cancel paper order ${btn.dataset.orderId} at the simulated broker? `
+          + "It may already have filled; the position updates when the order monitor sees the outcome.",
+        okLabel: "Cancel paper order", danger: true,
+      }))) return;
+      btn.disabled = true;
+      await API.cancelOrder(btn.dataset.orderId, "regular");
+      toast(`Cancellation requested for paper order ${btn.dataset.orderId}.`, { type: "info" });
+      await loadAppPositions();
     } else if (action === "position-journal") {
       showSection("journal");
     } else if (action === "position-reconciliation") {
@@ -2484,7 +2496,7 @@ function renderAccountSafety() {
       + (lossLimits.length ? ` (loss limit ${lossLimits.join(" or ")}${s.daily_loss_limit_hit ? " — HIT" : ""})`
         : " (daily loss limit NOT SET)"),
     s.max_order_notional != null ? `Max order ${inr(s.max_order_notional)}` : "Max order value NOT SET",
-    s.market_open ? "Market open" : "Market closed — live entries need explicit AMO",
+    s.market_open ? "Market open" : "Market closed — entries (live or paper) need explicit AMO",
   ];
   if (!s.breaker_open && s.breaker_recent_failures) parts.push(`Broker failures ${s.breaker_recent_failures}/${s.breaker_threshold ?? "off"}`);
   el.accountSafetySummary.textContent = parts.join(" · ");
@@ -3026,9 +3038,10 @@ function isClosingSell(t) {
   return t.transaction_type === "SELL" && (t.closes_ticket_id != null || t.source === "alert_action");
 }
 
-// PK-12H: a live NEW entry while the market is closed needs explicit AMO consent.
+// PK-12H: a NEW entry while the market is closed needs explicit AMO consent —
+// live, and since PK-20 dry run too (a paper order follows the same rule).
 function needsAmoConsent(t) {
-  return ticketExecMode(t) === "live" && !isClosingSell(t) && computeMarketStatus() !== "open";
+  return !isClosingSell(t) && computeMarketStatus() !== "open";
 }
 
 function ticketExecMode(t) {
@@ -3061,7 +3074,13 @@ async function resyncExecutionMode() {
 // How an approval will be executed — shown before the user commits.
 function executionNote(t) {
   const live = ticketExecMode(t) === "live";
-  if (!live) return { live, text: "DRY RUN — approving simulates the trade; nothing is sent to the broker." };
+  if (!live) {
+    // PK-20: a paper order at the simulated broker, never a real one.
+    const amo = computeMarketStatus() !== "open" && !isClosingSell(t)
+      ? " The market is closed — tick \"Send as AMO\" to queue a paper AMO for the next session." : "";
+    return { live, text: "DRY RUN — approving sends a PAPER order to the simulated broker; nothing is sent to Kite. "
+      + `It fills only when the observed market price allows.${amo}` };
+  }
   const open = computeMarketStatus() === "open";
   if (!open && !isClosingSell(t)) {
     // PK-12H: never an AMO by default — only with the checkbox below.
@@ -3201,7 +3220,10 @@ function reportExecution(t) {
   } else if (/UNPROTECTED|FAILED/.test(t.execution_message || "")) {
     toast(t.execution_message, { type: "warning", title: `${what} — placed, check protection`, timeout: 0 });
   } else if (t.mode === "dry_run") {
-    toast("Simulated — no real order was sent.", { type: "success", title: `${what} (dry run)` });
+    // PK-20: a PAPER order at the simulated broker — it fills (or not) only
+    // when the observed market price allows; the position follows.
+    toast(`PAPER order ${t.kite_order_id || ""} placed at the simulated broker — no real order was sent. It fills `
+      + "when the observed market price allows.", { type: "success", title: `${what} (dry run)` });
   } else if (t.ticket_state?.code === "EXITING") {
     toast(t.order_variety === "amo"
       ? "Exit sent as AMO — it executes when the market opens. The position stays open, with its protective GTT, until Kite reports the fill."
@@ -3381,10 +3403,14 @@ async function openDetailDialog(ticket) {
   const statusRow = `<div class="row"><span>Ticket</span><strong>${statusBadgeHtml(ticket.status, ticket)}</strong></div>`
     + positionDetailHtml(ticket);
   const modeRow = `<div class="row"><span>Mode</span><strong>${modeChipHtml(ticket.mode)}${ticket.order_variety === "amo" ? ' <span class="chip">AMO</span>' : ""}</strong></div>`;
+  // PK-20: a dry-run ticket's ids are the paper broker's, never Kite's.
+  const isPaper = (id) => typeof id === "string" && id.startsWith("PAPER-");
   const orderRow = ticket.kite_order_id
-    ? `<div class="row"><span>Kite Order ID</span><strong>${ticket.kite_order_id}</strong></div>` : "";
+    ? `<div class="row"><span>${isPaper(ticket.kite_order_id) ? "Paper Order ID" : "Kite Order ID"}</span>`
+      + `<strong>${esc(ticket.kite_order_id)}</strong></div>` : "";
   const gttRow = ticket.kite_gtt_id
-    ? `<div class="row"><span>Kite GTT ID</span><strong>${ticket.kite_gtt_id}</strong></div>` : "";
+    ? `<div class="row"><span>${isPaper(ticket.kite_gtt_id) ? "Paper GTT ID" : "Kite GTT ID"}</span>`
+      + `<strong>${esc(ticket.kite_gtt_id)}</strong></div>` : "";
   const tagRow = ticket.order_tag
     ? `<div class="row"><span>Kite order tag</span><strong>${esc(ticket.order_tag)}</strong></div>` : "";
   el.ticketDetailBody.innerHTML = statusRow + modeRow + orderRow + gttRow + tagRow + ticketConfirmHtml(ticket);

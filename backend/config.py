@@ -32,6 +32,11 @@ SUBMISSION_STALE_SECONDS = 120
 # IST day as the submission — once the order book has rolled over, absence
 # is not evidence and the ticket goes to manual review instead.
 UNKNOWN_ORDER_RECONCILE_WINDOW_SECONDS = 15 * 60
+# PK-20 paper broker: every simulated fill is this many basis points worse
+# than the observed LTP — a BUY above it, a SELL below it — then rounded to
+# the tick against the trader, and never past a LIMIT order's own price.
+# A deliberately simple, transparent cost of trading; not a spread model.
+PAPER_SLIPPAGE_BPS = 5.0
 
 # Historical OHLC backfill / indicators.
 # Kite's documented historical-data rate limit is 3 requests/second — the job

@@ -91,11 +91,19 @@ def test_live_entry_is_regular_while_market_open(env, market_open):
     assert env.kite.calls_to("place_order")[0]["variety"] == "regular"
 
 
-def test_dry_run_is_marked_filled(env):
+def test_dry_run_is_filled_by_the_paper_broker_at_the_observed_price(env, monkeypatch):
+    # PK-20 (was: "marked filled" at the ticket price on approval).
+    from backend import config, market, order_monitor
+    monkeypatch.setattr(market, "is_market_open", lambda at=None: True)
+    monkeypatch.setattr(config, "PAPER_SLIPPAGE_BPS", 0.0)
     set_mode(env.db, "dry_run")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
     r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
-    assert r["entry_fill_status"] == "filled" and r["filled_price"] == 3000.0
+    assert r["entry_fill_status"] == "pending" and r["filled_price"] is None
+    env.kite.ltp_map["NSE:TCS"] = 2995.0   # the observed price, at or below the 3000 limit
+    order_monitor.check_paper_orders(env.kite)
+    row = ticket_row(env.db, t["id"])
+    assert row["entry_fill_status"] == "filled" and row["filled_price"] == 2995.0
 
 
 def test_confirm_broadcasts_tickets_changed(env):

@@ -116,6 +116,9 @@ def env(tmp_path, monkeypatch):
     # FakeKite GTT ids and ticket ids restart in every test.
     from backend import reconciliation
     reconciliation.reset_cycle_memory()
+    # PK-20: the paper broker's one-shot test hooks are process memory too.
+    from backend import paper_broker
+    paper_broker.reset_test_hooks()
 
     from backend.ticker import ticker_manager
     monkeypatch.setattr(ticker_manager, "start", lambda *a, **k: None)

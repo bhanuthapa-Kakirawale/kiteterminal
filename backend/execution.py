@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from kiteconnect import KiteConnect
 from kiteconnect.exceptions import InputException, OrderException, PermissionException
 
-from backend import config, instruments, market
+from backend import config, instruments, market, paper_broker
 from backend.db import get_connection
 from backend.ticker import ticker_manager
 
@@ -47,8 +47,10 @@ def set_execution_mode(mode: str, confirm_real_money: bool, account_id: int | No
 # trade_tickets.submission_state records what is known about a live ticket's
 # broker order, separately from its lifecycle status:
 #
-#   NULL          never submitted (draft/pending/rejected tickets, dry runs,
-#                 and every ticket from before PK-2)
+#   NULL          never submitted (draft/pending/rejected tickets, dry runs
+#                 from before PK-20, and every ticket from before PK-2).
+#                 Since PK-20 a dry-run ticket's paper order is tracked
+#                 exactly like a live one, with the same states.
 #   submitting    execution claimed (status 'confirmed'); the broker call is
 #                 about to start or in flight. Written in the same
 #                 compare-and-set as pending_confirmation -> confirmed.
@@ -148,8 +150,9 @@ def update_ticket_if(
 # if that leaves the position flat — is the position's closed_at stamped.
 # PK-13: an exit that ends after a partial fill ('partial') sold exactly its
 # filled_quantity; the rest of the position stays open, and the exit no
-# longer owns it. 'unconfirmed' exits still keep it and need a human. A
-# dry-run exit is simulated as filled at once. No new status value:
+# longer owns it. 'unconfirmed' exits still keep it and need a human. PK-20:
+# a dry-run exit follows exactly the same lifecycle against the paper
+# broker — EXITING until a paper fill is observed. No new status value:
 # 'executed' + 'pending' keeps the exit owning its position under the PK-4
 # unique index while its order is in flight (EXIT_IN_FLIGHT_SQL).
 #
@@ -244,8 +247,8 @@ class ExecutionResult:
     event_type: str  # 'executed' | 'execution_failed' | 'protection_failed' | 'submission_unknown'
     message: str
     order_variety: str | None = None  # 'regular' | 'amo'
-    # 'pending' for a live order until backend/order_monitor.py sees the
-    # broker's terminal state; 'filled' for a simulated (dry-run) execution.
+    # 'pending' for a placed order (live or paper, PK-20) until
+    # backend/order_monitor.py sees the broker's terminal state.
     entry_fill_status: str | None = None
 
 
@@ -298,10 +301,14 @@ def unsupported_new_position(ticket_row) -> str | None:
 
 
 def execute_ticket(kite: KiteConnect, ticket: sqlite3.Row, entry_variety: str | None = None) -> ExecutionResult:
-    """entry_variety ('regular' | 'amo') is the order variety the account
-    safety gate decided for a live NEW entry (PK-12H) — an AMO only with the
-    approver's explicit consent. It is never re-derived from the clock here.
-    Exits keep resolving their own variety (AMO outside market hours)."""
+    """`kite` is the broker this ticket's mode executes against (PK-20):
+    Kite for a live ticket, the paper broker for a dry-run one
+    (paper_broker.broker_for) — the same order + protective GTT code runs
+    against either. entry_variety ('regular' | 'amo') is the order variety
+    the account safety gate decided for a NEW entry (PK-12H) — an AMO only
+    with the approver's explicit consent. It is never re-derived from the
+    clock here. Exits keep resolving their own variety (AMO outside market
+    hours)."""
     unsupported = unsupported_new_position(ticket)
     if unsupported is not None:
         # PK-17 backstop, in dry run too: a ticket that would open an
@@ -314,11 +321,25 @@ def execute_ticket(kite: KiteConnect, ticket: sqlite3.Row, entry_variety: str | 
             status="failed", event_type="execution_failed",
             message=f"{UNSUPPORTED_MANUAL_TRADE}: {unsupported} Refused before any broker call; nothing was sent.",
         )
-    if ticket["mode"] == "dry_run":
-        return _simulate(ticket)
+    try:
+        paper_broker.check_mode(kite, ticket["mode"])
+    except paper_broker.ModeIsolationError as e:
+        # PK-20 backstop: a dry-run ticket never reaches Kite and a live one
+        # never the paper broker. Definite, like the PK-17 refusal above.
+        return ExecutionResult(
+            success=False, kite_order_id=None, kite_gtt_id=None,
+            status="failed", event_type="execution_failed", message=f"{e} Refused before any broker call.",
+        )
     if is_closing_sell(ticket):
-        return _execute_exit(kite, ticket)
-    return _execute_live(kite, ticket, _entry_variety(kite, entry_variety))
+        result = _execute_exit(kite, ticket)
+    else:
+        result = _execute_live(kite, ticket, _entry_variety(kite, entry_variety))
+    if paper_broker.is_paper_broker(kite):
+        result.message = f"{PAPER_NOTE} {result.message}"
+    return result
+
+
+PAPER_NOTE = "PAPER (dry run — simulated broker, no real order):"
 
 
 def _entry_variety(kite: KiteConnect, entry_variety: str | None) -> str:
@@ -349,18 +370,6 @@ def unknown_result(ticket: sqlite3.Row, exc: BaseException, variety: str | None 
             f"exists; nothing will be resubmitted automatically."
         ),
         order_variety=variety,
-    )
-
-
-def _simulate(ticket: sqlite3.Row) -> ExecutionResult:
-    return ExecutionResult(
-        success=True,
-        kite_order_id=None,
-        kite_gtt_id=None,
-        status="executed",
-        event_type="executed",
-        message="Simulated (dry run) — no real order placed.",
-        entry_fill_status="filled",
     )
 
 

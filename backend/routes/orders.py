@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from kiteconnect import KiteConnect
 from kiteconnect.exceptions import KiteException, TokenException
 
-from backend import execution, system_events
+from backend import execution, paper_broker, system_events
 from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
@@ -30,7 +30,7 @@ def _linked_ticket_map(order_ids: list, gtt_ids: list) -> dict:
         rows = conn.execute(
             """
             SELECT id, kite_order_id, kite_gtt_id FROM trade_tickets
-            WHERE account_id = ? AND (kite_order_id IN ({}) OR kite_gtt_id IN ({}))
+            WHERE account_id = ? AND mode = 'live' AND (kite_order_id IN ({}) OR kite_gtt_id IN ({}))
             """.format(
                 ",".join("?" * len(order_ids)) or "NULL",
                 ",".join("?" * len(gtt_ids)) or "NULL",
@@ -106,26 +106,37 @@ def cancel_order(order_id: str, variety: str = "regular", kite: KiteConnect = De
     COMPLETE, partial, REJECTED) and resolves the ticket from broker
     evidence, exactly as for an order cancelled in Kite itself. An EXITING
     exit therefore keeps its position open and protected until then. If the
-    broker call fails, nothing is written at all."""
-    account = get_trading_account()
-    _call(lambda: kite.cancel_order(variety=variety, order_id=order_id))
+    broker call fails, nothing is written at all.
 
+    PK-20: a paper order id ('PAPER-O-...') is cancelled at the paper broker
+    — never sent to Kite — with exactly the same semantics: the request is
+    recorded, and the order monitor resolves the dry-run ticket. A live id
+    is never looked up among dry-run tickets, nor a paper id among live."""
+    account = get_trading_account()
+    paper = paper_broker.is_paper_id(order_id)
     conn = get_connection()
     try:
+        if paper:
+            broker = paper_broker.PaperBroker(conn, account["id"])
+            _call(lambda: broker.cancel_order(variety=variety, order_id=order_id))
+        else:
+            _call(lambda: kite.cancel_order(variety=variety, order_id=order_id))
+
         ticket = conn.execute(
-            "SELECT id FROM trade_tickets WHERE account_id = ? AND kite_order_id = ?",
-            (account["id"], order_id),
+            "SELECT id FROM trade_tickets WHERE account_id = ? AND kite_order_id = ? AND mode = ?",
+            (account["id"], order_id, "dry_run" if paper else "live"),
         ).fetchone()
         if ticket is not None:
             conn.execute(
                 "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'modified', ?)",
-                (ticket["id"], f"Cancellation requested at broker for order {order_id} via Orders & Trades. Kite "
-                               f"accepting the request is not a cancellation — the order may still fill; the order "
-                               f"monitor records the broker's final state."),
+                (ticket["id"], f"Cancellation requested at {'the paper broker' if paper else 'broker'} for order "
+                               f"{order_id}. The broker accepting the request is not a cancellation — the order may "
+                               f"still fill; the order monitor records the broker's final state."),
             )
         system_events.log_event(
             conn, account["id"], "order_cancelled_manually",
-            f"cancel requested: order_id={order_id}, ticket={ticket['id'] if ticket else None}",
+            f"cancel requested{' (paper)' if paper else ''}: order_id={order_id}, "
+            f"ticket={ticket['id'] if ticket else None}",
         )
         conn.commit()
     finally:
@@ -133,7 +144,8 @@ def cancel_order(order_id: str, variety: str = "regular", kite: KiteConnect = De
 
     return {"data": {
         "cancel_requested": True, "order_id": order_id, "linked_ticket_id": ticket["id"] if ticket else None,
-        "message": f"Cancellation requested for order {order_id}. Kite decides the outcome; the linked ticket "
+        "message": f"Cancellation requested for order {order_id}. "
+                   f"{'The paper broker' if paper else 'Kite'} decides the outcome; the linked ticket "
                    f"updates when the order monitor sees it.",
     }}
 
@@ -157,7 +169,7 @@ def cancel_gtt(gtt_id: int, kite: KiteConnect = Depends(require_trading_account)
     conn = get_connection()
     try:
         ticket = conn.execute(
-            "SELECT id FROM trade_tickets WHERE account_id = ? AND kite_gtt_id = ?",
+            "SELECT id FROM trade_tickets WHERE account_id = ? AND kite_gtt_id = ? AND mode = 'live'",
             (account["id"], gtt_id),
         ).fetchone()
         if ticket is not None:

@@ -505,7 +505,10 @@ def test_12d_dry_run_entry_makes_no_price_check(env, market_open):
     env.kite.ltp_map["NSE:TCS"] = 5000.0
     r = _confirm(env, _entry(env))
     assert r.status_code == 200 and r.json()["data"]["mode"] == "dry_run"
-    assert env.kite.calls_to("ltp") == []
+    assert r.json()["data"]["status"] == "executed"  # not refused by the PK-12D deviation check
+    # PK-20: the one market-data read is the paper GTT's reference price
+    # (a live entry makes two: the price check, then the GTT's).
+    assert len(env.kite.calls_to("ltp")) == 1 and env.kite.calls_to("place_order") == []
 
 
 # ================================================================= PK-12E stale strategy signal
@@ -968,13 +971,21 @@ def test_12h_emergency_exit_outside_hours_is_not_blocked(closed):
     assert [x["status"] for x in r.json()["data"]["results"]] == ["exit_submitted"]
 
 
-def test_12h_dry_run_entry_outside_hours_is_simulated_without_amo(env, monkeypatch):
+def test_12h_dry_run_entry_outside_hours_follows_the_same_amo_rule(env, monkeypatch):
+    # PK-20: a dry-run entry is a paper ORDER, so PK-12H applies to it as it
+    # does live: refused without explicit AMO consent, a paper AMO with it.
     from backend import market
     monkeypatch.setattr(market, "is_market_open", lambda at=None: False)
-    r = _confirm(env, _entry(env))
+    tid = _entry(env)
+    r = _confirm(env, tid)
+    assert r.status_code == 409 and _code(r) == "AMO_CONFIRMATION_REQUIRED"
+    assert ticket_row(env.db, tid)["status"] == "pending_confirmation"
+
+    r = _confirm(env, tid, allow_amo=True)
     assert r.status_code == 200 and r.json()["data"]["mode"] == "dry_run"
-    assert r.json()["data"]["order_variety"] is None
-    assert _orders(env) == [] and env.kite.calls_to("ltp") == []
+    assert r.json()["data"]["order_variety"] == "amo"
+    assert r.json()["data"]["kite_order_id"].startswith("PAPER-O-")
+    assert _orders(env) == [] and env.kite.calls_to("place_order") == []
 
 
 def test_12h_amo_disabled_in_configuration_refuses_even_with_consent(closed, monkeypatch):

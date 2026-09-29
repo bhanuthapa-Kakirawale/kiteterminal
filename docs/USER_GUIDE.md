@@ -81,7 +81,16 @@ A persistent banner also shows your current mode with two safety buttons
 
 - **Dry Run (default)**: every trade is simulated. No order reaches
   Zerodha. This is the safe way to test strategies against real market
-  data without risking money.
+  data without risking money. Since PK-20 a dry-run approval places a
+  **paper order** (`PAPER-O-…`) and a **paper protective GTT**
+  (`PAPER-G-…`) at a simulated broker — it is *not* filled on approval.
+  The paper order fills only when the observed market price allows (a
+  LIMIT only at or better than its limit), slightly worse than that price
+  (5 bps slippage), and the position then moves through the same states
+  as a live one: ENTRY WORKING → OPEN → EXITING → CLOSED. The same
+  market-hours rule applies (outside hours, tick "Send as AMO"). A working
+  paper order can be cancelled from the Positions view. Paper P&L is gross
+  (no brokerage or taxes).
 - **Live**: real orders are placed through Kite Connect. Switching to Live
   requires you to explicitly confirm through a dialog (which also reminds
   you about the static-IP requirement). Switch back to Dry Run any time.

@@ -241,7 +241,7 @@ def _check_order_status(conn: sqlite3.Connection, kite, account) -> None:
     # checked too — against the quantity the app recorded as filled.
     tickets = conn.execute(
         "SELECT * FROM trade_tickets "
-        "WHERE account_id = ? AND status = 'executed' AND kite_order_id IS NOT NULL "
+        "WHERE account_id = ? AND mode = 'live' AND status = 'executed' AND kite_order_id IS NOT NULL "
         "AND executed_at >= ? AND COALESCE(entry_fill_status, 'filled') IN ('filled', 'partial')",
         (account["id"], risk_engine._same_day_ist_cutoff_utc()),
     ).fetchall()

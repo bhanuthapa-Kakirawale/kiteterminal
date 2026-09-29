@@ -9,8 +9,8 @@ from datetime import datetime, timedelta, timezone
 from kiteconnect.exceptions import GeneralException, InputException, OrderException, TokenException
 
 from backend import (
-    config, execution, instruments, kite_client, market, order_monitor, position_quantity, reconciliation,
-    risk_engine,
+    config, execution, instruments, kite_client, market, order_monitor, paper_broker, position_quantity,
+    reconciliation, risk_engine,
 )
 from backend.accounts import get_default_account
 from backend.db import get_connection
@@ -53,26 +53,32 @@ async def _tick_once() -> None:
     await asyncio.to_thread(_tick_sync)
 
 
-def monitored_positions(conn: sqlite3.Connection, account_id: int) -> list[sqlite3.Row]:
-    """Every live open position a protective GTT is watching — trailing or
-    not. A fixed stop + target position has an OCO GTT whose firing closes
-    it just as surely as a trailing stop does (P0-5), so eligibility does
-    not depend on trailing_enabled. 'executed' keeps out claimed and
+def monitored_positions(conn: sqlite3.Connection, account_id: int, mode: str = "live") -> list[sqlite3.Row]:
+    """Every open position of `mode` a protective GTT is watching — trailing
+    or not. A fixed stop + target position has an OCO GTT whose firing
+    closes it just as surely as a trailing stop does (P0-5), so eligibility
+    does not depend on trailing_enabled. 'executed' keeps out claimed and
     unknown-outcome submissions (PK-2), and an entry still waiting for its
-    fill has no position yet: a GTT id alone is never enough."""
+    fill has no position yet: a GTT id alone is never enough. PK-20: a
+    dry-run position's paper GTT is watched the same way, against the
+    paper broker — and only a paper GTT: a dry-run row carrying any other id
+    (a historical or hand-edited one) is never judged against either book."""
     return conn.execute(
         """
         SELECT * FROM trade_tickets
-        WHERE account_id = ? AND mode = 'live' AND status = 'executed'
+        WHERE account_id = ? AND mode = ? AND status = 'executed'
           AND closed_at IS NULL AND kite_gtt_id IS NOT NULL
           AND COALESCE(entry_fill_status, 'filled') != 'pending'
+          AND (mode = 'live' OR kite_gtt_id LIKE 'PAPER-%')
         ORDER BY id
         """,
-        (account_id,),
+        (account_id, mode),
     ).fetchall()
 
 
 def _tick_sync() -> None:
+    """One GTT-watcher / trailing cycle: live positions against Kite, then
+    (PK-20) dry-run positions against the paper broker — same code."""
     global _last_active_count
     conn = get_connection()
     try:
@@ -81,9 +87,10 @@ def _tick_sync() -> None:
             _last_active_count = 0
             return
 
-        tickets = monitored_positions(conn, account["id"])
-        _last_active_count = len(tickets)
-        if not tickets:
+        live = monitored_positions(conn, account["id"], "live")
+        paper = monitored_positions(conn, account["id"], "dry_run")
+        _last_active_count = len(live) + len(paper)
+        if not live and not paper:
             return
 
         try:
@@ -91,29 +98,41 @@ def _tick_sync() -> None:
         except kite_client.NoActiveSessionError:
             return  # heartbeat still fires — UI can tell "ran but skipped" from "not running"
 
-        # One GTT book per cycle for every position. Without it nothing can
-        # be judged, so a failure here ends the cycle.
-        gtt_book = {g["id"]: g for g in kite.get_gtts()}
-        gtt_status = {gtt_id: g.get("status", "active") for gtt_id, g in gtt_book.items()}
-        ltp_data = _trailing_ltps(kite, tickets, gtt_status)
-
-        for ticket in tickets:
-            # One position's failure must not stop the others being checked:
-            # each is its own transaction, rolled back alone if it raises.
-            try:
-                _process_ticket(kite, conn, ticket, ltp_data, gtt_book)
-                conn.commit()
-                _consecutive_errors.pop(ticket["id"], None)
-            except TokenException:
-                conn.rollback()
-                raise  # the session is gone — every later call would fail too
-            except Exception as e:
-                conn.rollback()
-                logger.exception("GTT watcher failed for ticket %d (%s); continuing with the rest",
-                                 ticket["id"], ticket["symbol"])
-                _note_ticket_error(ticket, e)
+        if live:
+            _tick_mode(conn, kite, live)
+        if paper:
+            # Market data is read from Kite; every GTT call goes to the paper
+            # broker, on this cycle's connection.
+            _tick_mode(conn, paper_broker.PaperBroker(conn, account["id"], market_data=kite), paper)
     finally:
         conn.close()
+
+
+def _tick_mode(conn: sqlite3.Connection, kite, tickets: list[sqlite3.Row]) -> None:
+    """The cycle for one mode's positions against that mode's broker."""
+    for ticket in tickets:
+        paper_broker.check_mode(kite, ticket["mode"])
+    # One GTT book per cycle for every position. Without it nothing can be
+    # judged, so a failure here ends the cycle.
+    gtt_book = {g["id"]: g for g in kite.get_gtts()}
+    gtt_status = {gtt_id: g.get("status", "active") for gtt_id, g in gtt_book.items()}
+    ltp_data = _trailing_ltps(kite, tickets, gtt_status)
+
+    for ticket in tickets:
+        # One position's failure must not stop the others being checked:
+        # each is its own transaction, rolled back alone if it raises.
+        try:
+            _process_ticket(kite, conn, ticket, ltp_data, gtt_book)
+            conn.commit()
+            _consecutive_errors.pop(ticket["id"], None)
+        except TokenException:
+            conn.rollback()
+            raise  # the session is gone — every later call would fail too
+        except Exception as e:
+            conn.rollback()
+            logger.exception("GTT watcher failed for ticket %d (%s); continuing with the rest",
+                             ticket["id"], ticket["symbol"])
+            _note_ticket_error(ticket, e)
 
 
 def _trailing_ltps(kite, tickets: list[sqlite3.Row], gtt_status: dict) -> dict:
@@ -411,6 +430,13 @@ def _app_order_ids(conn: sqlite3.Connection) -> set[str]:
 
 
 def _other_positions_in_symbol(conn: sqlite3.Connection, ticket: sqlite3.Row) -> list[int]:
+    if ticket["mode"] == "dry_run":
+        # PK-20: a paper order can only be another PAPER position's exit.
+        return [r["id"] for r in conn.execute(
+            "SELECT id FROM trade_tickets WHERE account_id = ? AND mode = 'dry_run' AND status = 'executed' "
+            "AND transaction_type = 'BUY' AND closed_at IS NULL AND symbol = ? AND exchange = ? AND id != ?",
+            (ticket["account_id"], ticket["symbol"], ticket["exchange"], ticket["id"]),
+        ).fetchall()]
     return [p["id"] for p in risk_engine.list_open_positions(conn, ticket["account_id"])
             if p["symbol"] == ticket["symbol"] and p["exchange"] == ticket["exchange"] and p["id"] != ticket["id"]]
 

@@ -60,6 +60,13 @@ its deterministic order tag (execution.order_tag_for) — never resubmitted:
 
 Every write here is a compare-and-set against the state the ticket was read
 in, because the confirming request may be writing the same ticket.
+
+PK-20: dry-run tickets follow exactly the same lifecycle against the paper
+broker. Each cycle first follows the live orders (Kite), then advances the
+simulated exchange (paper_broker.evaluate: observed prices fill paper
+orders and fire paper GTTs) and follows the dry-run tickets' paper orders
+through the very same functions below. A cycle only ever pairs a mode with
+its own broker (paper_broker.check_mode).
 """
 
 import asyncio
@@ -67,7 +74,7 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-from backend import config, execution, kite_client, position_quantity, reconciliation, risk_engine
+from backend import config, execution, kite_client, paper_broker, position_quantity, reconciliation, risk_engine
 from backend.accounts import get_default_account
 from backend.db import get_connection
 from backend.ticker import ticker_manager
@@ -89,6 +96,10 @@ async def run_order_monitor_loop() -> None:
             await asyncio.to_thread(check_pending_orders)
         except Exception:
             logger.exception("Order monitor cycle failed")
+        try:
+            await asyncio.to_thread(check_paper_orders)
+        except Exception:
+            logger.exception("Paper order monitor cycle failed")
         await asyncio.sleep(config.ORDER_MONITOR_INTERVAL_SECONDS)
 
 
@@ -99,35 +110,63 @@ def _log_event(conn: sqlite3.Connection, ticket_id: int, event_type: str, detail
     )
 
 
-def pending_tickets(conn: sqlite3.Connection, account_id: int) -> list[sqlite3.Row]:
+def pending_tickets(conn: sqlite3.Connection, account_id: int, mode: str = "live") -> list[sqlite3.Row]:
     return conn.execute(
         """
         SELECT * FROM trade_tickets
-        WHERE account_id = ? AND mode = 'live' AND status = 'executed'
+        WHERE account_id = ? AND mode = ? AND status = 'executed'
           AND entry_fill_status = 'pending' AND kite_order_id IS NOT NULL
+          AND (mode = 'live' OR kite_order_id LIKE 'PAPER-%')
         ORDER BY id
         """,
-        (account_id,),
+        (account_id, mode),
     ).fetchall()
 
 
-def unresolved_submissions(conn: sqlite3.Connection, account_id: int, now: datetime) -> list[sqlite3.Row]:
-    """Live tickets whose broker submission has no known outcome: marked
-    'unknown' by the confirming request, or still 'submitting' long after
-    any request could be in flight (the process died mid-submission)."""
+def unresolved_submissions(conn: sqlite3.Connection, account_id: int, now: datetime,
+                           mode: str = "live") -> list[sqlite3.Row]:
+    """Tickets of `mode` whose broker submission has no known outcome:
+    marked 'unknown' by the confirming request, or still 'submitting' long
+    after any request could be in flight (the process died mid-submission)."""
     stale_cutoff = (now - timedelta(seconds=config.SUBMISSION_STALE_SECONDS)).strftime(_SQL_TIME)
     return conn.execute(
         """
         SELECT * FROM trade_tickets
-        WHERE account_id = ? AND mode = 'live' AND status = 'confirmed'
+        WHERE account_id = ? AND mode = ? AND status = 'confirmed'
           AND (submission_state = ? OR (submission_state = ? AND submitted_at <= ?))
         ORDER BY id
         """,
-        (account_id, execution.UNKNOWN, execution.SUBMITTING, stale_cutoff),
+        (account_id, mode, execution.UNKNOWN, execution.SUBMITTING, stale_cutoff),
     ).fetchall()
 
 
-def check_pending_orders(kite=None) -> dict:
+def check_paper_orders(market_data=None) -> dict:
+    """PK-20: one dry-run cycle — advance the simulated exchange against the
+    observed market (market_data: Kite, read only), then follow every
+    dry-run ticket's paper order through the same lifecycle as a live one.
+    Without a session there are no prices, so nothing can fill: skipped."""
+    conn = get_connection()
+    try:
+        account = get_default_account(conn)
+    finally:
+        conn.close()
+    if account["account_type"] != "trading":
+        return {"checked": 0, "updated": 0}
+    if market_data is None:
+        try:
+            market_data = kite_client.get_kite()
+        except kite_client.NoActiveSessionError:
+            return {"checked": 0, "updated": 0, "skipped": "no_session"}
+    exchange = paper_broker.evaluate(account["id"], market_data)
+    result = check_pending_orders(mode="dry_run")
+    result["paper_exchange"] = exchange
+    return result
+
+
+def check_pending_orders(kite=None, mode: str = "live") -> dict:
+    """One cycle for the tickets of `mode`. Live: Kite's order book (`kite`,
+    or the session's client). Dry run (PK-20): the paper broker's book, on
+    this cycle's own connection — no session is needed to read it."""
     updates: list[dict] = []
     checked = 0
     conn = get_connection()
@@ -136,14 +175,18 @@ def check_pending_orders(kite=None) -> dict:
         if account["account_type"] != "trading":
             return {"checked": 0, "updated": 0}
         now = _utc_now()
-        unresolved = unresolved_submissions(conn, account["id"], now)
-        if not unresolved and not pending_tickets(conn, account["id"]):
+        unresolved = unresolved_submissions(conn, account["id"], now, mode)
+        if not unresolved and not pending_tickets(conn, account["id"], mode):
             return {"checked": 0, "updated": 0}
-        if kite is None:
+        if mode == "dry_run":
+            kite = paper_broker.PaperBroker(conn, account["id"])
+        elif kite is None:
             try:
                 kite = kite_client.get_kite()
             except kite_client.NoActiveSessionError:
                 return {"checked": 0, "updated": 0, "skipped": "no_session"}
+        # A cycle never pairs a mode with the other mode's broker.
+        paper_broker.check_mode(kite, mode)
         try:
             orders = kite.orders()
         except Exception:
@@ -160,7 +203,7 @@ def check_pending_orders(kite=None) -> dict:
             conn.commit()
 
         today_cutoff = risk_engine._same_day_ist_cutoff_utc()
-        for ticket in pending_tickets(conn, account["id"]):
+        for ticket in pending_tickets(conn, account["id"], mode):
             checked += 1
             order = book.get(ticket["kite_order_id"]) or _order_from_history(kite, ticket["kite_order_id"])
             if order is None:

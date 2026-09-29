@@ -1012,9 +1012,17 @@ def test_p0_3_dry_run_position_exit_under_global_live_sends_nothing(env, market_
     assert r.status_code == 200, r.text
     assert _broker_calls(env) == []
     row = ticket_row(env.db, sell_id)
-    assert (row["mode"], row["status"], row["kite_order_id"]) == ("dry_run", "executed", None)
-    assert row["submission_state"] is None and row["order_tag"] is None  # no live submission metadata
-    assert "Simulated" in r.json()["data"]["execution_message"]
+    # PK-20: a PAPER order at the paper broker — never a Kite order — tracked
+    # like any order (PK-2 metadata), and EXITING until a paper fill.
+    assert (row["mode"], row["status"], row["entry_fill_status"]) == ("dry_run", "executed", "pending")
+    assert row["kite_order_id"].startswith("PAPER-O-") and row["submission_state"] == "acknowledged"
+    assert r.json()["data"]["execution_message"].startswith("PAPER")
+    assert _closed_trades_for(env, buy_id) == []
+
+    from backend import order_monitor
+    order_monitor.check_paper_orders(env.kite)  # the paper exchange fills it at the observed price
+
+    assert _broker_calls(env) == []
     assert [t["mode"] for t in _closed_trades_for(env, buy_id)] == ["dry_run"]
 
 

@@ -467,11 +467,19 @@ def test_25_complete_gtt_close_still_works(env, market_open):
     assert not _modifies(env)
 
 
-def test_dry_run_entry_is_filled_in_full_at_once(env):
+def test_dry_run_entry_fills_only_through_the_paper_broker(env, market_open):
+    # PK-20 (was: "filled in full at once"): approval places a paper order
+    # that has filled nothing; the paper exchange fills it at an observed
+    # price, and only then is the position its filled quantity.
     set_mode(env.db, "dry_run")
-    t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
+    t = env.client.post("/api/tickets", json=_manual_ticket(entry_order_type="MARKET")).json()["data"]
     done = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
-    assert (done["status"], done["filled_quantity"], done["open_quantity"]) == ("executed", 5, 5)
+    assert (done["status"], done["filled_quantity"], done["entry_fill_status"]) == ("executed", 0, "pending")
+
+    from backend import order_monitor
+    order_monitor.check_paper_orders(env.kite)
+    listed = {x["id"]: x for x in env.client.get("/api/tickets").json()["data"]}
+    assert (listed[t["id"]]["filled_quantity"], listed[t["id"]]["open_quantity"]) == (5, 5)
 
 
 # ===================================================================== RESTART

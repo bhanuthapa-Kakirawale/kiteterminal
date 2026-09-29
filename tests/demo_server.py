@@ -441,6 +441,42 @@ def seed_lifecycle_fixtures(db, fake) -> None:
     print("  seeded PK-19 lifecycle fixtures", flush=True)
 
 
+def install_paper_controls(app, fake) -> None:
+    """PK-20, opt-in (--paper-controls), demo server only — these routes do
+    not exist in backend/main.py. They drive the paper broker's market for a
+    browser rehearsal: set a symbol's simulated LTP (FakeKite is the demo's
+    market-data source), run one paper cycle now instead of waiting for the
+    background loops, and make a working paper order fill progressively."""
+    from fastapi import Body, HTTPException
+    from backend import order_monitor, paper_broker, trailing_engine
+
+    # With these controls the paper exchange advances only on demand
+    # (POST /api/demo/paper/cycle), so a rehearsal can observe every state;
+    # the background order-monitor loop keeps following live orders.
+    run_paper_cycle = order_monitor.check_paper_orders
+    order_monitor.check_paper_orders = lambda *a, **k: {"skipped": "demo: paper cycles run on demand"}
+
+    @app.post("/api/demo/paper/ltp")
+    def demo_paper_ltp(body: dict = Body(...)):
+        key = f"{body.get('exchange', 'NSE')}:{str(body['symbol']).upper()}"
+        fake.ltp_map[key] = float(body["price"])
+        return {"data": {"key": key, "price": fake.ltp_map[key]}}
+
+    @app.post("/api/demo/paper/cycle")
+    def demo_paper_cycle():
+        result = run_paper_cycle(fake)
+        trailing_engine._tick_sync()
+        return {"data": result}
+
+    @app.post("/api/demo/paper/fill-plan")
+    def demo_paper_fill_plan(body: dict = Body(...)):
+        try:
+            paper_broker.set_fill_plan(str(body["order_id"]), list(body["plan"]))
+        except ValueError as e:
+            raise HTTPException(400, {"error_code": "BAD_FILL_PLAN", "message": str(e)})
+        return {"data": {"order_id": body["order_id"], "plan": body["plan"]}}
+
+
 def _serve_frontend_from(app, frontend_dir: Path) -> None:
     """Swap in a different frontend build (e.g. an older one, for a
     before/after comparison) without touching backend/main.py."""
@@ -460,6 +496,10 @@ def main() -> None:
     parser.add_argument("--frontend-dir", default=None, help="serve another frontend build instead of ./frontend")
     parser.add_argument("--lifecycle-fixtures", action="store_true",
                         help="PK-19: also seed one app position per lifecycle state (off by default)")
+    parser.add_argument("--paper-controls", action="store_true",
+                        help="PK-20: demo-only routes to set simulated LTPs and run paper cycles (off by default)")
+    parser.add_argument("--market-open", action="store_true",
+                        help="pin the NSE clock to 'open' (a deterministic paper rehearsal at any hour)")
     args = parser.parse_args()
 
     workdir = Path(args.workdir or tempfile.mkdtemp(prefix="kite-demo-"))
@@ -472,6 +512,8 @@ def main() -> None:
     if db.DB_PATH.exists():
         db.DB_PATH.unlink()
 
+    if args.market_open:
+        market.is_market_open = lambda at=None: True
     fake, closes = build_fake(market)
     seed_holdings(fake, closes)
     kite_client.get_kite = lambda account_id=None: fake
@@ -488,6 +530,8 @@ def main() -> None:
     from backend.main import app
     if args.frontend_dir:
         _serve_frontend_from(app, Path(args.frontend_dir))
+    if args.paper_controls:
+        install_paper_controls(app, fake)
     print(f"Demo server on http://127.0.0.1:{args.port}  (db: {db.DB_PATH})", flush=True)
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
 

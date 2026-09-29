@@ -30,7 +30,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from backend import config, execution, position_quantity
+from backend import config, execution, paper_broker, position_quantity
 from backend import reconciliation as rc
 
 # ---- lifecycle states ---------------------------------------------------------
@@ -161,12 +161,16 @@ class Context:
     issues_by_ticket: dict[int, list] = field(default_factory=lambda: defaultdict(list))
     issues_by_symbol: dict[str, list] = field(default_factory=lambda: defaultdict(list))
     journal: dict[int, sqlite3.Row] = field(default_factory=dict)
+    # PK-20: the paper broker's own order book, by paper order id — the
+    # app's persisted simulated broker, so still no broker call.
+    paper_orders: dict[str, sqlite3.Row] = field(default_factory=dict)
     now: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 def build_context(conn: sqlite3.Connection, account_id: int) -> Context:
-    """Three queries, whatever the number of positions: every ticket of the
-    account, the unresolved reconciliation findings, and the journal. (The
+    """Four queries, whatever the number of positions: every ticket of the
+    account, the unresolved reconciliation findings, the journal and (PK-20)
+    the paper order book. (The
     reconciliation log has no account column — the app has one trading
     account; its rows are matched to this account's tickets and symbols.)"""
     ctx = Context()
@@ -182,7 +186,31 @@ def build_context(conn: sqlite3.Connection, account_id: int) -> Context:
             ctx.issues_by_symbol[row["symbol"]].append(row)
     for row in conn.execute("SELECT * FROM closed_trades WHERE account_id = ?", (account_id,)):
         ctx.journal[row["buy_ticket_id"]] = row
+    for row in conn.execute(
+        "SELECT paper_order_id, status, quantity, filled_quantity, average_price FROM paper_orders "
+        "WHERE account_id = ?", (account_id,),
+    ):
+        ctx.paper_orders[row["paper_order_id"]] = row
     return ctx
+
+
+def _paper_order(row, active_exit: dict | None, ctx: Context) -> dict | None:
+    """PK-20: the paper order that matters for this position now — its
+    working exit's, else its entry's — with the paper broker's own status.
+    PARTIAL is how a working order with some shares filled is shown (Kite,
+    and so the paper broker, report it as OPEN)."""
+    order_id = active_exit["kite_order_id"] if active_exit and active_exit["kite_order_id"] else row["kite_order_id"]
+    order = ctx.paper_orders.get(order_id) if paper_broker.is_paper_id(order_id) else None
+    if order is None:
+        return None
+    status = order["status"]
+    if status == "OPEN" and 0 < order["filled_quantity"] < order["quantity"]:
+        status = "PARTIAL"
+    elif status == paper_broker.AMO_PENDING:
+        status = "AMO"
+    return {"order_id": order_id, "side": "exit" if active_exit and order_id != row["kite_order_id"] else "entry",
+            "status": status, "filled_quantity": order["filled_quantity"], "quantity": order["quantity"],
+            "average_price": order["average_price"] or None}
 
 
 # ---- predicates -------------------------------------------------------------------
@@ -306,7 +334,9 @@ def _issue(row) -> dict:
 
 
 def _protection(row, state: str, ticket_issue_codes: set, desired) -> str:
-    if state not in POSITION_STATES or row["mode"] != "live":
+    if state not in POSITION_STATES or not position_quantity.broker_tracked(row):
+        # A dry-run position from before PK-20 never had a GTT; a paper
+        # position's paper GTT is judged exactly like a live one's.
         return NOT_APPLICABLE
     if state == SUBMISSION_UNKNOWN:
         return PROTECTION_UNKNOWN
@@ -383,6 +413,9 @@ def derive(row, ctx: Context) -> dict:
         "strategy_name": row["strategy_name"], "source": row["source"], "product_type": row["product_type"],
         # PK-3: the position's own, immutable mode — never the global switch.
         "mode": row["mode"],
+        # PK-20: this position's orders and GTT are the paper broker's.
+        "paper": paper_broker.is_paper_id(row["kite_order_id"]),
+        "paper_order": _paper_order(row, active_exit, ctx),
         "lifecycle_state": state, "lifecycle_label": LABELS[state], "severity": severity,
         "state_reason": extra.get("reason"), "unknown_scope": extra.get("unknown_scope"),
         "is_position": state in POSITION_STATES, "is_holding": state in HOLDING_STATES,
@@ -426,8 +459,12 @@ def _allowed_actions(row, state: str, open_qty, active_exit, pending_exit, issue
     if (row["mode"] == "live" and active_exit is None
             and state in (ENTRY_OPEN, ENTRY_PARTIAL, OPEN, EXIT_PARTIAL)):
         actions.append(EMERGENCY_EXIT)
-    if row["mode"] == "live" and (state in (ENTRY_OPEN, ENTRY_PARTIAL)
-                                  or (active_exit is not None and active_exit["phase"] in ("WORKING", "PARTIAL"))):
+    # PK-20: a working paper order is cancelled through the paper broker,
+    # exactly like a live one through Kite (the monitor still resolves it).
+    entry_working = state in (ENTRY_OPEN, ENTRY_PARTIAL) and position_quantity.broker_tracked(row)
+    exit_working = (active_exit is not None and active_exit["phase"] in ("WORKING", "PARTIAL")
+                    and (row["mode"] == "live" or paper_broker.is_paper_id(active_exit["kite_order_id"])))
+    if entry_working or exit_working:
         actions.append(CANCEL_ORDER)
     if issues:
         actions.append(VIEW_RECONCILIATION)

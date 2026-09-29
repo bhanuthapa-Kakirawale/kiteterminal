@@ -1464,6 +1464,67 @@ def _ensure_reconciliation_issue_columns(conn: sqlite3.Connection) -> None:
     )
 
 
+_PAPER_TABLES = """
+CREATE TABLE IF NOT EXISTS paper_orders (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_order_id   TEXT UNIQUE,
+    account_id       INTEGER NOT NULL REFERENCES accounts(id),
+    ticket_id        INTEGER,
+    source_gtt_id    TEXT,
+    tag              TEXT,
+    variety          TEXT NOT NULL CHECK (variety IN ('regular', 'amo')),
+    exchange         TEXT NOT NULL,
+    tradingsymbol    TEXT NOT NULL,
+    transaction_type TEXT NOT NULL CHECK (transaction_type IN ('BUY', 'SELL')),
+    product          TEXT NOT NULL,
+    order_type       TEXT NOT NULL CHECK (order_type IN ('MARKET', 'LIMIT')),
+    quantity         INTEGER NOT NULL CHECK (quantity > 0),
+    filled_quantity  INTEGER NOT NULL DEFAULT 0 CHECK (filled_quantity >= 0 AND filled_quantity <= quantity),
+    pending_quantity INTEGER NOT NULL,
+    price            REAL,
+    trigger_price    REAL,
+    average_price    REAL NOT NULL DEFAULT 0,
+    status           TEXT NOT NULL CHECK (status IN ('AMO REQ RECEIVED', 'OPEN', 'COMPLETE', 'CANCELLED', 'REJECTED')),
+    status_message   TEXT,
+    session_date     TEXT NOT NULL,
+    fill_plan        TEXT,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    filled_at        TEXT,
+    cancelled_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_paper_orders_account_status ON paper_orders(account_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_orders_tag ON paper_orders(tag) WHERE tag IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS paper_gtts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_gtt_id   TEXT UNIQUE,
+    account_id     INTEGER NOT NULL REFERENCES accounts(id),
+    trigger_type   TEXT NOT NULL CHECK (trigger_type IN ('single', 'two-leg')),
+    exchange       TEXT NOT NULL,
+    tradingsymbol  TEXT NOT NULL,
+    trigger_values TEXT NOT NULL,
+    last_price     REAL,
+    legs           TEXT NOT NULL,
+    quantity       INTEGER NOT NULL,
+    status         TEXT NOT NULL CHECK (status IN ('active', 'triggered', 'deleted')),
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    triggered_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_paper_gtts_account_status ON paper_gtts(account_id, status);
+"""
+
+
+def _ensure_paper_tables(conn: sqlite3.Connection) -> None:
+    # PK-20: the paper broker's own books — its order book and GTT book, the
+    # simulated counterpart of what Kite keeps. Separate tables, so nothing
+    # about a live ticket or a live broker id changes; dry-run tickets refer
+    # to them by 'PAPER-O-<id>' / 'PAPER-G-<id>' in kite_order_id /
+    # kite_gtt_id. Only CREATE ... IF NOT EXISTS: idempotent, no rebuild.
+    conn.executescript(_PAPER_TABLES)
+
+
 def _ensure_watchlist_tag_column(conn: sqlite3.Connection) -> None:
     # Short free-text categorical label, separate from `notes` (free-form
     # commentary) — used only for the Watchlist's optional "group by tag"
@@ -1578,6 +1639,7 @@ def init_db() -> None:
         _ensure_watchlist_tag_column(conn)
         _ensure_dashboard_panels_screen_column(conn)
         _ensure_reconciliation_issue_columns(conn)
+        _ensure_paper_tables(conn)
         conn.executescript(_ACCOUNT_ID_INDEXES)
         _seed_default_account(conn)
         _ensure_trading_account_type(conn)
