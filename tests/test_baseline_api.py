@@ -155,7 +155,7 @@ def test_edit_only_allowed_for_draft(env):
     assert r.status_code == 409
 
 
-def test_confirm_dry_run_places_nothing(env):
+def test_confirm_dry_run_places_nothing(env, market_open):
     set_mode(env.db, "dry_run")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
     r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]

@@ -73,18 +73,30 @@ def _last_or_none(series: pd.Series, min_len: int) -> float | None:
     return float(value) if pd.notna(value) else None
 
 
-def load_ohlc_frame(instrument_token: int) -> pd.DataFrame:
+def load_ohlc_frame(instrument_token: int, end_date: str | None = None) -> pd.DataFrame:
     """All cached daily candles for one instrument, ordered by date — the
     shared read path used by both the live indicator cache writer below and
     the strategy engine / backtester (Phase 5), so there is exactly one
-    query building the OHLC dataframe everything else operates on."""
+    query building the OHLC dataframe everything else operates on.
+
+    `end_date` (PK-21) filters IN SQL, before any indicator or signal is
+    computed: a backtest ending on D never has a row after D in memory at
+    all, rather than loading the full frame and slicing its output later.
+    Earlier rows are always returned — they are the indicator warm-up."""
     conn = get_connection()
     try:
-        rows = conn.execute(
-            "SELECT date, open, high, low, close, volume FROM ohlc_daily "
-            "WHERE instrument_token = ? ORDER BY date",
-            (instrument_token,),
-        ).fetchall()
+        if end_date is None:
+            rows = conn.execute(
+                "SELECT date, open, high, low, close, volume FROM ohlc_daily "
+                "WHERE instrument_token = ? ORDER BY date",
+                (instrument_token,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT date, open, high, low, close, volume FROM ohlc_daily "
+                "WHERE instrument_token = ? AND date <= ? ORDER BY date",
+                (instrument_token, str(end_date)[:10]),
+            ).fetchall()
     finally:
         conn.close()
     return pd.DataFrame([dict(r) for r in rows])

@@ -89,3 +89,57 @@ AUTOMATION_RETRY_MINUTES = 15
 # against what the app expects — order status, GTT state, position
 # quantities. Runs only against the trading account.
 RECONCILIATION_INTERVAL_SECONDS = 180
+
+# PK-21 historical backtester. Every default a backtest uses lives here, in
+# one place, and every one of them is overridable per run from the Backtest
+# form / API. These are deliberately NOT the live account's risk_settings:
+# a historical test is its own explicit experiment, not a replay of today's
+# runtime limits.
+BACKTEST_DEFAULTS = {
+    "initial_capital": 1_000_000.0,
+    # Sizing uses the same risk-based / capital-based formula as live tickets
+    # (risk_engine.compute_position_size), applied to the simulated equity.
+    "risk_per_trade_pct": 0.5,
+    "capital_per_trade_pct": 10.0,
+    "max_open_positions": 5,
+    # Same default as the PK-20 paper broker, applied the same way: a BUY
+    # fills above its reference price, a SELL below it, rounded to the tick.
+    "entry_slippage_bps": 5.0,
+    "exit_slippage_bps": 5.0,
+    "costs_enabled": True,
+    # "next_open": market order at the next session's actual open.
+    # "next_session_limit": the live ticket's DAY LIMIT at close x 1.001,
+    # which only fills if the next session trades at or below it.
+    "entry_model": "next_open",
+    # Live breakeven is a proposal a human must approve, so assuming every
+    # one is approved is opt-in.
+    "simulate_breakeven": False,
+}
+
+# Indian equity DELIVERY (CNC) charges, per side, in percent of turnover
+# unless stated. Zerodha's published CNC schedule —
+# verify against the broker's current charges page before relying on it.
+#   brokerage_pct / brokerage_max_per_order: Zerodha charges Rs 0 on delivery.
+#   stt_pct: Securities Transaction Tax, 0.1% on BOTH buy and sell for delivery.
+#   exchange_txn_pct: NSE transaction charge, 0.00297% of turnover.
+#   sebi_per_crore: SEBI turnover fee, Rs 10 per crore of turnover.
+#   gst_pct: 18% GST on brokerage + exchange transaction charge + SEBI fee.
+#   stamp_duty_buy_pct: 0.015% on the BUY side only.
+#   dp_charge_per_sell: flat depository charge per scrip per sell day
+#                       (Rs 13 + 18% GST), debited on delivery sells only.
+BACKTEST_COST_DEFAULTS = {
+    "brokerage_pct": 0.0,
+    "brokerage_max_per_order": 0.0,
+    "stt_pct": 0.1,
+    "exchange_txn_pct": 0.00297,
+    "sebi_per_crore": 10.0,
+    "gst_pct": 18.0,
+    "stamp_duty_buy_pct": 0.015,
+    "dp_charge_per_sell": 15.34,
+}
+
+# A bar whose open is more than this far from the previous close is flagged
+# on any backtest trade it touches as a possible unadjusted corporate action
+# (split/bonus). ohlc_daily carries no adjustment metadata, so this is a
+# warning only — it never changes a fill (PK-21M; detection per audit P2-5).
+SUSPECT_CORPORATE_ACTION_GAP_PCT = 25.0

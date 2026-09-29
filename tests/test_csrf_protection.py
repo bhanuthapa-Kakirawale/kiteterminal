@@ -189,7 +189,7 @@ def test_c_wrong_header_value_is_rejected(env, value):
     assert _is_csrf_reject(r)
 
 
-def test_d_same_origin_with_header_behaves_normally(env):
+def test_d_same_origin_with_header_behaves_normally(env, market_open):
     set_mode(env.db, "dry_run")
     tid = _pending_ticket(env)
     r = _bare().post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db), headers={**APP_HEADER, "Origin": TERMINAL_ORIGIN})
@@ -269,7 +269,7 @@ def test_e_is_terminal_origin(origin, scheme, host, expected):
 
 # ---------------------------------------------------------------- G: non-browser clients, Referer fallback
 
-def test_g_no_origin_with_header_is_accepted(env):
+def test_g_no_origin_with_header_is_accepted(env, market_open):
     set_mode(env.db, "dry_run")
     tid = _pending_ticket(env)
     r = _bare().post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db), headers=APP_HEADER)

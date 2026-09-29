@@ -106,7 +106,7 @@ def test_dry_run_is_filled_by_the_paper_broker_at_the_observed_price(env, monkey
     assert row["entry_fill_status"] == "filled" and row["filled_price"] == 2995.0
 
 
-def test_confirm_broadcasts_tickets_changed(env):
+def test_confirm_broadcasts_tickets_changed(env, market_open):
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
     env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
     reasons = [m.get("reason") for m in env.broadcasts if m["type"] == "tickets_changed"]

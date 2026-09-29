@@ -110,9 +110,12 @@ def reject_stop_adjustment(proposal_id: int, kite: KiteConnect = Depends(require
 @router.post("/api/strategies/backtests")
 def run_backtest_endpoint(req: BacktestRequest, kite: KiteConnect = Depends(require_trading_account)):
     _require_known_strategy(req.strategy_name)
+    if req.start_date > req.end_date:
+        raise HTTPException(400, {"error_code": "INVALID_DATE_RANGE", "message": "start_date must not be after end_date"})
     account = get_trading_account()
     conn = get_connection()
     try:
+        universe_source = "user_supplied" if req.symbols else "current_watchlist"
         if req.symbols:
             pairs = []
             for sym in req.symbols:
@@ -136,14 +139,24 @@ def run_backtest_endpoint(req: BacktestRequest, kite: KiteConnect = Depends(requ
         else:
             params = strategy_engine.get_config(conn, account["id"], req.strategy_name)["params"]
 
+        # PK-21: the backtest sizes against its own simulated capital, so it
+        # no longer reads the live portfolio (no broker call is made).
         try:
-            result = backtest.run_backtest(
-                conn, account, kite, req.strategy_name, pairs, params, req.start_date, req.end_date,
-                run_walk_forward=req.run_walk_forward, window_days=req.window_days,
-                run_monte_carlo=req.run_monte_carlo, mc_iterations=req.mc_iterations, mc_random_seed=req.mc_random_seed,
+            cfg = backtest.BacktestConfig.from_overrides(
+                initial_capital=req.initial_capital, risk_per_trade_pct=req.risk_per_trade_pct,
+                capital_per_trade_pct=req.capital_per_trade_pct, max_open_positions=req.max_open_positions,
+                entry_slippage_bps=req.entry_slippage_bps, exit_slippage_bps=req.exit_slippage_bps,
+                costs_enabled=req.costs_enabled, entry_model=req.entry_model,
+                simulate_breakeven=req.simulate_breakeven,
             )
-        except risk_engine.RiskCheckUnavailableError as e:
-            raise HTTPException(status_code=e.status_code, detail={"error_code": e.error_code, "message": e.message})
+        except ValueError as e:
+            raise HTTPException(400, {"error_code": "INVALID_BACKTEST_CONFIG", "message": str(e)})
+        result = backtest.run_backtest(
+            conn, req.strategy_name, pairs, params, req.start_date, req.end_date, cfg=cfg,
+            universe_source=universe_source,
+            run_walk_forward=req.run_walk_forward, window_days=req.window_days,
+            run_monte_carlo=req.run_monte_carlo, mc_iterations=req.mc_iterations, mc_random_seed=req.mc_random_seed,
+        )
         return {"data": result}
     finally:
         conn.close()

@@ -1277,6 +1277,50 @@ def _ensure_backtest_runs_rigor_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE backtest_runs ADD COLUMN {column} {sql_type}")
 
 
+# PK-21: execution-realistic backtests. All nullable, no CHECKs, so plain
+# ALTER TABLEs suffice and the migration is idempotent. NULL on a run from
+# before PK-21 means "recorded by the old, optimistic fill model" — old runs
+# are never recomputed. The JSON columns hold the run's execution config,
+# net metrics, MTM equity curve, skipped/unexecuted signals and warnings.
+_BACKTEST_RUNS_PK21_COLUMNS = [
+    ("execution_config", "TEXT"),
+    ("metrics", "TEXT"),
+    ("equity_curve", "TEXT"),
+    ("skipped_signals", "TEXT"),
+    ("warnings", "TEXT"),
+    ("universe_source", "TEXT"),
+    ("survivorship_bias", "TEXT"),
+]
+_BACKTEST_TRADES_PK21_COLUMNS = [
+    ("strategy_name", "TEXT"),
+    ("signal_date", "TEXT"),
+    ("planned_entry_price", "REAL"),
+    ("quantity", "INTEGER"),
+    ("initial_stop", "REAL"),
+    ("initial_target", "REAL"),
+    ("gross_pnl", "REAL"),
+    ("entry_costs", "REAL"),
+    ("exit_costs", "REAL"),
+    ("costs", "REAL"),
+    ("net_pnl", "REAL"),
+    ("holding_days", "INTEGER"),
+    ("bars_held", "INTEGER"),
+    ("net_r_multiple", "REAL"),
+    ("gap_fill", "INTEGER"),
+    ("forced_close", "INTEGER"),
+    ("data_warning", "TEXT"),
+]
+
+
+def _ensure_backtest_pk21_columns(conn: sqlite3.Connection) -> None:
+    for column, sql_type in _BACKTEST_RUNS_PK21_COLUMNS:
+        if not _column_exists(conn, "backtest_runs", column):
+            conn.execute(f"ALTER TABLE backtest_runs ADD COLUMN {column} {sql_type}")
+    for column, sql_type in _BACKTEST_TRADES_PK21_COLUMNS:
+        if not _column_exists(conn, "backtest_trades", column):
+            conn.execute(f"ALTER TABLE backtest_trades ADD COLUMN {column} {sql_type}")
+
+
 def _seed_strategy_config_versions(conn: sqlite3.Connection) -> None:
     # One-time backfill: give every existing strategy_configs row a version
     # 1 history entry matching its current params, so trade_tickets.
@@ -1629,6 +1673,7 @@ def init_db() -> None:
         _ensure_closed_trades_strategy_version_column(conn)
         _ensure_strategy_configs_versioning_columns(conn)
         _ensure_backtest_runs_rigor_columns(conn)
+        _ensure_backtest_pk21_columns(conn)
         _ensure_execution_tracking_columns(conn)
         _ensure_alert_action_source(conn)
         _ensure_submission_tracking_columns(conn)

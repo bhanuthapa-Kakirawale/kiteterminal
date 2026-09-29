@@ -207,10 +207,21 @@ class EmergencyExitConfirmRequest(BaseModel):
 
 class BacktestRequest(BaseModel):
     strategy_name: str
-    start_date: str
-    end_date: str
+    start_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    end_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     symbols: list[str] | None = None  # None = every symbol currently on the watchlist
     params: dict | None = None  # None = the account's saved params for this strategy
+    # PK-21 execution-realism settings. None = config.BACKTEST_DEFAULTS —
+    # deliberately not the live account's risk_settings.
+    initial_capital: float | None = Field(default=None, gt=0)
+    risk_per_trade_pct: float | None = Field(default=None, gt=0, le=100)
+    capital_per_trade_pct: float | None = Field(default=None, gt=0, le=100)
+    max_open_positions: int | None = Field(default=None, ge=1, le=1000)
+    entry_slippage_bps: float | None = Field(default=None, ge=0, le=1000)
+    exit_slippage_bps: float | None = Field(default=None, ge=0, le=1000)
+    costs_enabled: bool | None = None
+    entry_model: Literal["next_open", "next_session_limit"] | None = None
+    simulate_breakeven: bool | None = None
     # Phase 8 Part D: opt-in rigor add-ons, off by default so a plain
     # backtest call isn't slowed down or randomized unless asked for.
     run_walk_forward: bool = False

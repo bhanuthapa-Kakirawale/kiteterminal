@@ -226,9 +226,26 @@ Go to **Strategies** to:
 - **Backtest** — pick a date range and symbol set, optionally enable a
   walk-forward consistency check or Monte Carlo simulation, and run a
   historical simulation using the *exact same* entry/exit logic the live
-  scanner uses. Results include win rate, average R, profit factor,
-  drawdown, Sharpe/Sortino, max consecutive losses, and a trade-by-trade
-  table.
+  scanner uses. The simulation only trades what could really have been
+  traded:
+  - a signal from a day's close is bought at the **next session's open**
+    (or, if you choose "Next-session LIMIT", only if the next day trades
+    down to the live ticket's limit price);
+  - a stop the price gaps through fills at the **opening price**, not at
+    the stop;
+  - trailing and breakeven stops only take effect the next session;
+  - strategy exits (EMA, time, RSI) fill at the next open.
+
+  Every fill pays slippage and Indian delivery charges (STT, exchange,
+  SEBI, GST, stamp duty, DP). Trades share one pot of capital with a cap
+  on open positions, and signals that could not be taken are counted
+  with the reason.
+
+  Results show gross and **net** P&L, costs, ending equity, a
+  drawdown measured on daily mark-to-market equity, and a trade-by-trade
+  table. A red banner warns when your current watchlist was used as the
+  universe: today's watchlist leaves out stocks that failed or were
+  dropped, so results are likely optimistic.
 
 ### The three built-in strategies, in plain terms
 

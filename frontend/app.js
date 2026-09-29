@@ -1711,15 +1711,57 @@ el.stopAdjustmentsList.addEventListener("click", async (event) => {
   }
 });
 
+function _btPct(v, digits = 2) {
+  return v != null ? `${v >= 0 ? "+" : ""}${v.toFixed(digits)}%` : "—";
+}
+
+// PK-21: the execution assumptions and the universe caveat are shown with
+// every result, so a number is never read without the model that produced it.
+function renderBacktestContext(r) {
+  const c = r.execution_config || {};
+  const universe = r.universe || {};
+  const warn = document.getElementById("bt-universe-warning");
+  warn.hidden = !universe.warning;
+  warn.textContent = universe.warning ? `⚠ ${universe.warning}` : "";
+
+  const costs = c.costs_enabled ? "costs ON (STT, exchange, SEBI, GST, stamp, DP)" : "costs OFF";
+  document.getElementById("bt-execution-summary").textContent =
+    `Execution: ${c.entry_model_label || "—"} · slippage ${c.entry_slippage_bps ?? "—"} / ${c.exit_slippage_bps ?? "—"} bps`
+    + ` (entry / exit) · ${costs} · capital ${inr(c.initial_capital, 0)} · max ${c.max_open_positions ?? "—"} positions`
+    + ` · risk ${c.risk_per_trade_pct ?? "—"}% per trade · same-bar stop+target: stop first`
+    + ` · close-based exits and trailing stops act next session`
+    + (c.simulate_breakeven ? " · breakeven assumed approved" : "");
+
+  const others = (r.warnings || []).filter((w) => w !== universe.warning);
+  const box = document.getElementById("bt-data-warnings");
+  box.hidden = others.length === 0;
+  box.innerHTML = others.map((w) => `<div>${esc(w)}</div>`).join("");
+}
+
 function renderBacktestResults() {
   const r = state.backtestResult;
   if (!r) return;
   el.backtestResults.hidden = false;
+  renderBacktestContext(r);
+  const m = r.metrics || {};
+  const set = (id, text) => { document.getElementById(id).textContent = text; };
+  set("bt-r-initial", inr(m.initial_capital, 0));
+  set("bt-r-ending", inr(m.ending_equity, 0));
+  set("bt-r-gross", `${inr(m.gross_pnl, 0)} / ${_btPct(m.gross_return_pct)}`);
+  set("bt-r-costs", inr(m.costs, 0));
+  set("bt-r-net", `${inr(m.net_pnl, 0)} / ${_btPct(m.net_return_pct)}`);
+  set("bt-r-cagr", m.net_cagr_pct != null ? _btPct(m.net_cagr_pct) : "— (under 1 year)");
+  set("bt-r-skipped", `${m.skipped_signals ?? "—"} / ${m.unexecuted_signals ?? "—"}`);
+  set("bt-r-avgtrade", `${inr(m.avg_trade, 0)} / ${inr(m.median_trade, 0)}`);
+  set("bt-r-largest", `${inr(m.largest_win, 0)} / ${inr(m.largest_loss, 0)}`);
+  set("bt-r-exposure", m.exposure_pct != null ? `${m.exposure_pct.toFixed(1)}%` : "—");
+  set("bt-r-holding", m.avg_holding_days != null ? m.avg_holding_days.toFixed(1) : "—");
   document.getElementById("bt-r-total").textContent = r.total_signals;
   document.getElementById("bt-r-winrate").textContent = r.win_rate != null ? `${(r.win_rate * 100).toFixed(1)}%` : "—";
   document.getElementById("bt-r-avgr").textContent = r.avg_r_multiple != null ? r.avg_r_multiple.toFixed(2) : "—";
   document.getElementById("bt-r-pf").textContent = r.profit_factor != null ? r.profit_factor.toFixed(2) : "—";
-  document.getElementById("bt-r-dd").textContent = r.max_drawdown_pct != null ? `${r.max_drawdown_pct.toFixed(2)}%` : "—";
+  document.getElementById("bt-r-dd").textContent = r.max_drawdown_pct != null
+    ? `${r.max_drawdown_pct.toFixed(2)}% (${inr(r.max_drawdown_amount, 0)})` : "—";
   document.getElementById("bt-r-sharpe").textContent = r.sharpe_ratio != null ? r.sharpe_ratio.toFixed(2) : "—";
   document.getElementById("bt-r-sortino").textContent = r.sortino_ratio != null ? r.sortino_ratio.toFixed(2) : "—";
   document.getElementById("bt-r-maxlosses").textContent = r.max_consecutive_losses ?? "—";
@@ -1732,9 +1774,10 @@ function renderBacktestResults() {
   if (r.mc_iterations) {
     el.btMonteCarloSummary.hidden = false;
     el.btMonteCarloSummary.textContent =
-      `Monte Carlo (${r.mc_iterations} reshuffles): median max drawdown ${r.mc_median_drawdown_pct.toFixed(1)}%, `
-      + `95th percentile ${r.mc_p95_drawdown_pct.toFixed(1)}% — final equity ranges ₹${fmt(r.mc_p5_final_equity, 0)} `
-      + `to ₹${fmt(r.mc_p95_final_equity, 0)} (order-invariant sum; only drawdown varies across reshuffles).`;
+      `Monte Carlo (${r.mc_iterations} reshuffles of closed-trade net P&L): median max drawdown `
+      + `${r.mc_median_drawdown_pct.toFixed(1)}%, 95th percentile ${r.mc_p95_drawdown_pct.toFixed(1)}% — final equity `
+      + `ranges ₹${fmt(r.mc_p5_final_equity, 0)} to ₹${fmt(r.mc_p95_final_equity, 0)} (order-invariant sum; only `
+      + `drawdown varies across reshuffles; closed-trade only, so it understates the MTM drawdown above).`;
   } else {
     el.btMonteCarloSummary.hidden = true;
   }
@@ -1759,20 +1802,26 @@ function renderBacktestResults() {
 
   el.backtestTradesBody.innerHTML = "";
   if (r.trades.length === 0) {
-    el.backtestTradesBody.innerHTML = `<tr class="empty-row"><td colspan="8">No signals in this range</td></tr>`;
+    el.backtestTradesBody.innerHTML = `<tr class="empty-row"><td colspan="13">No trades in this range</td></tr>`;
     return;
   }
   for (const t of r.trades) {
     const tr = document.createElement("tr");
+    const flags = [t.gap_fill ? "gap fill" : null, t.data_warning ? "data warning" : null].filter(Boolean);
     tr.innerHTML = `
-      <td>${t.symbol}</td>
-      <td>${t.entry_date}</td>
+      <td>${esc(t.symbol)}</td>
+      <td>${esc(t.signal_date ?? "—")}</td>
+      <td>${esc(t.entry_date)}</td>
       <td class="num">${fmt(t.entry_price)}</td>
-      <td>${t.exit_date ?? "—"}</td>
+      <td class="num">${t.quantity ?? "—"}</td>
+      <td>${esc(t.exit_date ?? "—")}</td>
       <td class="num">${t.exit_price != null ? fmt(t.exit_price) : "—"}</td>
-      <td>${t.exit_reason ?? "—"}</td>
+      <td>${esc(t.exit_reason ?? "—")}${flags.length ? ` <span class="badge-muted">${esc(flags.join(", "))}</span>` : ""}</td>
+      <td class="num">${t.gross_pnl != null ? fmt(t.gross_pnl) : "—"}</td>
+      <td class="num">${t.costs != null ? fmt(t.costs) : "—"}</td>
+      <td class="num">${t.net_pnl != null ? fmt(t.net_pnl) : "—"}</td>
       <td class="num">${t.r_multiple != null ? t.r_multiple.toFixed(2) : "—"}</td>
-      <td>${t.outcome ?? "—"}</td>
+      <td>${esc(t.outcome ?? "—")}</td>
     `;
     el.backtestTradesBody.appendChild(tr);
   }
@@ -1789,10 +1838,19 @@ el.backtestForm.addEventListener("submit", async (event) => {
   const runWalkForward = el.btRunWalkForward.checked;
   const windowDays = parseInt(el.btWindowDays.value, 10) || 90;
   const runMonteCarlo = el.btRunMonteCarlo.checked;
+  const num = (id) => {
+    const v = parseFloat(document.getElementById(id).value);
+    return Number.isFinite(v) ? v : undefined;
+  };
   try {
     state.backtestResult = await API.runBacktest({
       strategy_name: strategyName, start_date: startDate, end_date: endDate, symbols,
       run_walk_forward: runWalkForward, window_days: windowDays, run_monte_carlo: runMonteCarlo,
+      initial_capital: num("bt-initial-capital"), max_open_positions: num("bt-max-positions"),
+      entry_slippage_bps: num("bt-entry-slippage"), exit_slippage_bps: num("bt-exit-slippage"),
+      entry_model: document.getElementById("bt-entry-model").value,
+      costs_enabled: document.getElementById("bt-costs-enabled").checked,
+      simulate_breakeven: document.getElementById("bt-simulate-breakeven").checked,
     });
     renderBacktestResults();
   } catch (e) {

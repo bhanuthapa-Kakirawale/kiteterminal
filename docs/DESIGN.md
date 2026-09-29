@@ -341,22 +341,44 @@ parameter change, not on enable/disable toggling.
 ## 7. Backtesting Design
 
 `backtest.py` reuses the exact same `evaluate_entry` / `evaluate_exit` /
-`compute_entry_levels` functions the live scanner calls, so backtested and
-live logic can never silently diverge. Documented simplifying assumptions:
+`compute_entry_levels` / `rank_key` functions the live scanner calls, so
+backtested and live signal logic can never silently diverge. Since PK-21 it
+is a portfolio-level, event-driven daily simulation that models only what
+was known at each close and what could be traded next (the full rules are
+in the module docstring and `docs/OPUS55_PK21_IMPLEMENTATION_REPORT.md`):
 
-- If both stop and target are touched on the same day, the stop is assumed
-  hit first (conservative).
-- Trailing stops are evaluated once per day at the close, not intraday.
-- Position sizing uses the account's *current* portfolio value, not a
-  historically accurate one.
+- A signal from bar N's close enters at bar N+1's **open** plus slippage.
+  The alternative model is the live ticket's DAY LIMIT, which fills only if
+  bar N+1 trades at or below it. A signal on the last bar in range is never
+  traded.
+- A stop the open gaps through fills at the open. Intrabar stop and target
+  fills are at the trigger level less slippage. If stop and target are both
+  inside one bar, the stop is assumed first (conservative).
+- Trailing and optional breakeven stops are computed at the close and are
+  active from the next session. Close-based strategy exits fill at the next
+  open.
+- Indian delivery charges (`backtest_costs.py`, rates in
+  `config.BACKTEST_COST_DEFAULTS`) and entry/exit slippage are applied to
+  every fill. Gross, costs and net are all reported.
+- There is one pot of simulated capital (`config.BACKTEST_DEFAULTS`,
+  overridable per run). It uses live risk-based sizing on the simulated
+  equity, a `max_open_positions` cap, the strategy's `max_signals_per_day`
+  and a cash check. Skipped signals are recorded with their reason.
+- No price row after `end_date` is loaded (filtered in SQL). A backtest on
+  the current watchlist is labelled survivorship-biased.
 
-`backtest_analytics.py` adds Sharpe/Sortino (annualized via an implied
-trades-per-year figure, risk-free rate = 0), max consecutive losses, recovery
-factor, average win/loss in R-multiples, and time-in-market %. An optional
-walk-forward "consistency check" (explicitly *not* walk-forward optimization
-— no parameter refitting between windows) and Monte Carlo trade-reshuffling
-(minimum 5 trades, no fixed random seed by default) produce drawdown/equity
-distribution percentiles.
+`backtest_analytics.py` computes net metrics from the daily mark-to-market
+equity curve:
+- max drawdown;
+- Sharpe/Sortino from daily returns (√252, risk-free rate = 0);
+- CAGR (only for spans of at least a year);
+- win rate, profit factor, expectancy, exposure and more.
+
+An optional walk-forward "consistency check" is explicitly *not*
+walk-forward optimization: there is no parameter refitting between windows,
+and each window is an independent simulation with its own end-date cut.
+Monte Carlo reshuffling of closed-trade net P&L (minimum 5 trades, no fixed
+random seed by default) produces drawdown/equity distribution percentiles.
 
 ## 8. Key Configuration Constants (`backend/config.py`)
 
@@ -385,6 +407,9 @@ distribution percentiles.
 | Autopilot | `AUTOMATION_MAX_ATTEMPTS_PER_DAY` | 3 |
 | Autopilot | `AUTOMATION_RETRY_MINUTES` | 15 |
 | Reconciliation | `RECONCILIATION_INTERVAL_SECONDS` | 180 |
+| Backtest | `BACKTEST_DEFAULTS` | ₹10,00,000 capital, 0.5% risk / 10% capital per trade, max 5 positions, 5/5 bps slippage, costs on, next-open entry, breakeven off |
+| Backtest | `BACKTEST_COST_DEFAULTS` | STT 0.1% each side, NSE 0.00297%, SEBI ₹10/cr, GST 18%, stamp 0.015% buy, DP ₹15.34 per sell, brokerage ₹0 |
+| Backtest | `SUSPECT_CORPORATE_ACTION_GAP_PCT` | 25.0 |
 
 ## 9. API Surface (summary)
 

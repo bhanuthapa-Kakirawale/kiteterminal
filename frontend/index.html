@@ -908,18 +908,63 @@
             <input id="bt-run-monte-carlo" type="checkbox" />
             <label for="bt-run-monte-carlo">Monte Carlo (1000 reshuffles)</label>
           </div>
+          <div class="field">
+            <label for="bt-initial-capital">Initial capital (₹)</label>
+            <input id="bt-initial-capital" type="number" min="1" step="any" value="1000000" />
+          </div>
+          <div class="field">
+            <label for="bt-max-positions">Max open positions</label>
+            <input id="bt-max-positions" type="number" min="1" step="1" value="5" />
+          </div>
+          <div class="field">
+            <label for="bt-entry-slippage">Entry slippage (bps)</label>
+            <input id="bt-entry-slippage" type="number" min="0" step="any" value="5" />
+          </div>
+          <div class="field">
+            <label for="bt-exit-slippage">Exit slippage (bps)</label>
+            <input id="bt-exit-slippage" type="number" min="0" step="any" value="5" />
+          </div>
+          <div class="field">
+            <label for="bt-entry-model">Entry fill</label>
+            <select id="bt-entry-model">
+              <option value="next_open" selected>Next-session open (market)</option>
+              <option value="next_session_limit">Next-session LIMIT (as live ticket)</option>
+            </select>
+          </div>
+          <div class="field checkbox-field">
+            <input id="bt-costs-enabled" type="checkbox" checked />
+            <label for="bt-costs-enabled">Transaction costs (STT, charges, stamp, DP)</label>
+          </div>
+          <div class="field checkbox-field">
+            <input id="bt-simulate-breakeven" type="checkbox" />
+            <label for="bt-simulate-breakeven">Assume breakeven proposals approved</label>
+          </div>
           <div class="field field-wide form-actions">
             <button type="submit" class="btn btn-primary">Run Backtest</button>
             <span id="backtest-error" class="form-error"></span>
           </div>
         </form>
         <div id="backtest-results" hidden>
+          <div id="bt-universe-warning" class="banner banner-slim" role="alert" hidden></div>
+          <div id="bt-execution-summary" class="banner banner-neutral banner-slim"></div>
+          <div id="bt-data-warnings" class="banner banner-neutral banner-slim" hidden></div>
           <div class="metrics-grid">
-            <div class="row"><span>Signals</span><strong id="bt-r-total"></strong></div>
-            <div class="row"><span>Win rate</span><strong id="bt-r-winrate"></strong></div>
-            <div class="row"><span>Avg R multiple</span><strong id="bt-r-avgr"></strong></div>
-            <div class="row"><span>Profit factor</span><strong id="bt-r-pf"></strong></div>
-            <div class="row"><span>Max drawdown</span><strong id="bt-r-dd"></strong></div>
+            <div class="row"><span>Initial capital</span><strong id="bt-r-initial"></strong></div>
+            <div class="row"><span>Ending equity</span><strong id="bt-r-ending"></strong></div>
+            <div class="row"><span>Gross P&amp;L / return</span><strong id="bt-r-gross"></strong></div>
+            <div class="row"><span>Costs</span><strong id="bt-r-costs"></strong></div>
+            <div class="row"><span>Net P&amp;L / return</span><strong id="bt-r-net"></strong></div>
+            <div class="row"><span>Net CAGR</span><strong id="bt-r-cagr"></strong></div>
+            <div class="row"><span>Trades</span><strong id="bt-r-total"></strong></div>
+            <div class="row"><span>Skipped / unexecuted signals</span><strong id="bt-r-skipped"></strong></div>
+            <div class="row"><span>Win rate (net)</span><strong id="bt-r-winrate"></strong></div>
+            <div class="row"><span>Expectancy (net R)</span><strong id="bt-r-avgr"></strong></div>
+            <div class="row"><span>Avg / median trade</span><strong id="bt-r-avgtrade"></strong></div>
+            <div class="row"><span>Largest win / loss</span><strong id="bt-r-largest"></strong></div>
+            <div class="row"><span>Profit factor (net)</span><strong id="bt-r-pf"></strong></div>
+            <div class="row"><span>Max drawdown (MTM equity)</span><strong id="bt-r-dd"></strong></div>
+            <div class="row"><span>Exposure</span><strong id="bt-r-exposure"></strong></div>
+            <div class="row"><span>Avg holding (days)</span><strong id="bt-r-holding"></strong></div>
             <div class="row"><span>Sharpe ratio</span><strong id="bt-r-sharpe"></strong></div>
             <div class="row"><span>Sortino ratio</span><strong id="bt-r-sortino"></strong></div>
             <div class="row"><span>Max consecutive losses</span><strong id="bt-r-maxlosses"></strong></div>
@@ -946,8 +991,9 @@
             <table id="backtest-trades-table">
               <thead>
                 <tr>
-                  <th>Symbol</th><th>Entry Date</th><th class="num">Entry</th>
+                  <th>Symbol</th><th>Signal</th><th>Entry Date</th><th class="num">Entry</th><th class="num">Qty</th>
                   <th>Exit Date</th><th class="num">Exit</th><th>Reason</th>
+                  <th class="num">Gross</th><th class="num">Costs</th><th class="num">Net</th>
                   <th class="num">R</th><th>Outcome</th>
                 </tr>
               </thead>

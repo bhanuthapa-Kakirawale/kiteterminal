@@ -176,8 +176,8 @@ manually (see §2):
   via flows that depend on it).
 - `sector_mapping.py` edge cases beyond basic CRUD.
 - `backtest_analytics.py`'s Sharpe/Sortino/Monte Carlo math is only
-  exercised indirectly through the backtest endpoint test, not directly
-  with known-answer inputs.
+  exercised indirectly (the fill model, costs, capital and net metrics have
+  known-answer tests in `tests/test_backtest_realism.py`; the ratios do not).
 - No test for dashboard panel reordering edge cases beyond a single field
   change.
 - No test of the `/ws/ticks` WebSocket tick delivery itself.
@@ -361,8 +361,10 @@ code changes:
 3. For any strategy parameter change, run a fresh backtest and compare
    headline statistics (win rate, expectancy, drawdown) against the
    pre-change baseline before enabling it live.
-4. Judge any such change **net of transaction costs**. `backend/backtest.py`
-   models none, and on ATR-based stops a round trip is roughly 0.08–0.10R —
+4. Judge any such change **net of transaction costs**. Since PK-21
+   `backend/backtest.py` charges them (see `backend/backtest_costs.py` and
+   `config.BACKTEST_COST_DEFAULTS`); read the **net** figures. On ATR-based
+   stops a round trip is roughly 0.08–0.10R —
    enough on its own to turn a gross-positive strategy net-negative. The
    September 2026 revision found all three shipped strategies looking
    merely mediocre on gross numbers and clearly losing once costs applied.
