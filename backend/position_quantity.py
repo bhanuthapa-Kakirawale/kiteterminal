@@ -37,6 +37,10 @@ from backend import execution
 
 logger = logging.getLogger(__name__)
 
+# reconciliation.POSITION_QUANTITY_REVIEW — spelled out because this module
+# only imports reconciliation lazily (reconciliation imports this one).
+_REVIEW_CODE = "POSITION_QUANTITY_REVIEW"
+
 
 # ---- SQL fragments -----------------------------------------------------------
 #
@@ -119,6 +123,30 @@ def protection_quantity(conn: sqlite3.Connection, position) -> int | None:
     return open_quantity(conn, position["id"])
 
 
+# ---- the same figures from rows already read (PK-19) --------------------------
+#
+# backend/lifecycle.py derives a whole batch of positions from one read of the
+# account's tickets; these are the exact twins of the SQL above for that case
+# (a parity test holds them to it), so the arithmetic still lives only here.
+
+def exits_filled_from_rows(exits) -> int | None:
+    """exits_filled_sql over the position's exit rows: what its EXECUTED
+    exits sold; NULL if any of them has an unknown fill."""
+    sold = [filled(x) for x in exits if x["status"] == "executed"]
+    return None if any(q is None for q in sold) else sum(sold)
+
+
+def open_quantity_from_rows(position, exits) -> int | None:
+    bought, sold = filled(position), exits_filled_from_rows(exits)
+    return None if bought is None or sold is None else bought - sold
+
+
+def protection_quantity_from_rows(position, exits) -> int | None:
+    if entry_still_working(position) and not filled(position):
+        return position["quantity"]
+    return open_quantity_from_rows(position, exits)
+
+
 # ---- monotonic fill recording ------------------------------------------------
 
 INCREASED, UNCHANGED, STALE, EXCEEDS_REQUESTED, INVALID = (
@@ -151,11 +179,14 @@ def record_fill(conn: sqlite3.Connection, ticket, broker_filled) -> str:
 
 
 def flag(conn: sqlite3.Connection, ticket_id: int | None, check_type: str, expected: str, actual: str,
-         detail: str) -> bool:
+         detail: str, **structured) -> bool:
     """A de-duplicated finding: one reconciliation_log row (and one ticket
-    event) per distinct unresolved `actual`. True if it is new."""
+    event) per distinct unresolved `actual`. True if it is new. `structured`
+    is reconciliation.log_mismatch's keyword-only view of the finding (its
+    issue_code, PK-19), which does not change the de-duplication."""
     from backend import reconciliation
-    if not reconciliation.log_mismatch(conn, ticket_id, check_type, expected=expected, actual=actual, detail=detail):
+    if not reconciliation.log_mismatch(conn, ticket_id, check_type, expected=expected, actual=actual, detail=detail,
+                                       **structured):
         return False
     if ticket_id is not None:
         _log_event(conn, ticket_id, "modified", detail)
@@ -218,20 +249,23 @@ def sync_protection(conn: sqlite3.Connection, kite, position_id: int, reason: st
         symbol, gtt_id = position["symbol"], position["kite_gtt_id"]
         desired = protection_quantity(conn, position)
 
-        def mismatch(state: str, text: str) -> SyncResult:
+        from backend import reconciliation as rc
+
+        def mismatch(state: str, text: str, code: str = rc.PROTECTION_QUANTITY_MISMATCH) -> SyncResult:
             detail = (f"PROTECTION QUANTITY MISMATCH: {symbol} (ticket {position_id}) — {text} The position is kept "
                       f"OPEN. Check its stop-loss in Kite now.")
             new = flag(conn, position_id, "order_status", expected=f"protective GTT covering {desired} share(s)",
-                       actual=state, detail=detail)
+                       actual=state, detail=detail, issue_code=code, symbol=symbol, gtt_id=gtt_id)
             return SyncResult("mismatch", detail, urgent=True, new_flag=new)
 
         if desired is None:
             return mismatch("open quantity unknown",
                             "its open quantity is unknown (an unrecorded partial fill), so its protection cannot be "
-                            "sized.")
+                            "sized.", rc.POSITION_QUANTITY_REVIEW)
         if desired < 0:
             return mismatch(f"open quantity {desired}",
-                            f"its exits sold more than it bought (open quantity {desired}) — NEEDS REVIEW.")
+                            f"its exits sold more than it bought (open quantity {desired}) — NEEDS REVIEW.",
+                            rc.POSITION_QUANTITY_REVIEW)
         if desired == 0:
             # Nothing left to protect. A flat position is closed (and its GTT
             # removed) by close_if_flat once its entry has ended; while the
@@ -239,7 +273,8 @@ def sync_protection(conn: sqlite3.Connection, kite, position_id: int, reason: st
             return SyncResult("in_sync")
         if gtt_id is None:
             return mismatch("no protective GTT",
-                            f"{desired} share(s) are open but it has NO protective GTT ({reason}).")
+                            f"{desired} share(s) are open but it has NO protective GTT ({reason}).",
+                            rc.PROTECTION_MISSING)
 
         if gtt_book is not None and gtt_id in gtt_book:
             gtt = gtt_book[gtt_id]
@@ -254,7 +289,7 @@ def sync_protection(conn: sqlite3.Connection, kite, position_id: int, reason: st
         if status != "active":
             return mismatch(f"GTT {gtt_id} {status or 'missing'}; open {desired}",
                             f"protective GTT {gtt_id} is {status or 'missing from Kite'}, so it cannot be resized to "
-                            f"the {desired} share(s) now open ({reason}).")
+                            f"the {desired} share(s) now open ({reason}).", rc.PROTECTION_MISSING)
         current = gtt_leg_quantities(gtt)
         if current and all(q == desired for q in current):
             return SyncResult("in_sync")
@@ -321,7 +356,7 @@ def close_if_flat(conn: sqlite3.Connection, kite, position_id: int, closing_exit
         detail = (f"{position['symbol']}: position #{position_id}'s open quantity is unknown (an unrecorded partial "
                   f"fill) — it is kept OPEN; NEEDS REVIEW in Kite.")
         flag(conn, position_id, "position_state", expected="a known open quantity", actual="open quantity unknown",
-             detail=detail)
+             detail=detail, issue_code=_REVIEW_CODE, symbol=position["symbol"])
         conn.commit()
         return CloseResult(False, f" {detail}", urgent=True)
     if remaining < 0:
@@ -329,7 +364,7 @@ def close_if_flat(conn: sqlite3.Connection, kite, position_id: int, closing_exit
                   f"{filled(position)} but its exits sold {exits_filled(conn, position_id)} "
                   f"(open {remaining}). It is NOT closed and nothing is sent; check Kite's orders and holdings.")
         flag(conn, position_id, "position_state", expected="exits sell at most what the entry bought",
-             actual=f"open quantity {remaining}", detail=detail)
+             actual=f"open quantity {remaining}", detail=detail, issue_code=_REVIEW_CODE, symbol=position["symbol"])
         conn.commit()
         return CloseResult(False, f" {detail}", urgent=True)
     if remaining > 0 or not entry_ended(position):
@@ -368,7 +403,9 @@ def remove_protective_gtt(conn: sqlite3.Connection, kite, exit_ticket_id: int | 
                   f"and holdings now.")
         reconciliation.log_mismatch(conn, position_id, "order_status",
                                     expected="protective GTT removed after the exit filled",
-                                    actual=f"GTT {gtt_id} triggered alongside exit order {order_id}", detail=detail)
+                                    actual=f"GTT {gtt_id} triggered alongside exit order {order_id}", detail=detail,
+                                    issue_code=reconciliation.POSSIBLE_DOUBLE_SELL, severity=reconciliation.URGENT,
+                                    symbol=symbol, gtt_id=gtt_id)
         _log_event(conn, position_id, "modified", detail)
         return f" {detail}", True
     if status not in ("active", None):
@@ -381,7 +418,9 @@ def remove_protective_gtt(conn: sqlite3.Connection, kite, exit_ticket_id: int | 
                   f"its protective GTT {gtt_id} FAILED ({type(e).__name__}: {e}). It could still fire against shares "
                   f"that are gone — delete it in Kite NOW.")
         reconciliation.log_mismatch(conn, position_id, "order_status", expected=f"GTT {gtt_id} removed",
-                                    actual=f"GTT {gtt_id} delete failed after exit fill", detail=detail)
+                                    actual=f"GTT {gtt_id} delete failed after exit fill", detail=detail,
+                                    issue_code=reconciliation.ORPHANED_GTT_AFTER_EXIT,
+                                    severity=reconciliation.URGENT, symbol=symbol, gtt_id=gtt_id)
         _log_event(conn, position_id, "modified", detail)
         return f" {detail}", True
     conn.execute("UPDATE trade_tickets SET kite_gtt_id = NULL WHERE id = ?", (position_id,))

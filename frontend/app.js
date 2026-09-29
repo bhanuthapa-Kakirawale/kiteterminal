@@ -1,3 +1,9 @@
+// PK-19: every ticket and position state in this file is decided by the
+// SERVER (backend/lifecycle.py) and only rendered here, through lifecycle.js
+// (loaded first). No label, flag or button is worked out from raw ticket
+// columns (status / fill / submission / closed_at / GTT id) in this file.
+const LC = window.KTLifecycle;
+
 class SessionExpiredError extends Error {}
 class ApiError extends Error {
   constructor(message, errorCode, failures = null) {
@@ -8,7 +14,9 @@ class ApiError extends Error {
   }
 }
 
-async function fetchJson(url) {
+// wholeBody: return the whole response body rather than its `data` (a
+// payload that also carries e.g. summary counts).
+async function fetchJson(url, wholeBody = false) {
   const res = await fetch(url);
   if (res.status === 401) {
     const body = await res.json();
@@ -17,7 +25,8 @@ async function fetchJson(url) {
   if (!res.ok) {
     throw new Error(`Request failed: ${res.status}`);
   }
-  return (await res.json()).data;
+  const body = await res.json();
+  return wholeBody ? body : body.data;
 }
 
 async function fetchJsonMutate(url, method, body) {
@@ -143,6 +152,12 @@ const API = {
   cancelOrder: (orderId, variety) => fetchJsonMutate(`/api/orders/${encodeURIComponent(orderId)}/cancel?variety=${encodeURIComponent(variety || "regular")}`, "POST"),
   cancelGtt: (gttId) => fetchJsonMutate(`/api/gtts/${gttId}/cancel`, "POST"),
   emergencyExitPreview: () => fetchJson("/api/kill-switch/emergency-exit-preview"),
+
+  // PK-19: app-managed positions with their server-derived lifecycle. The
+  // whole body is returned: the active view also carries header counts.
+  appPositions: (view) => fetchJson(`/api/app-positions?view=${encodeURIComponent(view)}`, true),
+  // Creates an exit ticket for approval — never sends an order by itself.
+  exitPosition: (positionId) => fetchJsonMutate(`/api/app-positions/${positionId}/exit`, "POST"),
   emergencyExitConfirm: (confirmationPhrase) => fetchJsonMutate("/api/kill-switch/emergency-exit-confirm", "POST", { confirmation_phrase: confirmationPhrase }),
 
   // Phase 8: reconciliation
@@ -248,6 +263,7 @@ const el = {
   signalDetail: document.getElementById("signal-detail"),
   sdSide: document.getElementById("sd-side"),
   sdSymbol: document.getElementById("sd-symbol"),
+  sdLifecycle: document.getElementById("sd-lifecycle"),
   sdStrategy: document.getElementById("sd-strategy"),
   sdSignalDate: document.getElementById("sd-signal-date"),
   sdModePill: document.getElementById("sd-mode-pill"),
@@ -406,6 +422,11 @@ const el = {
   modePill: document.getElementById("mode-pill"),
   navBadgeApprovals: document.getElementById("nav-badge-approvals"),
   navBadgeTradeQueue: document.getElementById("nav-badge-trade-queue"),
+  navBadgePositions: document.getElementById("nav-badge-positions"),
+  positionsActiveBody: document.querySelector("#positions-active-table tbody"),
+  positionsClosedBody: document.querySelector("#positions-closed-table tbody"),
+  positionsSummary: document.getElementById("positions-summary"),
+  positionsRefreshBtn: document.getElementById("positions-refresh-btn"),
   dashApprovalsCallout: document.getElementById("dash-approvals-callout"),
   dashApprovalsText: document.getElementById("dash-approvals-text"),
   dashApprovalsOpen: document.getElementById("dash-approvals-open"),
@@ -513,6 +534,8 @@ const state = {
   journalStats: null,
   todaysActions: null,
   tradeQueueTickets: [],
+  // PK-19: app-managed positions as the server describes them.
+  appPositions: { active: [], closed: [], summary: null, tab: "active" },
 
   // Phase 8: reconciliation
   reconciliationMismatches: [],
@@ -823,13 +846,13 @@ function evaluateAlerts(view, totalValue, dayPnl, margins, sessionStatus) {
   }
 
   for (const t of state.tickets) {
-    const unprotected = t.status === "executed" && t.mode === "live" && !t.kite_gtt_id && !t.closed_at
-      && t.closes_ticket_id == null && t.use_gtt;
+    // PK-19: the server's protection status of the ticket's own position.
+    const unprotected = t.lifecycle?.position_id === t.id && t.lifecycle.protection_status === "MISSING";
     if (unprotected) {
       alerts.push({
         id: `protection-failed-${t.id}`,
         severity: "urgent",
-        message: `${t.symbol}: entry placed but protective stop FAILED — UNPROTECTED position, act now`,
+        message: `${t.symbol}: no active protective stop — UNPROTECTED position (${t.lifecycle.open_quantity ?? "?"} share(s)), act now`,
         scrollTargetSelector: `tr[data-ticket-id="${t.id}"]`,
       });
     }
@@ -2021,6 +2044,134 @@ document.querySelectorAll(".tab-btn[data-tq-tab]").forEach((btn) => {
   });
 });
 
+// ---- PK-19: Positions view ----
+//
+// Every state, quantity, flag and button here comes from the server's
+// lifecycle (GET /api/app-positions); lifecycle.js renders it. The LTP is the
+// one the page already keeps live from /ws/ticks (holdings / positions) —
+// no extra broker call per position.
+
+function positionLtp(token) {
+  const holding = (state.holdings || []).find((h) => h.instrument_token === token);
+  const position = (state.positions?.net || []).find((p) => p.instrument_token === token);
+  return holding?.last_price ?? position?.last_price ?? null;
+}
+
+function renderPositionsSummary(summary) {
+  if (!summary) {
+    el.positionsSummary.innerHTML = "";
+    return;
+  }
+  const chip = (label, n, sev) => `<span class="lc-summary-chip${n && sev ? ` lc-sev-${sev}` : ""}">`
+    + `<strong>${n}</strong> ${label}</span>`;
+  el.positionsSummary.innerHTML = [
+    chip("open", summary.open), chip("waiting to fill", summary.waiting_to_fill, "info"),
+    chip("exiting", summary.exiting, "warning"), chip("need attention", summary.needs_attention, "critical"),
+    chip("unprotected", summary.unprotected, "critical"),
+  ].join("");
+}
+
+function renderAppPositions() {
+  const { active, closed, summary } = state.appPositions;
+  renderPositionsSummary(summary);
+  document.getElementById("pos-count-active").textContent = active.length || "";
+  document.getElementById("pos-count-closed").textContent = closed.length || "";
+  setBadge(el.navBadgePositions, summary?.needs_attention || 0);
+
+  el.positionsActiveBody.innerHTML = active.length ? "" :
+    `<tr class="empty-row"><td colspan="13">No active positions opened by this terminal</td></tr>`;
+  for (const lc of active) {
+    const tr = document.createElement("tr");
+    tr.dataset.positionId = lc.position_id;
+    tr.dataset.lifecycle = lc.lifecycle_state;
+    tr.dataset.positionToken = lc.instrument_token;
+    tr.classList.add(`lc-row-${lc.severity}`);
+    tr.innerHTML = LC.activeRowCells(lc, positionLtp(lc.instrument_token));
+    el.positionsActiveBody.appendChild(tr);
+  }
+  el.positionsClosedBody.innerHTML = closed.length ? "" :
+    `<tr class="empty-row"><td colspan="12">No closed positions yet</td></tr>`;
+  for (const lc of closed) {
+    const tr = document.createElement("tr");
+    tr.dataset.positionId = lc.position_id;
+    tr.dataset.lifecycle = lc.lifecycle_state;
+    tr.innerHTML = LC.closedRowCells(lc, fmtDateTime);
+    el.positionsClosedBody.appendChild(tr);
+  }
+}
+
+// Ticks move only the LTP and unrealised P&L cells — the rows (and their
+// buttons) are not rebuilt under the cursor.
+function updatePositionPrices() {
+  for (const lc of state.appPositions.active) {
+    const tr = el.positionsActiveBody.querySelector(`tr[data-position-id="${lc.position_id}"]`);
+    if (!tr) continue;
+    const ltp = positionLtp(lc.instrument_token);
+    tr.querySelector('[data-field="ltp"]').textContent = fmt(ltp);
+    tr.querySelector('[data-field="upnl"]').innerHTML = LC.pnlCell(LC.unrealisedPnl(lc, ltp));
+  }
+}
+
+async function loadAppPositions() {
+  if (state.accountType !== "trading") return;
+  try {
+    const [active, closed] = await Promise.all([API.appPositions("active"), API.appPositions("closed")]);
+    state.appPositions.active = active.data;
+    state.appPositions.summary = active.summary;
+    state.appPositions.closed = closed.data;
+    renderAppPositions();
+  } catch (e) {
+    // leave prior state visible on a transient load failure
+  }
+}
+
+document.querySelectorAll(".tab-btn[data-pos-tab]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    state.appPositions.tab = btn.dataset.posTab;
+    document.querySelectorAll(".tab-btn[data-pos-tab]").forEach((b) => b.classList.toggle("active", b === btn));
+    document.querySelectorAll(".pos-panel").forEach((p) => {
+      p.hidden = p.dataset.posPanel !== btn.dataset.posTab;
+    });
+  });
+});
+
+el.positionsRefreshBtn.addEventListener("click", loadAppPositions);
+
+async function onPositionAction(event) {
+  const btn = event.target.closest("button[data-action]");
+  if (!btn) return;
+  const action = btn.dataset.action;
+  try {
+    if (action === "position-exit") {
+      btn.disabled = true;
+      // Creates an exit ticket for the shares actually held; nothing is sent
+      // until it is approved in the dialog that opens next.
+      const ticket = await API.exitPosition(btn.dataset.positionId);
+      await loadAppPositions();
+      openConfirmDialog(ticket);
+    } else if (action === "position-review-exit") {
+      openConfirmDialog(await API.getTicket(btn.dataset.ticketId));
+    } else if (action === "position-detail") {
+      openDetailDialog(await API.getTicket(btn.dataset.ticketId));
+    } else if (action === "position-orders") {
+      showSection("orders-trades");
+    } else if (action === "position-journal") {
+      showSection("journal");
+    } else if (action === "position-reconciliation") {
+      showSection("trade-queue");
+      document.getElementById("reconciliation-list")?.closest("details")?.scrollIntoView({ behavior: "smooth" });
+    }
+  } catch (e) {
+    toast(e.message, { type: e.errorCode ? "warning" : "error",
+      title: action === "position-exit" ? "Exit not created" : "Action failed", timeout: 0 });
+    btn.disabled = false;
+    loadAppPositions();
+  }
+}
+
+el.positionsActiveBody.addEventListener("click", onPositionAction);
+el.positionsClosedBody.addEventListener("click", onPositionAction);
+
 async function loadPhase6Data() {
   await initJournal();
   await loadTodaysActions();
@@ -2062,42 +2213,25 @@ const STATUS_LABELS = { pending_confirmation: "awaiting approval", risk_rejected
 // PK-2: a broker submission whose outcome is not known. Deliberately unlike
 // rejected/cancelled/failed — the order may be live at the broker.
 function isSubmissionUnresolved(t) {
-  return t.status === "confirmed" && ["unknown", "needs_review"].includes(t.submission_state);
+  return ["UNKNOWN", "NEEDS_REVIEW"].includes(t.ticket_state?.code);
 }
 
+// The ticket / order state (server-derived ticket_state). A ticket payload
+// without one (a bare status string, e.g. a plain filter label) falls back
+// to its status text.
 function statusBadgeHtml(status, ticket = null) {
-  if (ticket && status === "confirmed" && ticket.submission_state === "needs_review") {
-    return `<span class="status-badge submission_unknown" title="Broker orders for this ticket are ambiguous — resolve it in Kite. Nothing will be resubmitted.">NEEDS REVIEW — CHECK KITE</span>`;
-  }
-  if (ticket && status === "confirmed" && ticket.submission_state === "unknown") {
-    return `<span class="status-badge submission_unknown" title="The order may or may not exist at the broker. The app is searching Kite for it by its order tag.">UNKNOWN — DO NOT RESUBMIT</span>`;
-  }
-  if (ticket && status === "failed" && ticket.submission_state === "not_found") {
-    return `<span class="status-badge failed" title="No broker order with this ticket's tag appeared — nothing was placed.">not placed · no broker order</span>`;
-  }
-  // PK-8: an exit order at the broker is not a closed position.
-  if (ticket && ticket.exit_state === "exiting") {
-    return `<span class="status-badge exiting" title="Exit order placed with the broker but not filled. The position stays open and keeps its protective GTT until Kite reports the fill.">EXITING · awaiting fill</span>`;
-  }
-  // PK-13: an exit that ended after selling only part of the position.
-  if (ticket && ticket.exit_state === "exit_partial") {
-    const sold = ticket.filled_quantity ?? "?";
-    return `<span class="status-badge submission_unknown" title="The exit order ended after a partial fill. Those shares are sold; the rest of the position is still OPEN and protected, and can be exited again. Nothing will be resubmitted automatically.">PARTIAL EXIT · ${esc(sold)}/${esc(ticket.quantity)} sold</span>`;
-  }
-  if (ticket && ticket.exit_state === "exit_unconfirmed") {
-    return `<span class="status-badge submission_unknown" title="The exit's fill could not be confirmed. The position is NOT closed — check Kite. Nothing will be resubmitted.">EXIT UNCONFIRMED — NEEDS REVIEW</span>`;
-  }
-  if (ticket && status === "executed" && ticket.entry_fill_status === "pending" && ticket.filled_quantity > 0) {
-    return `<span class="status-badge exiting" title="The order is still working at the broker and has filled part of its quantity. The position holds only the filled shares; its protective GTT covers exactly those.">PARTIAL FILL · ${esc(ticket.filled_quantity)}/${esc(ticket.quantity)} · working</span>`;
-  }
-  if (ticket && status === "executed" && ticket.entry_fill_status === "pending") {
-    return `<span class="status-badge awaiting_fill" title="Order placed with the broker — waiting for the fill">placed · awaiting fill</span>`;
-  }
-  if (ticket && status === "executed" && ticket.entry_fill_status === "partial" && ticket.closes_ticket_id == null) {
-    return `<span class="status-badge exiting" title="The order ended after a partial fill. The position is the filled shares only; the rest will not be bought.">PARTIAL FILL · ${esc(ticket.filled_quantity ?? "?")}/${esc(ticket.quantity)}</span>`;
-  }
-  const label = STATUS_LABELS[status] || status.replace(/_/g, " ");
+  if (ticket?.ticket_state) return LC.ticketStateBadge(ticket.ticket_state);
+  const label = STATUS_LABELS[status] || String(status).replace(/_/g, " ");
   return `<span class="status-badge ${esc(status)}">${esc(label)}</span>`;
+}
+
+// The POSITION a ticket belongs to (an entry's own, an exit's position), as
+// a small chip next to the ticket state: "executed" is not "closed" (PK-8).
+function positionChipHtml(t) {
+  const lc = t.lifecycle;
+  if (!lc || !lc.is_position && !lc.is_closed) return "";
+  const own = lc.position_id === t.id ? "" : ` #${lc.position_id}`;
+  return ` <span class="lc-chip" title="Position${esc(own)}: ${esc(lc.lifecycle_label)}">${LC.lifecycleBadge(lc)}</span>`;
 }
 
 function trailingChipHtml(t) {
@@ -2105,18 +2239,21 @@ function trailingChipHtml(t) {
   return t.trailing_active ? `<span class="chip ok">active</span>` : `<span class="chip warn">armed</span>`;
 }
 
-// PK-13: the requested quantity alone is not the position. Shown only when
-// it differs: "Req 100 · Filled 40 · Open 40" for a position, "Exit 40 ·
-// Filled 15 · Remaining 25" for an exit.
+// PK-13: the requested quantity alone is not the position. For a ticket
+// whose position is live the server's quantities are shown when they differ
+// from the request: "Req 100 · Filled 40 · Open 40" for a position, "Exit 40
+// · Filled 15 · Remaining 25" for an exit order still working.
 function quantityCellHtml(t) {
   const qty = fmt(t.quantity, 0);
-  if (t.status !== "executed" || t.filled_quantity == null) return qty;
-  if (t.open_quantity !== undefined && t.open_quantity !== null && t.closes_ticket_id == null && !t.closed_at) {
-    if (t.filled_quantity === t.quantity && t.open_quantity === t.quantity) return qty;
-    return `${qty}<div class="badge-muted" title="Requested · broker-filled · still held">Req ${esc(t.quantity)} · Filled ${esc(t.filled_quantity)} · Open ${esc(t.open_quantity)}</div>`;
+  const lc = t.lifecycle;
+  if (!lc || !lc.is_position) return qty;
+  if (lc.position_id === t.id) {
+    if (lc.filled_quantity === t.quantity && lc.open_quantity === t.quantity) return qty;
+    return `${qty}<div class="badge-muted" title="Requested · broker-filled · still held">Req ${esc(lc.requested_quantity)} · Filled ${esc(lc.filled_quantity ?? "?")} · Open ${esc(lc.open_quantity ?? "?")}</div>`;
   }
-  if (t.remaining_quantity != null && t.filled_quantity !== t.quantity && t.exit_state) {
-    return `${qty}<div class="badge-muted" title="Exit requested · filled · not sold">Exit ${esc(t.quantity)} · Filled ${esc(t.filled_quantity)} · Remaining ${esc(t.remaining_quantity)}</div>`;
+  const x = lc.active_exit;
+  if (x && x.ticket_id === t.id && x.filled_quantity != null && x.filled_quantity !== x.requested_quantity) {
+    return `${qty}<div class="badge-muted" title="Exit requested · filled · not sold">Exit ${esc(x.requested_quantity)} · Filled ${esc(x.filled_quantity)} · Remaining ${esc(x.remaining_quantity)}</div>`;
   }
   return qty;
 }
@@ -2132,8 +2269,7 @@ function ticketRowHtml(t) {
     <td class="num">${fmt(t.current_stop_loss ?? t.stop_loss)}</td>
     <td class="num">${fmt(t.target_1)}</td>
     <td>${trailingChipHtml(t)}</td>
-    <td>${statusBadgeHtml(t.status, t)}${t.exit_in_flight_ticket_id != null
-      ? ` <span class="chip warn" title="Exit ticket #${t.exit_in_flight_ticket_id} is at the broker but not filled — the position is still open.">exiting</span>` : ""}</td>
+    <td>${statusBadgeHtml(t.status, t)}${positionChipHtml(t)}</td>
     <td>${modeChipHtml(t.mode)}</td>
     <td>${fmtDateTime(t.created_at)}</td>
   `;
@@ -2163,11 +2299,11 @@ function renderTicketsTable(tickets = state.tickets, bodyEl = el.ticketsBody) {
       tr.title = "Click to view details";
       tr.addEventListener("click", () => openDetailDialog(t));
     }
-    if ((t.status === "executed" && t.mode === "live" && !t.kite_gtt_id && !t.closed_at
-        && t.closes_ticket_id == null && t.use_gtt) || isSubmissionUnresolved(t)
-        || ["exit_partial", "exit_unconfirmed"].includes(t.exit_state)
-        || (t.status === "executed" && t.closes_ticket_id == null && !t.closed_at
-            && t.filled_quantity != null && t.filled_quantity !== t.quantity)) {
+    // PK-19: flagged when the server says the ticket or its position needs
+    // attention (UNKNOWN, unprotected, mismatch, partial, review).
+    if (t.ticket_state?.tone === "critical" || (t.lifecycle?.is_position
+        && (t.lifecycle.review_required || t.lifecycle.entry_partial
+            || ["ENTRY_PARTIAL", "EXIT_PARTIAL"].includes(t.lifecycle.lifecycle_state)))) {
       tr.classList.add("row-flagged");
     }
     if (t.archived) {
@@ -2433,7 +2569,7 @@ el.emergencyExitAllBtn.addEventListener("click", async () => {
     el.emergencyExitPreviewBody.innerHTML = positions.length
       ? positions.map((p) => `
           <tr>
-            <td>${esc(p.symbol)}${p.entry_fill_status === "pending" ? ' <span class="badge-muted">order still working — the unfilled rest will be cancelled</span>' : ""}</td>
+            <td>${esc(p.symbol)}${["ENTRY_OPEN", "ENTRY_PARTIAL"].includes(p.lifecycle_state) ? ' <span class="badge-muted">order still working — the unfilled rest will be cancelled</span>' : ""}</td>
             <td class="num" title="Sells what is actually held (broker-filled, less any shares already sold)">${fmt(p.open_quantity ?? 0, 0)}${p.open_quantity !== p.quantity ? `<div class="badge-muted">of ${esc(p.quantity)} ordered</div>` : ""}</td>
             <td class="num">${fmt(p.entry_price)}</td><td class="num">${fmt(p.current_stop_loss ?? p.stop_loss)}</td>
             <td>${esc(strategyLabel(p.strategy_name) || "Manual")}</td>
@@ -2585,7 +2721,9 @@ el.reconciliationList.addEventListener("click", async (event) => {
 });
 
 function renderTrailingIndicator() {
-  const hasTrailingTickets = state.tickets.some((t) => t.trailing_enabled && t.status === "executed" && !t.closed_at);
+  // PK-19: "a position is still held" is the server lifecycle's call.
+  const hasTrailingTickets = state.tickets.some((t) => t.trailing_enabled && t.lifecycle?.is_holding
+    && t.lifecycle.position_id === t.id);
   if (!state.trailingHeartbeat && !hasTrailingTickets) {
     el.trailingIndicator.hidden = true;
     return;
@@ -2625,6 +2763,7 @@ function renderAll() {
   renderMfTable(state.mf);
   renderWatchlistTable();
   renderWatchlistSummaryPanel();
+  updatePositionPrices();
 
   const alerts = evaluateAlerts(view, portfolioValue, dayPnl, state.margins, state.sessionStatus);
   renderAlertBanner(alerts);
@@ -3063,7 +3202,7 @@ function reportExecution(t) {
     toast(t.execution_message, { type: "warning", title: `${what} — placed, check protection`, timeout: 0 });
   } else if (t.mode === "dry_run") {
     toast("Simulated — no real order was sent.", { type: "success", title: `${what} (dry run)` });
-  } else if (t.exit_state === "exiting") {
+  } else if (t.ticket_state?.code === "EXITING") {
     toast(t.order_variety === "amo"
       ? "Exit sent as AMO — it executes when the market opens. The position stays open, with its protective GTT, until Kite reports the fill."
       : "Exit placed — the position stays open, with its protective GTT, until Kite reports the fill.",
@@ -3211,6 +3350,25 @@ function renderTicketDetailEvents(events) {
     : `<div class="event-row"><span class="event-detail">No events yet</span></div>`);
 }
 
+// PK-19: the position a ticket belongs to, as the server describes it.
+function positionDetailHtml(t) {
+  const lc = t.lifecycle;
+  if (!lc) return "";
+  const which = lc.position_id === t.id ? "" : ` <span class="badge-muted">position #${esc(lc.position_id)}</span>`;
+  const rows = [`<div class="row"><span>Position</span><strong>${LC.lifecycleBadge(lc)}${which}</strong></div>`];
+  if (lc.is_position || lc.is_closed) {
+    rows.push(`<div class="row"><span>Held</span><strong>${LC.quantityCell(lc)}</strong></div>`);
+    rows.push(`<div class="row"><span>Protection</span><strong>${LC.protectionBadge(lc)}</strong></div>`);
+  }
+  if (lc.active_exit || lc.pending_exit_ticket_id != null) {
+    rows.push(`<div class="row"><span>Exit</span><strong>${LC.activeExitCell(lc)}</strong></div>`);
+  }
+  if (lc.review_required) {
+    rows.push(`<div class="row"><span>Review</span><strong>${LC.reviewCell(lc)}</strong></div>`);
+  }
+  return rows.join("");
+}
+
 async function openDetailDialog(ticket) {
   state.activeDetailTicketId = ticket.id;
   state.activeDetailTicket = ticket;
@@ -3218,7 +3376,10 @@ async function openDetailDialog(ticket) {
   el.ticketDetailBody.hidden = false;
   el.ticketEditError.textContent = "";
 
-  const statusRow = `<div class="row"><span>Status</span><strong>${statusBadgeHtml(ticket.status, ticket)}</strong></div>`;
+  // PK-19: the ticket's own state and its POSITION's lifecycle are separate
+  // concepts — an executed exit ticket does not mean the position is closed.
+  const statusRow = `<div class="row"><span>Ticket</span><strong>${statusBadgeHtml(ticket.status, ticket)}</strong></div>`
+    + positionDetailHtml(ticket);
   const modeRow = `<div class="row"><span>Mode</span><strong>${modeChipHtml(ticket.mode)}${ticket.order_variety === "amo" ? ' <span class="chip">AMO</span>' : ""}</strong></div>`;
   const orderRow = ticket.kite_order_id
     ? `<div class="row"><span>Kite Order ID</span><strong>${ticket.kite_order_id}</strong></div>` : "";
@@ -3797,6 +3958,7 @@ const SECTIONS = [
   { id: "approvals", el: document.getElementById("view-approvals") },
   { id: "new-ticket", el: document.getElementById("view-new-ticket") },
   { id: "trade-queue", el: document.getElementById("view-trade-queue") },
+  { id: "positions", el: document.getElementById("view-positions") },
   { id: "ticket-history", el: document.getElementById("view-ticket-history") },
   { id: "orders-trades", el: document.getElementById("view-orders-trades") },
   { id: "watchlist", el: document.getElementById("view-watchlist") },
@@ -3818,6 +3980,7 @@ function showSection(id) {
   if (location.hash !== `#${id}`) history.replaceState(null, "", `#${id}`);
   if (id === "approvals") loadApprovals();
   if (id === "orders-trades") refreshOrderBooks();
+  if (id === "positions") loadAppPositions();
   window.scrollTo({ top: 0 });
 }
 
@@ -3835,7 +3998,7 @@ window.addEventListener("hashchange", () => {
 function revealTradingNavItems() {
   for (const id of [
     "approvals", "new-ticket", "ticket-history", "orders-trades", "settings", "watchlist", "strategies",
-    "trade-queue", "todays-actions", "journal",
+    "trade-queue", "todays-actions", "journal", "positions",
   ]) {
     const btn = document.querySelector(`.nav-item[data-section-id="${id}"]`);
     if (btn) btn.hidden = false;
@@ -4058,7 +4221,7 @@ function refreshTicketViews() {
   }
   _refreshInFlight = Promise.all([
     refreshTickets(), loadSignalQueue(), loadTradeQueue(), loadTodaysActions(), loadStopAdjustments(),
-    loadApprovals(), loadAutomationStatus(),
+    loadApprovals(), loadAutomationStatus(), loadAppPositions(),
   ]).finally(() => {
     _refreshInFlight = null;
     if (_refreshQueued) {
@@ -4474,6 +4637,13 @@ function sdRenderHeader(ticket, data) {
   el.sdModePill.innerHTML = mode === "live"
     ? `<span class="chip live">LIVE — real money</span>`
     : `<span class="chip dry">DRY RUN — simulated</span>`;
+
+  // PK-19: the ticket's state and its position's lifecycle, as two concepts.
+  const ts = data?.ticket_state ?? ticket.ticket_state;
+  const lc = data?.lifecycle ?? ticket.lifecycle;
+  el.sdLifecycle.innerHTML = (ts ? `<span class="sd-lc-part">Ticket ${LC.ticketStateBadge(ts)}</span>` : "")
+    + (lc && (lc.is_position || lc.is_closed)
+      ? `<span class="sd-lc-part">Position ${LC.lifecycleBadge(lc)} ${LC.protectionBadge(lc)}</span>` : "");
 
   sdSeedPrice(ticket.symbol, ticket.instrument_token);
   sdRenderLtp();
@@ -4944,10 +5114,10 @@ function sdRenderContextSection() {
 
   // An existing position in the same symbol.
   const open = (state.tickets || []).filter((x) =>
-    x.symbol === d.symbol && x.status === "executed" && !x.closed_at && x.transaction_type === "BUY");
+    x.symbol === d.symbol && x.lifecycle?.is_holding && x.lifecycle.position_id === x.id);
   if (open.length) {
     items.push(`<div class="sd-warn warn">You already hold an open position in
-      <strong>${esc(d.symbol)}</strong> (${open.map((x) => `${fmt(x.quantity, 0)} @ ${inr(x.entry_price)}`).join(", ")}).
+      <strong>${esc(d.symbol)}</strong> (${open.map((x) => `${fmt(x.lifecycle.open_quantity, 0)} @ ${inr(x.lifecycle.entry_fill_price ?? x.entry_price)}`).join(", ")}).
       Approving this adds to it.</div>`);
   }
 

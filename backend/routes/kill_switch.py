@@ -4,7 +4,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from kiteconnect import KiteConnect
 
-from backend import execution, order_monitor, position_quantity, risk_engine, system_events
+from backend import execution, lifecycle, order_monitor, position_quantity, risk_engine, system_events
 from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
@@ -21,6 +21,7 @@ _REQUIRED_PHRASE = "EXIT ALL"
 
 def _build_exit_preview(conn, account) -> list[dict]:
     positions = risk_engine.list_open_positions(conn, account["id"])
+    ctx = lifecycle.build_context(conn, account["id"]) if positions else None
     return [
         {
             # PK-13: quantity is what was ordered; open_quantity is what is
@@ -31,6 +32,9 @@ def _build_exit_preview(conn, account) -> list[dict]:
             "current_stop_loss": p["current_stop_loss"], "strategy_name": p["strategy_name"], "mode": p["mode"],
             "entry_fill_status": p["entry_fill_status"],
             "exit_in_flight": _exit_in_flight(conn, p["id"]) is not None,
+            # PK-19: the server-derived lifecycle, so the dialog never reads
+            # raw fill columns to decide what it shows.
+            "lifecycle_state": lifecycle.derive(ctx.tickets[p["id"]], ctx)["lifecycle_state"],
         }
         for p in positions
     ]
@@ -309,6 +313,15 @@ def _result_status(data: dict) -> str:
 
 
 def _create_emergency_exit_ticket(conn, account, position, ltp_data: dict) -> int:
+    return create_linked_exit_ticket(conn, account, position, ltp_data, "Emergency exit — all positions",
+                                     {"emergency_exit_all": True})
+
+
+def create_linked_exit_ticket(conn, account, position, ltp_data: dict, rationale: str, rule_checklist: dict) -> int:
+    """A draft MARKET SELL that closes `position` — Emergency Exit's, and
+    since PK-19 the Positions view's per-position Exit. It is only created:
+    the caller runs the risk checks, and it executes only through the normal
+    confirm path. Its mode is the position's own (PK-3)."""
     # Reference/expected fill price for this MARKET exit — the current LTP
     # when available (same source check_breakeven_candidates already uses
     # for a live price), falling back to the position's own current stop
@@ -340,14 +353,14 @@ def _create_emergency_exit_ticket(conn, account, position, ltp_data: dict) -> in
             position["symbol"], position["exchange"], position["instrument_token"],
             quantity, entry_price, position["stop_loss"], position["target_1"],
             position["product_type"], metrics["risk_amount"], metrics["risk_reward_ratio"],
-            "Emergency exit — all positions", position["id"],
-            json.dumps({"emergency_exit_all": True}), position["mode"],  # inherited, never the global mode
+            rationale, position["id"],
+            json.dumps(rule_checklist), position["mode"],  # inherited, never the global mode
         ),
     )
     ticket_id = cursor.lastrowid
     conn.execute(
         "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'created', ?)",
-        (ticket_id, "Emergency exit — all positions"),
+        (ticket_id, rationale),
     )
     conn.commit()
     return ticket_id

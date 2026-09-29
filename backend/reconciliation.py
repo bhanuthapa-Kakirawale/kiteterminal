@@ -28,6 +28,16 @@ UNLINKED_POSSIBLE_GTT = "UNLINKED_POSSIBLE_GTT"
 AMBIGUOUS_GTT_OWNERSHIP = "AMBIGUOUS_GTT_OWNERSHIP"
 BROKER_POSITION_SHORTFALL = "BROKER_POSITION_SHORTFALL"
 
+# PK-19: codes for findings other modules record against a position, so the
+# position lifecycle (backend/lifecycle.py) can read them as data instead of
+# interpreting their text. Recording a code changes nothing about how a
+# finding is de-duplicated or reviewed.
+PROTECTION_MISSING = "PROTECTION_MISSING"                      # no active protective GTT
+PROTECTION_QUANTITY_MISMATCH = "PROTECTION_QUANTITY_MISMATCH"  # GTT could not be resized to the shares held
+POSITION_QUANTITY_REVIEW = "POSITION_QUANTITY_REVIEW"          # open quantity unknown, or negative
+POSSIBLE_DOUBLE_SELL = "POSSIBLE_DOUBLE_SELL"                  # exit filled AND the GTT triggered
+ORPHANED_GTT_AFTER_EXIT = "ORPHANED_GTT_AFTER_EXIT"            # position closed, its GTT delete failed
+
 # Kite -> app findings. A reviewed one stays silent while the broker GTT
 # (quantity, trigger, status) and the app positions it is judged against
 # are unchanged: an orphan that is really the user's own GTT for a long-term

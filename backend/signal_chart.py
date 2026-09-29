@@ -332,7 +332,11 @@ def _exit_plan(ticket: dict, module, params: dict) -> dict:
     """
     thesis_ma = params.get("thesis_invalidation_ma")
     time_exit_days = params.get("time_exit_days")
-    is_open = ticket.get("status") == "executed" and ticket.get("closed_at") is None
+    # PK-19: "the position is open" is the server-derived lifecycle's call
+    # when the route supplied one (backend/lifecycle.py).
+    lc = ticket.get("lifecycle")
+    is_open = (lc["is_holding"] if lc else
+               ticket.get("status") == "executed" and ticket.get("closed_at") is None)
     rules = []
 
     if module is not None and module.STRATEGY_NAME == "rsi_mean_reversion":
@@ -441,6 +445,10 @@ def build_payload(ticket: dict, settings=None) -> dict:
         "instrument_token": ticket.get("instrument_token"),
         "transaction_type": ticket.get("transaction_type"),
         "status": ticket.get("status"),
+        # PK-19: the ticket/order state and the position lifecycle, as two
+        # separate concepts (an executed exit is not a closed position).
+        "ticket_state": ticket.get("ticket_state"),
+        "lifecycle": ticket.get("lifecycle"),
         "strategy_name": ticket.get("strategy_name"),
         "strategy_label": (evaluation or {}).get("strategy_label")
         or (getattr(module, "STRATEGY_LABEL", None) if module else None)

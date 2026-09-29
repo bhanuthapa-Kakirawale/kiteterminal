@@ -47,6 +47,7 @@ from backend.routes import (
     kill_switch,
     orders,
     portfolio,
+    positions as positions_routes,
     reconciliation as reconciliation_routes,
     risk,
     strategies as strategies_routes,
@@ -141,6 +142,7 @@ app.include_router(watchlist_routes.router)
 app.include_router(strategies_routes.router)
 app.include_router(journal_routes.router)
 app.include_router(kill_switch.router)
+app.include_router(positions_routes.router)
 app.include_router(reconciliation_routes.router)
 app.include_router(automation_routes.router)
 app.include_router(account_safety_routes.router)

@@ -131,6 +131,11 @@
       </button>
 
       <div class="nav-group-label" data-trading-only hidden>Trading</div>
+      <button class="nav-item" data-section-id="positions" hidden>
+        <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 19V5M4 19h16"/><rect x="7" y="11" width="3" height="5" rx="1"/><rect x="12" y="7" width="3" height="9" rx="1"/><rect x="17" y="13" width="3" height="3" rx="1"/></svg></span>
+        <span class="nav-label">Positions</span>
+        <span class="nav-badge" id="nav-badge-positions" hidden>0</span>
+      </button>
       <button class="nav-item" data-section-id="trade-queue" hidden>
         <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 13 9 5 9-5"/></svg></span>
         <span class="nav-label">Trade Queue</span>
@@ -1156,6 +1161,53 @@
       </details>
     </div>
 
+    <!-- PK-19: app-managed positions, each shown by its SERVER-derived
+         lifecycle (GET /api/app-positions). Broker holdings stay on the
+         Dashboard; this is what the terminal itself opened. -->
+    <div class="view" id="view-positions" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Positions</h1>
+          <p class="page-sub">What this terminal holds, what is waiting to fill, what is exiting — and what needs your attention. States come from the server; buttons follow what it allows.</p>
+        </div>
+        <button class="btn btn-ghost" id="positions-refresh-btn" type="button">Refresh</button>
+      </div>
+      <div class="lc-summary" id="positions-summary"></div>
+      <div class="tab-row">
+        <button class="tab-btn active" data-pos-tab="active">Active <span class="tab-count" id="pos-count-active"></span></button>
+        <button class="tab-btn" data-pos-tab="closed">Closed / History <span class="tab-count" id="pos-count-closed"></span></button>
+      </div>
+      <div class="pos-panel" data-pos-panel="active">
+        <div class="table-wrap">
+          <table id="positions-active-table" class="positions-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Lifecycle</th><th>Mode</th><th class="num">Qty</th><th class="num">Entry</th>
+                <th class="num">LTP</th><th class="num">Stop</th><th class="num">Target</th><th>Protection</th>
+                <th>Active exit</th><th class="num">Unrealised P&amp;L</th><th>Review</th><th>Actions</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p class="muted-note">Exit creates an exit ticket for the shares actually held; nothing is sent until you approve it. Emergency Exit (top bar) covers every live position at once.</p>
+      </div>
+      <div class="pos-panel" data-pos-panel="closed" hidden>
+        <div class="table-wrap">
+          <table id="positions-closed-table" class="positions-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Strategy</th><th>Lifecycle</th><th>Mode</th><th class="num">Qty</th>
+                <th class="num">Entry</th><th class="num">Avg exit</th><th>Opened</th><th>Closed</th>
+                <th class="num">Realised P&amp;L</th><th>Review</th><th>Actions</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
     </main>
   </div>
 
@@ -1173,6 +1225,7 @@
         <span id="sd-strategy"></span>
         <span id="sd-signal-date" class="badge-muted"></span>
         <span id="sd-mode-pill"></span>
+        <span id="sd-lifecycle" class="sd-lifecycle"></span>
       </div>
       <div class="sd-head-live">
         <div class="sd-ltp"><label>Last price</label><strong id="sd-ltp">—</strong><span id="sd-ltp-change"></span></div>
@@ -1434,6 +1487,8 @@
           integrity="sha384-BSxuMLxX+FCbTdYec3TbXlnMGEEM2QXTFdtDaveen71o+jswm2J36+xFqp8k4VHM"></script>
   <script src="/static/vendor/lightweight-charts-5.2.1.standalone.production.js"
           integrity="sha384-KkYqTZlM13Zya6fVUF3IGCBOQ1ehFeJVVgxaVvD/0MebineF9EI8Jkd3NnWNChqN"></script>
+  <!-- PK-19: renderers for the server-derived lifecycle; app.js uses them. -->
+  <script src="/static/lifecycle.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

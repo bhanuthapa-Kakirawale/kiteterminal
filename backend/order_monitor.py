@@ -494,6 +494,8 @@ def _resolve_entry(conn: sqlite3.Connection, kite, ticket: sqlite3.Row, order: d
             reconciliation.log_mismatch(
                 conn, ticket["id"], "position_state", expected="filled position protected by an active GTT",
                 actual=f"kite_gtt_id={ticket['kite_gtt_id']}, no active GTT", detail=warning,
+                issue_code=reconciliation.PROTECTION_MISSING, severity=reconciliation.URGENT,
+                symbol=ticket["symbol"], gtt_id=ticket["kite_gtt_id"],
             )
             return {**base, "severity": "urgent", "message": f"{msg}. {warning}"}
         return {**base, "severity": severity, "message": msg}

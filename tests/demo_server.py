@@ -340,6 +340,107 @@ def seed_database(db, fake, market) -> None:
     conn.close()
 
 
+def seed_lifecycle_fixtures(db, fake) -> None:
+    """PK-19 (--lifecycle-fixtures, off by default): one app position in each
+    lifecycle state the Positions view must show, for browser validation.
+    Seeded AFTER everything above, and only on request, so the default demo —
+    and tests/e2e_ui.py against it — is unchanged. Each live state is backed
+    by a matching FakeKite order / GTT, so the demo's own background loops
+    (order monitor, GTT watcher, reconciliation) keep it stable."""
+    from backend import journal
+    from backend.accounts import get_default_account
+
+    tokens = {sym: token for token, sym, *_ in UNIVERSE}
+    conn = db.get_connection()
+    aid = get_default_account(conn)["id"]
+    ago = lambda days: (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")  # noqa: E731
+
+    def gtt(sym, qty, stop, last):
+        legs = [{"transaction_type": "SELL", "quantity": qty, "order_type": "LIMIT", "product": "CNC",
+                 "price": round(stop * 0.995, 2)}]
+        return fake.place_gtt("single", sym, "NSE", [stop], last, legs)["trigger_id"]
+
+    def position(sym, qty, price, **fields):
+        base = dict(account_id=aid, source="manual", symbol=sym, exchange="NSE", instrument_token=tokens[sym],
+                    transaction_type="BUY", quantity=qty, entry_price=price, entry_order_type="LIMIT",
+                    stop_loss=round(price * 0.96, 2), target_1=round(price * 1.08, 2),
+                    current_stop_loss=round(price * 0.96, 2), product_type="CNC", use_gtt=1,
+                    risk_amount=round(price * 0.04 * qty, 2), risk_reward_ratio=2.0, status="executed", mode="live",
+                    executed_at=ago(3), entry_fill_status="filled", filled_quantity=qty, filled_price=price,
+                    filled_at=ago(3), order_variety="regular", rationale=f"PK-19 lifecycle fixture ({sym})")
+        base.update(fields)
+        return _insert(conn, **base)
+
+    def exit_of(pid, sym, qty, price, **fields):
+        base = dict(account_id=aid, source="manual", symbol=sym, exchange="NSE", instrument_token=tokens[sym],
+                    transaction_type="SELL", quantity=qty, entry_price=price, entry_order_type="MARKET",
+                    stop_loss=round(price * 0.9, 2), target_1=round(price * 1.1, 2), product_type="CNC", use_gtt=1,
+                    status="executed", mode="live", closes_ticket_id=pid, executed_at=ago(0),
+                    rationale="PK-19 lifecycle fixture exit")
+        base.update(fields)
+        return _insert(conn, **base)
+
+    def finding(ticket_id, code, detail, **fields):
+        conn.execute(
+            "INSERT INTO reconciliation_log (ticket_id, check_type, expected, actual, mismatch, detail, issue_code, "
+            "severity, symbol, gtt_id, expected_quantity, broker_quantity, suggested_action) "
+            "VALUES (?, 'order_status', ?, ?, 1, ?, ?, 'urgent', ?, ?, ?, ?, 'CHECK KITE')",
+            (ticket_id, fields.get("expected", "protected"), fields.get("actual", code), detail, code,
+             fields.get("symbol"), fields.get("gtt_id"), fields.get("expected_quantity"),
+             fields.get("broker_quantity")))
+
+    # ENTRY_PARTIAL — LT: 40 of 100 filled, the order still working.
+    order = fake.add_broker_order("LT", "BUY", 100, status="OPEN", filled_quantity=40, price=2990.0,
+                                  average_price=2990.0)
+    position("LT", 100, 2990.0, kite_order_id=order, kite_gtt_id=gtt("LT", 40, 2870.0, 2990.0),
+             entry_fill_status="pending", filled_quantity=40, filled_price=None, filled_at=None)
+    fake.set_holding("LT", 40, average_price=2990.0)
+    # ENTRY_OPEN — NEWLISTCO: order at the broker, nothing filled.
+    order = fake.add_broker_order("NEWLISTCO", "BUY", 50, status="OPEN", price=700.0)
+    position("NEWLISTCO", 50, 700.0, kite_order_id=order, kite_gtt_id=gtt("NEWLISTCO", 50, 672.0, 700.0),
+             entry_fill_status="pending", filled_quantity=0, filled_price=None, filled_at=None)
+    # EXITING — BHARTIARTL: 30 held, exit order working, nothing sold.
+    pid = position("BHARTIARTL", 30, 1690.0, kite_gtt_id=gtt("BHARTIARTL", 30, 1622.0, 1690.0))
+    order = fake.add_broker_order("BHARTIARTL", "SELL", 30, status="OPEN", price=1750.0)
+    exit_of(pid, "BHARTIARTL", 30, 1750.0, kite_order_id=order, entry_fill_status="pending", filled_quantity=0)
+    fake.set_holding("BHARTIARTL", 30, average_price=1690.0)
+    # EXIT_PARTIAL — HDFCBANK: 40 bought, a working exit sold 15, 25 remain.
+    pid = position("HDFCBANK", 40, 1600.0, kite_gtt_id=gtt("HDFCBANK", 25, 1536.0, 1600.0))
+    order = fake.add_broker_order("HDFCBANK", "SELL", 40, status="OPEN", filled_quantity=15, price=1640.0,
+                                  average_price=1640.0)
+    exit_of(pid, "HDFCBANK", 40, 1640.0, kite_order_id=order, entry_fill_status="pending", filled_quantity=15)
+    # OPEN, UNPROTECTED — ITC: no protective GTT.
+    pid = position("ITC", 100, 440.0, kite_gtt_id=None)
+    finding(pid, "PROTECTION_MISSING", "ITC: 100 share(s) are open but it has NO protective GTT. Place a stop-loss "
+            "in Kite.", symbol="ITC", expected_quantity=100, broker_quantity=0)
+    # OPEN, GTT QUANTITY MISMATCH — RELIANCE: holds 30, the finding says the GTT covered 50.
+    gtt_id = gtt("RELIANCE", 30, 1260.0, 1310.0)
+    pid = position("RELIANCE", 30, 1310.0, kite_gtt_id=gtt_id)
+    finding(pid, "GTT_QUANTITY_TOO_HIGH", "RELIANCE: PROTECTION QUANTITY MISMATCH — protective GTT is OVERSIZED: it "
+            "covers 50 share(s) but the position holds 30.", symbol="RELIANCE", gtt_id=gtt_id, expected_quantity=30,
+            broker_quantity=50)
+    # SUBMISSION_UNKNOWN (entry) — DIVISLAB: the broker call's outcome is unknown.
+    position("DIVISLAB", 20, 190.0, status="confirmed", kite_gtt_id=None, executed_at=None, order_variety=None,
+             entry_fill_status=None, filled_quantity=None, filled_price=None, filled_at=None,
+             submission_state="unknown", order_tag="ktdemo1", submitted_at=ago(0))
+    # SUBMISSION_UNKNOWN (exit) — TCS: 10 held, the exit's broker evidence is ambiguous.
+    pid = position("TCS", 10, 3400.0, kite_gtt_id=gtt("TCS", 10, 3264.0, 3400.0))
+    exit_of(pid, "TCS", 10, 3450.0, status="confirmed", executed_at=None, submission_state="needs_review",
+            order_tag="ktdemo2", submitted_at=ago(0))
+    # OPEN, DRY RUN — INFY: a simulated position; its mode is its own.
+    position("INFY", 12, 1450.0, mode="dry_run", kite_gtt_id=None, order_variety=None)
+    # CLOSED — SUNPHARMA: a live round trip closed on its exit fill, journaled.
+    pid = position("SUNPHARMA", 15, 1420.0, kite_gtt_id=None, executed_at=ago(9), filled_at=ago(9),
+                   closed_at=ago(1))
+    sell = exit_of(pid, "SUNPHARMA", 15, 1500.0, entry_fill_status="filled", filled_quantity=15,
+                   filled_price=1500.0, filled_at=ago(1), executed_at=ago(1), kite_order_id="250000000999")
+    conn.commit()
+    journal.record_closed_trade(conn, sell)
+    conn.commit()
+    conn.close()
+    print("  seeded PK-19 lifecycle fixtures", flush=True)
+
+
 def _serve_frontend_from(app, frontend_dir: Path) -> None:
     """Swap in a different frontend build (e.g. an older one, for a
     before/after comparison) without touching backend/main.py."""
@@ -357,6 +458,8 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--workdir", default=None)
     parser.add_argument("--frontend-dir", default=None, help="serve another frontend build instead of ./frontend")
+    parser.add_argument("--lifecycle-fixtures", action="store_true",
+                        help="PK-19: also seed one app position per lifecycle state (off by default)")
     args = parser.parse_args()
 
     workdir = Path(args.workdir or tempfile.mkdtemp(prefix="kite-demo-"))
@@ -378,6 +481,8 @@ def main() -> None:
 
     db.init_db()
     seed_database(db, fake, market)
+    if args.lifecycle_fixtures:
+        seed_lifecycle_fixtures(db, fake)
 
     import uvicorn
     from backend.main import app

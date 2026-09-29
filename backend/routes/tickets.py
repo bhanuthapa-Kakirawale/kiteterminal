@@ -8,7 +8,8 @@ from kiteconnect import KiteConnect
 from kiteconnect.exceptions import KiteException
 
 from backend import (
-    account_safety, execution, instruments, journal, kite_chart, position_quantity, reconciliation, risk_engine,
+    account_safety, execution, instruments, journal, kite_chart, lifecycle, position_quantity, reconciliation,
+    risk_engine,
     signal_chart,
     system_events,
 )
@@ -106,6 +107,20 @@ def _serialize(ticket: sqlite3.Row) -> dict:
     }
     # PK-8: 'exiting' = exit order placed, not filled; the position is open.
     data["exit_state"] = execution.exit_state(ticket)
+    # PK-19: what happened to this ticket and its order, decided here — the
+    # frontend renders it. The position lifecycle is added by the callers
+    # that hold a lifecycle context (_with_lifecycle).
+    data["ticket_state"] = lifecycle.ticket_state(ticket)
+    return data
+
+
+def _with_lifecycle(conn: sqlite3.Connection, ticket: sqlite3.Row, ctx: lifecycle.Context | None = None) -> dict:
+    """A ticket payload with its PK-13 quantities and PK-19 position
+    lifecycle, from one lifecycle context (built here when not given)."""
+    ctx = ctx or lifecycle.build_context(conn, ticket["account_id"])
+    data = _serialize(ticket)
+    data.update(_quantity_fields(ticket, ctx))
+    data["lifecycle"] = lifecycle.for_ticket(ticket, ctx)
     return data
 
 
@@ -378,11 +393,14 @@ def list_tickets(
             f"SELECT * FROM trade_tickets WHERE {' AND '.join(clauses)} ORDER BY created_at DESC",
             params,
         ).fetchall()
-        in_flight = _exits_in_flight(conn, account["id"])
+        # PK-19: one lifecycle context for the whole list — a constant number
+        # of queries, however many tickets (it replaced a per-ticket open
+        # quantity query).
+        ctx = lifecycle.build_context(conn, account["id"])
+        in_flight = _exits_in_flight(ctx)
         data = []
         for r in rows:
-            item = _serialize(r)
-            item.update(_quantity_fields(conn, r))
+            item = _with_lifecycle(conn, r, ctx)
             item["exit_in_flight_ticket_id"] = in_flight.get(r["id"])
             data.append(item)
         return {"data": data}
@@ -390,22 +408,17 @@ def list_tickets(
         conn.close()
 
 
-def _exits_in_flight(conn: sqlite3.Connection, account_id: int) -> dict[int, int]:
+def _exits_in_flight(ctx: lifecycle.Context) -> dict[int, int]:
     """position id -> the exit ticket that owns it while its order is in
     flight (claimed/UNKNOWN, EXITING, unconfirmed): the position still
     exists, but an exit is in flight (PK-8). An exit that ended after a
-    partial fill no longer owns it (PK-13)."""
-    rows = conn.execute(
-        f"""
-        SELECT closes_ticket_id, id FROM trade_tickets
-        WHERE account_id = ? AND closes_ticket_id IS NOT NULL AND {execution.EXIT_IN_FLIGHT_SQL}
-        """,
-        (account_id,),
-    ).fetchall()
-    return {r["closes_ticket_id"]: r["id"] for r in rows}
+    partial fill no longer owns it (PK-13). (execution.EXIT_IN_FLIGHT_SQL,
+    evaluated on the rows the lifecycle context already read.)"""
+    return {position_id: x["id"] for position_id, exits in ctx.exits.items()
+            for x in exits if lifecycle.exit_in_flight(x)}
 
 
-def _quantity_fields(conn: sqlite3.Connection, ticket: sqlite3.Row) -> dict:
+def _quantity_fields(ticket: sqlite3.Row, ctx: lifecycle.Context) -> dict:
     """PK-13: requested vs filled vs open. For a position (an executed entry):
     open_quantity = shares still held. For an exit: remaining_quantity = what
     its order has not sold."""
@@ -414,7 +427,8 @@ def _quantity_fields(conn: sqlite3.Connection, ticket: sqlite3.Row) -> dict:
     if ticket["status"] != "executed":
         return fields
     if ticket["closes_ticket_id"] is None and not execution.is_closing_sell(ticket):
-        fields["open_quantity"] = 0 if ticket["closed_at"] else position_quantity.open_quantity(conn, ticket["id"])
+        fields["open_quantity"] = 0 if ticket["closed_at"] else position_quantity.open_quantity_from_rows(
+            ticket, ctx.exits.get(ticket["id"], []))
     elif bought is not None:
         fields["remaining_quantity"] = ticket["quantity"] - bought
     return fields
@@ -429,8 +443,7 @@ def get_ticket(ticket_id: int, kite: KiteConnect = Depends(require_trading_accou
         events = conn.execute(
             "SELECT * FROM ticket_events WHERE ticket_id = ? ORDER BY created_at ASC", (ticket_id,)
         ).fetchall()
-        data = _serialize(ticket)
-        data.update(_quantity_fields(conn, ticket))
+        data = _with_lifecycle(conn, ticket)
         data["events"] = [dict(e) for e in events]
         return {"data": data}
     finally:
@@ -450,7 +463,9 @@ def get_ticket_chart(ticket_id: int, kite: KiteConnect = Depends(require_trading
     account = get_trading_account()
     conn = get_connection()
     try:
-        ticket = _serialize(_get_ticket_or_404(conn, ticket_id, account["id"]))
+        # PK-19: the ticket's own state and its position's lifecycle, shown
+        # side by side in the Signal Detail header.
+        ticket = _with_lifecycle(conn, _get_ticket_or_404(conn, ticket_id, account["id"]))
 
         # Tickets created before this feature shipped have no stored chart
         # URL. Rather than showing them a dead link, resolve once on first
@@ -977,8 +992,7 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
         ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
 
     _notify("executed", ticket_id=ticket_id, status=ticket["status"], success=result.success)
-    data = _serialize(ticket)
-    data.update(_quantity_fields(conn, ticket))
+    data = _with_lifecycle(conn, ticket)
     if won:
         data["execution_message"] = result.message
         data["success"] = result.success
