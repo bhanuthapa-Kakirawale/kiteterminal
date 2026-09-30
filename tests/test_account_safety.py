@@ -62,6 +62,16 @@ def _codes(r):
     return [f["code"] for f in r.json()["detail"]["failures"]]
 
 
+def _ignore_live0_unknown_gate(monkeypatch):
+    """Since LIVE-0 an unresolved UNKNOWN live submission blocks every further
+    live entry by itself (account_safety.check_live_prerequisites). A PK-12
+    test that needs several UNKNOWN outcomes to exercise ANOTHER control (the
+    breaker's failure count, the daily-slot accounting) switches just that
+    part off; test_live_preflight.py covers the gate."""
+    from backend import live_preflight
+    monkeypatch.setattr(live_preflight, "unresolved_live_submissions", lambda *a, **k: [])
+
+
 def _orders(env):
     return [name for name, _ in env.kite.calls if name in ORDER_CALLS]
 
@@ -247,17 +257,25 @@ def test_12b_one_share_or_tick_above_the_cap_is_refused(live, overrides):
     _assert_untouched_pending(live, tid)
 
 
-def test_12b_disabled_cap_does_not_limit(live):
+def test_12b_unset_cap_no_longer_means_unlimited_for_a_live_entry(live):
+    # LIVE-0 changed this deliberately: before, NULL disabled the cap; now a
+    # live entry without an explicit cap is refused before any broker call.
     _risk(live, max_order_notional=None)
-    r = _confirm(live, _entry(live, quantity=6))
-    assert r.status_code == 200 and r.json()["data"]["status"] == "executed"
+    tid = _entry(live, quantity=6)
+    mark = len(live.kite.calls)
+    r = _confirm(live, tid)
+    assert r.status_code == 409 and _code(r) == "LIVE_PREREQUISITE_MISSING"
+    assert "max order notional is not set" in r.json()["detail"]["message"]
+    assert _calls_since(live, mark) == []
+    _assert_untouched_pending(live, tid)
 
 
 @pytest.mark.parametrize("value", [-1, 0, "lots"])
 def test_12b_malformed_or_negative_setting_is_rejected(live, value):
+    before = live.client.get("/api/risk/settings").json()["data"]["max_order_notional"]
     r = live.client.post("/api/risk/settings", json=_settings_body(live, max_order_notional=value))
     assert r.status_code == 422
-    assert live.client.get("/api/risk/settings").json()["data"]["max_order_notional"] is None
+    assert live.client.get("/api/risk/settings").json()["data"]["max_order_notional"] == before
 
 
 def test_12b_database_rejects_a_negative_cap_too(live):
@@ -342,7 +360,8 @@ def test_12c_unknown_live_submission_counts(live):
     _unknown_ticket(live, submitted_at=_now_utc_sql())  # a real order may exist
     assert _entries_today(live) == 1
     r = _confirm(live, _entry(live))
-    assert r.status_code == 409 and _code(r) == "DAILY_ENTRY_LIMIT"
+    # LIVE-0: the UNKNOWN outcome now also blocks on its own, reported first.
+    assert r.status_code == 409 and _codes(r)[:2] == ["LIVE_PREREQUISITE_MISSING", "DAILY_ENTRY_LIMIT"]
     assert live.kite.calls_to("place_order") == []
 
 
@@ -724,11 +743,19 @@ def test_12f_pnl_that_cannot_be_computed_fails_closed(live, monkeypatch):
     assert _orders(live) == []
 
 
-def test_12f_disabled_by_default(live):
+def test_12f_unset_by_default_and_required_for_a_live_entry(live):
+    # The column still defaults to NULL (nothing is invented for the user)...
+    [column] = [c for c in _sql(live, "PRAGMA table_info(risk_settings)") if c["name"] == "max_daily_loss_amount"]
+    assert column["dflt_value"] is None
+    # ...but since LIVE-0 NULL no longer means "no limit" for a live entry.
+    _risk(live, max_daily_loss_amount=None)
     s = _status(live)
     assert s["max_daily_loss_amount"] is None and s["max_daily_loss_pct"] is None
     _closed_trade(live, -1_000_000.0)
-    assert _confirm(live, _entry(live)).status_code == 200
+    r = _confirm(live, _entry(live))
+    assert r.status_code == 409 and _code(r) == "LIVE_PREREQUISITE_MISSING"
+    assert "rupee daily loss limit is not set" in r.json()["detail"]["message"]
+    assert _orders(live) == []
 
 
 def test_12f_lock_is_not_overwritten_by_the_loss_limit(live):
@@ -773,7 +800,8 @@ def test_12g_open_breaker_blocks_new_entries_without_broker_calls(live):
     _assert_untouched_pending(live, tid)
 
 
-def test_12g_unknown_order_outcomes_trip_the_breaker(live, unsafe_client):
+def test_12g_unknown_order_outcomes_trip_the_breaker(live, unsafe_client, monkeypatch):
+    _ignore_live0_unknown_gate(monkeypatch)  # three UNKNOWN outcomes in a row are what trips the breaker here
     _risk(live, max_new_entries_per_day=None)
     for _ in range(3):
         tid = _entry(live)

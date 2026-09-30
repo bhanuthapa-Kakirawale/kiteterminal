@@ -17,6 +17,8 @@ Controls (one small function each):
   12F  daily realized loss     check_daily_loss          live
   12G  broker circuit breaker  check_breaker             live
   12H  market hours / AMO      decide_variety            live
+  L0   live prerequisites      check_live_prerequisites  live (LIVE-0: notional + ₹ loss set,
+                                                          static IP confirmed, no UNKNOWN order)
 
 Two orchestrators run them, in a fixed order:
 
@@ -64,6 +66,7 @@ BROKER_CIRCUIT_OPEN = "BROKER_CIRCUIT_OPEN"
 AMO_CONFIRMATION_REQUIRED = "AMO_CONFIRMATION_REQUIRED"
 AMO_DISABLED = "AMO_DISABLED"
 ACCOUNT_SAFETY_UNAVAILABLE = "ACCOUNT_SAFETY_UNAVAILABLE"
+LIVE_PREREQUISITE_MISSING = "LIVE_PREREQUISITE_MISSING"
 
 VARIETY_REGULAR = "regular"
 VARIETY_AMO = "amo"
@@ -422,6 +425,36 @@ def check_notional(ticket: sqlite3.Row, settings: sqlite3.Row) -> SafetyFailure 
                          f"the absolute per-order cap of ₹{cap:,.2f}.")
 
 
+def check_live_prerequisites(conn: sqlite3.Connection, account_id: int, settings: sqlite3.Row,
+                             now: datetime) -> SafetyFailure | None:
+    """LIVE-0: what must hold before ANY live new entry, checked locally (no
+    broker call): an absolute per-order notional cap and a rupee daily loss
+    limit are set (NULL is no longer 'disabled' for a live entry), the Kite
+    static IP is confirmed and not contradicted, and no earlier live order
+    has an unknown outcome that may be real, unaccounted exposure. The same
+    helpers back the Live Readiness pre-flight (backend/live_preflight.py)."""
+    from backend import live_preflight
+    missing = []
+    if settings["max_order_notional"] is None:
+        missing.append("max order notional is not set")
+    if settings["max_daily_loss_amount"] is None:
+        missing.append("the rupee daily loss limit is not set")
+    ip = live_preflight.static_ip_status(conn, account_id)
+    if ip["status"] == live_preflight.STATIC_IP_FAILED:
+        missing.append(f"static IP check FAILED ({ip['message']})")
+    elif ip["status"] not in live_preflight.STATIC_IP_ACCEPTABLE:
+        missing.append("the Kite static IP has not been confirmed on the Live Readiness page")
+    unknown = live_preflight.unresolved_live_submissions(conn, account_id, now.astimezone(timezone.utc))
+    if unknown:
+        ids = ", ".join(f"#{u['id']}" for u in unknown[:5])
+        missing.append(f"{len(unknown)} live order(s) have an unknown broker outcome ({ids}) — check Kite first")
+    if not missing:
+        return None
+    return SafetyFailure(LIVE_PREREQUISITE_MISSING,
+                         "Live entry refused — live-trading prerequisite(s) missing: " + "; ".join(missing)
+                         + ". See Live Readiness. Nothing was executed; exits are still allowed.")
+
+
 def check_stale_signal(ticket: sqlite3.Row, now: datetime) -> SafetyFailure | None:
     """PK-12E: a STRATEGY entry is valid only while its signal candle is the
     latest completed session (the rule expire_stale_signals applies at the
@@ -507,6 +540,7 @@ def precheck(conn: sqlite3.Connection, account_id: int, ticket: sqlite3.Row, mod
     decision.add(check_trading_lock(state))
     live = mode == "live"
     if live:
+        decision.add(check_live_prerequisites(conn, account_id, settings, now))
         decision.add(check_daily_loss(conn, account_id, settings, now))
         decision.add(check_daily_entry_limit(conn, account_id, settings, ticket["id"], now))
         decision.add(check_notional(ticket, settings))

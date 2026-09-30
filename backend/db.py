@@ -1824,6 +1824,27 @@ def _m004_ohlc_history_integrity(conn: sqlite3.Connection) -> None:
     ohlc_integrity.backfill_all(conn)
 
 
+_LIVE_READINESS_TABLE = """
+CREATE TABLE IF NOT EXISTS live_readiness (
+    account_id             INTEGER PRIMARY KEY REFERENCES accounts(id),
+    static_ip              TEXT,
+    static_ip_confirmed_at TEXT,
+    egress_ip              TEXT,
+    egress_checked_at      TEXT,
+    egress_error           TEXT,
+    updated_at             TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+
+def _m005_live_readiness(conn: sqlite3.Connection) -> None:
+    # LIVE-0: the user's attestation of the static IP whitelisted in the Kite
+    # developer console, and the last deliberate outbound-IP observation
+    # (backend/live_preflight.py). Kite exposes neither through its API.
+    # No seed row: absent means "not yet confirmed".
+    _execute_script(conn, _LIVE_READINESS_TABLE)
+
+
 # (version, name, function) — append only; never renumber or rename a
 # released migration: the name is checked against every database's history.
 MIGRATIONS: list[tuple[int, str, object]] = [
@@ -1831,6 +1852,7 @@ MIGRATIONS: list[tuple[int, str, object]] = [
     (2, "pk22_drop_legacy_dashboard_index", _m002_drop_legacy_dashboard_index),
     (3, "pk22_query_indexes", _m003_query_indexes),
     (4, "pk22_ohlc_history_integrity", _m004_ohlc_history_integrity),
+    (5, "live0_live_readiness", _m005_live_readiness),
 ]
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
 

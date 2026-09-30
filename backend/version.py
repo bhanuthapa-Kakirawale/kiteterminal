@@ -8,7 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 
 # The packet this code implements; bumped with each packet.
-APP_VERSION = "pk22"
+APP_VERSION = "live0"
 
 _REPO = Path(__file__).resolve().parent.parent
 

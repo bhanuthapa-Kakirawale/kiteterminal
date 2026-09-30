@@ -15,8 +15,8 @@ from kiteconnect.exceptions import NetworkException
 
 from conftest import TERMINAL_ORIGIN, displayed_mode, set_mode, terminal_client, ticket_row
 from test_account_safety import (  # noqa: F401 — live is a fixture
-    _assert_untouched_pending, _closed_trade, _code, _confirm, _entry, _lock, _record_failures, _risk, _session,
-    _status, _sys_events, live,
+    _assert_untouched_pending, _closed_trade, _code, _codes, _confirm, _entry, _ignore_live0_unknown_gate, _lock,
+    _record_failures, _risk, _session, _status, _sys_events, live,
 )
 from test_baseline_api import _insert_ticket
 from test_live_safety import (
@@ -81,6 +81,7 @@ def test_three_way_race_for_two_slots_places_exactly_two_orders(live, monkeypatc
 def test_race_with_an_unknown_submission_already_holding_a_slot(live, monkeypatch):
     from backend import execution
     from test_live_safety import _unknown_ticket
+    _ignore_live0_unknown_gate(monkeypatch)  # the daily-slot accounting of an UNKNOWN claim is under test
     _risk(live, max_new_entries_per_day=2)
     _unknown_ticket(live, submitted_at=execution.utc_now_sql())
     results = _race_entries(live, monkeypatch, [_entry(live), _entry(live)])
@@ -215,7 +216,8 @@ def test_s7_mixed_broker_errors_trip_the_circuit_breaker(live, unsafe_client):
     s = _status(live)
     assert s["breaker_open"] is True and len(_sys_events(live, "broker_breaker_tripped")) == 1
     t4 = _entry(live)
-    assert _code(_confirm(live, t4)) == "BROKER_CIRCUIT_OPEN"
+    # LIVE-0: t3's UNKNOWN outcome also blocks further live entries on its own.
+    assert {"LIVE_PREREQUISITE_MISSING", "BROKER_CIRCUIT_OPEN"} <= set(_codes(_confirm(live, t4)))
     assert len(live.kite.calls_to("place_order")) == 1
 
 
@@ -232,8 +234,9 @@ def test_s8_outside_hours_approval_requires_explicit_amo(env, monkeypatch):
 
 
 def _block_every_entry_control(env, monkeypatch):
-    """Every PK-12 entry control is tripped at once; a new entry is refused
-    with all of them, in the documented order."""
+    """Every PK-12 entry control (and, via the UNKNOWN ticket, the LIVE-0
+    live prerequisite) is tripped at once; a new entry is refused with all of
+    them, in the documented order."""
     from backend import execution, market
     _risk(env, max_new_entries_per_day=1, max_order_notional=1.0, max_daily_loss_amount=100.0,
           max_entry_price_deviation_pct=0.01)
@@ -246,7 +249,7 @@ def _block_every_entry_control(env, monkeypatch):
     r = _confirm(env, _entry(env))
     assert r.status_code == 409
     assert [f["code"] for f in r.json()["detail"]["failures"]] == [
-        "TRADING_LOCKED", "DAILY_LOSS_LIMIT", "DAILY_ENTRY_LIMIT", "MAX_NOTIONAL_EXCEEDED",
+        "TRADING_LOCKED", "LIVE_PREREQUISITE_MISSING", "DAILY_LOSS_LIMIT", "DAILY_ENTRY_LIMIT", "MAX_NOTIONAL_EXCEEDED",
         "BROKER_CIRCUIT_OPEN", "AMO_CONFIRMATION_REQUIRED"]
 
 

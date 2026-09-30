@@ -1,0 +1,171 @@
+{
+  "_about": "LIVE-0: structure (keys and type names only) of a real Kite read-only snapshot taken on 2026-09-30. No values, symbols, identifiers or row counts. Empty row_keys = no rows that day (not verified).",
+  "gtts": {
+    "row_keys": {}
+  },
+  "holdings": {
+    "row_keys": {
+      "authorisation": [
+        "dict"
+      ],
+      "authorised_date": [
+        "str"
+      ],
+      "authorised_quantity": [
+        "int"
+      ],
+      "average_price": [
+        "float",
+        "int"
+      ],
+      "close_price": [
+        "float",
+        "int"
+      ],
+      "collateral_quantity": [
+        "int"
+      ],
+      "collateral_type": [
+        "str"
+      ],
+      "day_change": [
+        "float"
+      ],
+      "day_change_percentage": [
+        "float"
+      ],
+      "discrepancy": [
+        "bool"
+      ],
+      "exchange": [
+        "str"
+      ],
+      "instrument_token": [
+        "int"
+      ],
+      "isin": [
+        "str"
+      ],
+      "last_price": [
+        "float",
+        "int"
+      ],
+      "mtf": [
+        "dict"
+      ],
+      "opening_quantity": [
+        "int"
+      ],
+      "pnl": [
+        "float",
+        "int"
+      ],
+      "price": [
+        "int"
+      ],
+      "product": [
+        "str"
+      ],
+      "quantity": [
+        "int"
+      ],
+      "realised_quantity": [
+        "int"
+      ],
+      "short_quantity": [
+        "int"
+      ],
+      "t1_quantity": [
+        "int"
+      ],
+      "tradingsymbol": [
+        "str"
+      ],
+      "used_quantity": [
+        "int"
+      ]
+    }
+  },
+  "margins": {
+    "commodity": {
+      "available": {
+        "adhoc_margin": "int",
+        "cash": "int",
+        "collateral": "int",
+        "intraday_payin": "int",
+        "live_balance": "int",
+        "opening_balance": "int"
+      },
+      "enabled": "bool",
+      "net": "int",
+      "utilised": {
+        "debits": "int",
+        "delivery": "int",
+        "equity": "int",
+        "exposure": "int",
+        "holding_sales": "int",
+        "liquid_collateral": "int",
+        "m2m_realised": "int",
+        "m2m_unrealised": "int",
+        "option_premium": "int",
+        "payout": "int",
+        "span": "int",
+        "spread_benefit_nfo": "int",
+        "stock_collateral": "int",
+        "turnover": "int"
+      }
+    },
+    "equity": {
+      "available": {
+        "adhoc_margin": "int",
+        "cash": "float",
+        "collateral": "int",
+        "intraday_payin": "int",
+        "live_balance": "float",
+        "opening_balance": "float"
+      },
+      "enabled": "bool",
+      "net": "float",
+      "utilised": {
+        "debits": "int",
+        "delivery": "int",
+        "equity": "int",
+        "exposure": "int",
+        "holding_sales": "int",
+        "liquid_collateral": "int",
+        "m2m_realised": "int",
+        "m2m_unrealised": "int",
+        "option_premium": "int",
+        "payout": "int",
+        "span": "int",
+        "spread_benefit_nfo": "int",
+        "stock_collateral": "int",
+        "turnover": "int"
+      }
+    }
+  },
+  "orders": {
+    "row_keys": {}
+  },
+  "positions": {
+    "day": {
+      "row_keys": {}
+    },
+    "net": {
+      "row_keys": {}
+    }
+  },
+  "profile_keys": [
+    "avatar_url",
+    "broker",
+    "email",
+    "exchanges",
+    "meta",
+    "order_types",
+    "products",
+    "user_id",
+    "user_name",
+    "user_shortname",
+    "user_type"
+  ]
+}

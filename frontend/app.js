@@ -3859,7 +3859,8 @@ function renderRiskSettingsForm() {
   form.querySelector('[name="max_sector_exposure_pct"]').value = s.max_sector_exposure_pct;
   form.querySelector('[name="max_total_portfolio_risk_pct"]').value = s.max_total_portfolio_risk_pct;
   form.querySelector('[name="min_risk_reward"]').value = s.min_risk_reward;
-  // PK-12: empty = disabled (null).
+  // PK-12: empty = disabled (null) — except that since LIVE-0 a live new
+  // entry is refused while Max Order Value or Max Daily Loss (₹) is empty.
   for (const name of ACCOUNT_SAFETY_FIELDS) {
     form.querySelector(`[name="${name}"]`).value = s[name] ?? "";
   }
@@ -4011,7 +4012,8 @@ el.riskSettingsForm.addEventListener("submit", async (event) => {
     // Not editable here — resend the stored value so saving never wipes it.
     starting_capital: state.riskSettings?.starting_capital ?? null,
   };
-  // PK-12: sent explicitly every time; an empty field disables that limit.
+  // PK-12: sent explicitly every time; an empty field disables that limit
+  // (for Max Order Value / Max Daily Loss ₹ that also blocks live entries).
   for (const name of ACCOUNT_SAFETY_FIELDS) {
     const raw = String(formData.get(name) ?? "").trim();
     body[name] = raw === "" ? null : Number(raw);
@@ -4026,6 +4028,30 @@ el.riskSettingsForm.addEventListener("submit", async (event) => {
   } catch (e) {
     el.riskSettingsError.textContent = e.message;
   }
+});
+
+// LIVE-0: the FIRST LIVE / CAUTIOUS profile only FILLS the form after an
+// explicit confirmation — nothing is saved until the user presses Save. It
+// never invents a rupee amount: Max Order Value and Max Daily Loss (₹) keep
+// whatever the user has (or must type) and become required; the other
+// exposure limits stay as they are.
+document.getElementById("first-live-profile-btn").addEventListener("click", async () => {
+  const ok = await confirmAction({
+    title: "Fill the FIRST LIVE / CAUTIOUS profile?",
+    message: "This sets Max New Entries / Day to 1 in the form and makes Max Order Value and Max Daily Loss (₹) " +
+      "required. It does not choose any rupee amount for you and saves nothing — review every field, then Save. " +
+      "Keep the trading lock ON until Live Readiness shows READY.",
+    okLabel: "Fill the form",
+  });
+  if (!ok) return;
+  const form = el.riskSettingsForm;
+  form.querySelector('[name="max_new_entries_per_day"]').value = 1;
+  for (const name of ["max_order_notional", "max_daily_loss_amount"]) {
+    form.querySelector(`[name="${name}"]`).required = true;
+  }
+  document.getElementById("first-live-profile-note").hidden = false;
+  const notional = form.querySelector('[name="max_order_notional"]');
+  (notional.value === "" ? notional : form.querySelector('[name="max_daily_loss_amount"]')).focus();
 });
 
 el.sectorMappingForm.addEventListener("submit", async (event) => {
@@ -4065,6 +4091,7 @@ const SECTIONS = [
   { id: "journal", el: document.getElementById("view-journal") },
   { id: "settings", el: document.getElementById("view-settings") },
   { id: "diagnostics", el: document.getElementById("view-diagnostics") },
+  { id: "live-readiness", el: document.getElementById("view-live-readiness") },
 ];
 
 function showSection(id) {
@@ -4081,6 +4108,7 @@ function showSection(id) {
   if (id === "orders-trades") refreshOrderBooks();
   if (id === "positions") loadAppPositions();
   if (id === "diagnostics") window.KTDiagnostics.load(document.getElementById("diagnostics-root"));
+  if (id === "live-readiness") window.KTReadiness.load(document.getElementById("live-readiness-root"));
   if (id === "volume-research") window.KTResearch.load(document.getElementById("volume-research-root"));
   window.scrollTo({ top: 0 });
 }

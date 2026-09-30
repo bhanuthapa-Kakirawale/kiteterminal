@@ -94,6 +94,12 @@ A persistent banner also shows your current mode with two safety buttons
 - **Live**: real orders are placed through Kite Connect. Switching to Live
   requires you to explicitly confirm through a dialog (which also reminds
   you about the static-IP requirement). Switch back to Dry Run any time.
+  Since LIVE-0 a live **new entry** is refused (`LIVE_PREREQUISITE_MISSING`)
+  until **Max Order Value** and **Max Daily Loss (₹)** are set, the Kite
+  static IP is confirmed on the **Live Readiness** page (and not contradicted
+  by an outbound-IP check), and no earlier live order has an unknown outcome.
+  Exits are never blocked by this. Before the first live trade, run **Live
+  Readiness** and follow [FIRST_LIVE_TRADE.md](FIRST_LIVE_TRADE.md).
 
 Your **Journal** (§8) tracks Dry Run and Live results completely
 separately, so paper-trading history never mixes with real results.
@@ -335,9 +341,27 @@ auto-corrected.
   minimum risk/reward, max capital per trade, max exposure per stock, max
   exposure per sector, max open positions, max total portfolio risk, and
   optionally your starting capital. Changes are tracked with history.
+- **Account safety** — max order value (₹), max new live entries per day,
+  entry price deviation, daily loss limit (₹ and/or %), broker circuit
+  breaker. **Fill FIRST LIVE / CAUTIOUS profile…** sets 1 new live entry per
+  day in the form and makes the two ₹ limits required; it never chooses an
+  amount and saves nothing until you press Save.
 - **Sector mappings** — assign sectors to symbols so the sector-exposure
   risk check can apply to them; an "unmapped symbols" helper shows which
   of your holdings/watchlist symbols still need a sector assigned.
+
+### Live Readiness (LIVE-0)
+
+Sidebar → **Live Readiness**: a read-only pre-flight that answers "is it
+safe, technically, to allow a live new entry right now?" with READY or NOT
+READY and every reason, grouped into Database, Security, Broker, Static IP,
+Market Data, Workers, Account Safety, Reconciliation and Trading Lock. Each
+row is PASS, FAIL, WARN or ACTION REQUIRED, and marked Blocking or Advisory;
+warnings (for example stale research-only data) never block. **Run broker
+check (read-only)** adds one read of your Kite account. The page never
+switches the mode or unlocks trading. When READY it shows the first-live-order
+checklist, which you tick yourself (it is never ticked for you or saved).
+READY is operational readiness only — it does not assess investment merit.
 
 ## 17. Daily Routine (Suggested)
 
@@ -356,6 +380,7 @@ auto-corrected.
 |---|---|
 | "Session expired" errors | You need to log in again — Kite requires a fresh login every trading day. |
 | Live orders rejected by broker | Your static IP is not whitelisted in the Kite Connect developer console. |
+| Live entry refused with `LIVE_PREREQUISITE_MISSING` | A live-trading prerequisite is missing (notional cap, ₹ daily loss limit, static-IP confirmation, or an unresolved UNKNOWN live order). Open Live Readiness: it lists which. |
 | A strategy signal disappeared without action | It expired — signals computed from a stale/older candle are auto-cancelled before the next scan so you never approve against stale prices. |
 | A trade shows "protection failed" | The entry order filled but the protective stop (GTT) could not be placed — place a manual stop-loss immediately in Kite or the Orders screen. |
 | A reconciliation mismatch appears | The app's records and your broker account disagree (e.g., a stop triggered outside the app). Investigate in Kite directly, then mark it reviewed once resolved. |

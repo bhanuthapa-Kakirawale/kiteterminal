@@ -177,6 +177,10 @@
         <span class="nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg></span>
         <span class="nav-label">Settings</span>
       </button>
+      <button class="nav-item" data-section-id="live-readiness">
+        <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M9 11l3 3 8-8"/><path d="M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h9"/></svg></span>
+        <span class="nav-label">Live Readiness</span>
+      </button>
       <button class="nav-item" data-section-id="diagnostics">
         <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M3 12h4l2-5 4 10 2-5h6"/></svg></span>
         <span class="nav-label">Diagnostics</span>
@@ -559,10 +563,21 @@
           <p class="page-sub">Read-only health of the terminal: readiness to trade, database, workers, calendar and data.</p>
         </div>
         <div class="page-actions">
+          <a class="btn btn-ghost btn-small" href="#live-readiness">Live Readiness</a>
           <button id="diagnostics-refresh-btn" class="btn btn-ghost btn-small" type="button">Re-check (incl. DB integrity)</button>
         </div>
       </div>
       <div id="diagnostics-root"></div>
+    </div>
+
+    <div class="view" id="view-live-readiness" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Live Readiness</h1>
+          <p class="page-sub">Pre-flight for a live new entry: is every technical precondition met right now? Read-only — it never switches the mode or unlocks trading.</p>
+        </div>
+      </div>
+      <div id="live-readiness-root"></div>
     </div>
 
     <div class="view" id="view-settings" hidden>
@@ -603,8 +618,15 @@
             <label for="rs-min-rr">Min Risk:Reward</label>
             <input id="rs-min-rr" name="min_risk_reward" type="number" step="any" min="0.01" required />
           </div>
-          <!-- PK-12: account-level limits. Empty = disabled. -->
+          <!-- PK-12: account-level limits. Empty = disabled, except that since
+               LIVE-0 a live new entry requires Max Order Value and Max Daily
+               Loss (₹) to be set. -->
           <h3 class="field field-wide form-subhead">Account safety (new live entries only — exits are never blocked)</h3>
+          <p class="field field-wide form-note">A live new entry is refused until <strong>Max Order Value</strong> and <strong>Max Daily Loss (₹)</strong> are set. Review every limit before the first live trade.</p>
+          <div class="field field-wide form-actions">
+            <button type="button" id="first-live-profile-btn" class="btn btn-outline btn-small">Fill FIRST LIVE / CAUTIOUS profile…</button>
+            <span id="first-live-profile-note" class="form-note" hidden>Profile filled in, nothing saved. Enter your own ₹ amounts for Max Order Value and Max Daily Loss, review every field, then Save. Keep the trading lock ON until Live Readiness shows READY.</span>
+          </div>
           <div class="field">
             <label for="rs-max-order-notional">Max Order Value (₹)</label>
             <input id="rs-max-order-notional" name="max_order_notional" type="number" step="any" min="0.01" placeholder="not set" />
@@ -1577,6 +1599,7 @@
   <!-- PK-19: renderers for the server-derived lifecycle; app.js uses them. -->
   <script src="/static/lifecycle.js"></script>
   <script src="/static/diagnostics.js"></script>
+  <script src="/static/readiness.js"></script>
   <script src="/static/research.js"></script>
   <script src="/static/app.js"></script>
 </body>

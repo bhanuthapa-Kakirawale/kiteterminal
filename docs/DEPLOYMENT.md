@@ -190,6 +190,7 @@ application directory, separates the two.
 | `GET /api/health` | Liveness: the process serves requests and the database answers. Always 200 while up. |
 | `GET /api/ready` | Readiness to trade: 200 when ready, **503** with `blockers` otherwise. The market does not have to be open. Blockers: schema not current or unsupported, database integrity failure, a critical worker (order monitor, trailing, reconciliation) not running, no valid Kite session for today, trading lock, open circuit breaker. |
 | `GET /api/diagnostics` | Everything the **System Diagnostics** page shows. Read-only; no broker call; no credential. |
+| `GET /api/live-readiness` | LIVE-0 **Live Readiness** pre-flight: `READY`/`NOT_READY` for a live new entry, with every check (`PASS`/`FAIL`/`WARN`/`USER_ACTION`, blocking or not). Adds to `/api/ready`: worker staleness, max order notional and ₹ daily loss set, static IP confirmed, no UNKNOWN live order, no critical reconciliation finding, strategy history current. `?broker=true` adds one read-only Kite snapshot (profile, holdings, positions, margins, orders, GTTs, one LTP). Never writes, switches mode or unlocks. |
 
 All three answer only on an allowed Host, like every other route. A supervisor
 or uptime check can poll `/api/health`; check `/api/ready` before trading.
@@ -222,7 +223,16 @@ python -m backend.db_maintenance integrity   # PRAGMA integrity_check + foreign_
 python -m backend.db_maintenance backup      # online backup to kite_terminal.db.manual_<time>_bak
 python -m backend.db_maintenance analyze     # refresh query-planner statistics
 python -m backend.db_maintenance vacuum      # compact the file (app stopped!)
+python -m backend.db_maintenance migrate     # apply pending migrations without starting the server (app stopped!)
 ```
+
+`migrate` (LIVE-0) runs exactly the application's own initialisation — the
+verified pre-migration backup, the migrations, the startup invariants — with
+no server, workers or ticker, so a migration can be done and checked
+deliberately. It loads `.env` first and refuses to run without
+`KITE_TERMINAL_ENCRYPTION_KEY`, because a newly generated key would make the
+stored Kite token unreadable. Run it twice: the second run must report
+`applied migrations: none` and `startup row changes: 0`.
 
 Nothing runs `VACUUM` automatically; `PRAGMA optimize` runs only after a
 migration was applied.
@@ -261,4 +271,5 @@ replaces it in one transaction.
 - [ ] `.env` and the DB are readable only by the service user, and the backups are protected.
 - [ ] The process runs under a supervisor with restart-on-crash, as a single instance.
 - [ ] `GET /api/ready` returns 200 (after logging in to Kite), and System Diagnostics shows no blockers.
+- [ ] **Live Readiness** (with *Run broker check*) shows nothing blocking except, deliberately, the trading lock; the static IP there is the one registered for the Kite app. Then follow [FIRST_LIVE_TRADE.md](FIRST_LIVE_TRADE.md).
 - [ ] `logs/` is on a disk with room for ~110 MB, and readable only by the service user.

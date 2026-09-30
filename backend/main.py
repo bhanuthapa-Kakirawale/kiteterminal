@@ -55,6 +55,7 @@ from backend.routes import (
     instruments as instruments_routes,
     journal as journal_routes,
     kill_switch,
+    live_readiness as live_readiness_routes,
     orders,
     portfolio,
     positions as positions_routes,
@@ -173,6 +174,7 @@ app.include_router(automation_routes.router)
 app.include_router(account_safety_routes.router)
 app.include_router(diagnostics_routes.router)
 app.include_router(data_health_routes.router)
+app.include_router(live_readiness_routes.router)
 app.include_router(volume_intelligence_routes.router)
 app.include_router(smart_money_score_routes.router)
 app.include_router(research_scanner_routes.router)

@@ -102,7 +102,7 @@ def test_brand_new_database_migrates_to_the_current_version(env):
     from backend import db
     history = _rows(env, "SELECT version, migration_name FROM schema_version ORDER BY version")
     assert [(h["version"], h["migration_name"]) for h in history] == [(v, n) for v, n, _ in db.MIGRATIONS]
-    assert history[-1]["version"] == db.LATEST_SCHEMA_VERSION == 4
+    assert history[-1]["version"] == db.LATEST_SCHEMA_VERSION == 5   # LIVE-0 added v5
     conn = env.db.get_connection()
     try:
         status = db.schema_status(conn)
@@ -130,7 +130,7 @@ def test_migration_history_is_recorded_once(env):
     for _ in range(3):
         env.db.init_db()
     rows = _rows(env, "SELECT version, COUNT(*) AS n FROM schema_version GROUP BY version")
-    assert [(r["version"], r["n"]) for r in rows] == [(1, 1), (2, 1), (3, 1), (4, 1)]
+    assert [(r["version"], r["n"]) for r in rows] == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
 
 
 @pytest.mark.parametrize("tamper", ["newer_version", "renamed_migration", "gap"])
@@ -183,8 +183,9 @@ def test_interrupted_migration_rolls_back_and_resumes(env, monkeypatch):
 
     monkeypatch.setattr(db, "MIGRATIONS", real_migrations)  # the next start resumes from v3
     db.init_db()
-    assert db.last_init["applied_migrations"] == [4]
-    assert [r["version"] for r in _rows(env, "SELECT version FROM schema_version ORDER BY version")] == [1, 2, 3, 4]
+    assert db.last_init["applied_migrations"] == [4, 5]
+    assert [r["version"] for r in _rows(env, "SELECT version FROM schema_version ORDER BY version")] == \
+        [1, 2, 3, 4, 5]
     assert "ohlc_history_status" in {r["name"] for r in _rows(env, "SELECT name FROM sqlite_master")}
 
 
@@ -194,19 +195,20 @@ def test_a_migration_that_adds_foreign_key_violations_is_refused(env, monkeypatc
     def orphaning(conn):
         conn.execute("INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (987654, 'created', 'orphan')")
 
-    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, (5, "test_orphan", orphaning)])
-    monkeypatch.setattr(db, "LATEST_SCHEMA_VERSION", 5)
+    latest = db.LATEST_SCHEMA_VERSION
+    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, (latest + 1, "test_orphan", orphaning)])
+    monkeypatch.setattr(db, "LATEST_SCHEMA_VERSION", latest + 1)
     with pytest.raises(db.DatabaseMigrationFailed, match="foreign key"):
         db.init_db()
     assert not _rows(env, "SELECT 1 FROM ticket_events WHERE ticket_id = 987654")
-    assert max(r["version"] for r in _rows(env, "SELECT version FROM schema_version")) == 4
+    assert max(r["version"] for r in _rows(env, "SELECT version FROM schema_version")) == latest
 
 
 def test_pending_migrations_on_an_existing_database_take_a_verified_backup_first(env):
     set_mode(env.db, "live")
     as_pre_pk22_database(env.db)
     env.db.init_db()
-    backups = list(_db_file(env).parent.glob("test.db.pre_schema_v4_bak*"))
+    backups = list(_db_file(env).parent.glob(f"test.db.pre_schema_v{env.db.LATEST_SCHEMA_VERSION}_bak*"))
     assert len(backups) == 1
     conn = sqlite3.connect(backups[0])
     try:
@@ -307,7 +309,7 @@ def test_an_old_database_migrates_forward_keeping_its_rows(tmp_path, monkeypatch
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     try:
-        assert [r[0] for r in conn.execute("SELECT version FROM schema_version")] == [1, 2, 3, 4]
+        assert [r[0] for r in conn.execute("SELECT version FROM schema_version")] == [v for v, _, _ in db.MIGRATIONS]
         ticket = conn.execute("SELECT * FROM trade_tickets WHERE id = 1").fetchone()
         assert (ticket["symbol"], ticket["quantity"], ticket["kite_order_id"]) == ("INFY", 7, "O-1")
         assert ticket["filled_quantity"] == 7                               # PK-13 backfill of a legacy fill
@@ -330,7 +332,7 @@ def test_an_old_database_migrates_forward_keeping_its_rows(tmp_path, monkeypatch
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         conn.close()
-    assert len(list(tmp_path.glob("legacy.db.pre_schema_v4_bak*"))) == 1
+    assert len(list(tmp_path.glob(f"legacy.db.pre_schema_v{db.LATEST_SCHEMA_VERSION}_bak*"))) == 1
 
 
 BACKUP = REPO / "backend" / "kite_terminal.db.pre_pk22_bak"
@@ -355,7 +357,7 @@ def test_a_copy_of_the_real_pre_pk22_backup_migrates(tmp_path, monkeypatch):
     db.init_db()
     after = sqlite3.connect(copy)
     try:
-        assert [r[0] for r in after.execute("SELECT version FROM schema_version")] == [1, 2, 3, 4]
+        assert [r[0] for r in after.execute("SELECT version FROM schema_version")] == [v for v, _, _ in db.MIGRATIONS]
         assert after.execute("SELECT id, symbol, quantity, status FROM trade_tickets ORDER BY id").fetchall() == \
             tickets_before
         assert after.execute("SELECT COUNT(*) FROM ohlc_daily").fetchone()[0] == ohlc_before
@@ -1026,7 +1028,7 @@ def test_connections_wait_for_a_busy_writer_instead_of_failing(env):
 def test_maintenance_cli_reports_checks_and_backs_up(env, capsys):
     from backend import db_maintenance
     assert db_maintenance.main(["status", "--db", str(_db_file(env))]) == 0
-    assert "schema:    v4 of v4" in capsys.readouterr().out
+    assert "schema:    v5 of v5" in capsys.readouterr().out
     assert db_maintenance.main(["integrity", "--db", str(_db_file(env))]) == 0
     assert "integrity_check: ok" in capsys.readouterr().out
     assert db_maintenance.main(["backup", "--db", str(_db_file(env))]) == 0
@@ -1077,7 +1079,7 @@ def test_readiness_reports_each_blocker_and_does_not_need_an_open_market(env, mo
     _exec(env, "UPDATE sessions SET login_time = '2026-01-02T09:00:00+05:30'")
     assert "BROKER_SESSION_STALE" in {b["code"] for b in env.client.get("/api/ready").json()["data"]["blockers"]}
     _exec(env, "UPDATE sessions SET login_time = ?", (datetime.now(IST).isoformat(),))
-    _exec(env, "DELETE FROM schema_version WHERE version = 4")
+    _exec(env, "DELETE FROM schema_version WHERE version = (SELECT MAX(version) FROM schema_version)")
     assert "SCHEMA_NOT_CURRENT" in {b["code"] for b in env.client.get("/api/ready").json()["data"]["blockers"]}
     monkeypatch.setattr(diagnostics, "integrity_status", lambda refresh=False: {"ok": False, "result": ["corrupt"]})
     assert "DB_INTEGRITY_FAILED" in {b["code"] for b in env.client.get("/api/ready").json()["data"]["blockers"]}
@@ -1097,10 +1099,10 @@ def test_diagnostics_report_is_complete_and_leaks_no_secret(env, monkeypatch):
     for secret in (*SENTINELS, "test_api_key", "fake-access-token"):
         assert secret not in text, secret
     data = r.json()["data"]
-    assert data["schema"]["current_version"] == 4 and data["database_integrity"]["ok"] is True
+    assert data["schema"]["current_version"] == 5 and data["database_integrity"]["ok"] is True
     assert data["broker_session"]["state"] == "VALID" and data["broker_session"]["verified_with_broker"] is False
     assert {"order_monitor", "trailing", "reconciliation"} <= set(data["workers"])
     assert data["market"]["session_state"] in ("OPEN", "CLOSED", "PRE_OPEN", "HOLIDAY", "WEEKEND")
     assert "counts" in data["historical_data"] and data["security"]["workers"] == 1
-    assert data["app"]["version"] == "pk22"
+    assert data["app"]["version"] == "live0"
     assert env.kite.calls_to("orders") == [] and env.kite.calls_to("get_gtts") == []   # no broker call

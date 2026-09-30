@@ -179,6 +179,28 @@ between pending signals without closing, there is no horizontal overflow at
 painted into a canvas, so those two are asserted through the view's own
 read-only `window.__signalDetail` handle rather than against the DOM.)
 
+**LIVE-0 — live trading pre-flight** (`tests/test_live_preflight.py`,
+`tests/test_live_readiness_ui.py` + `tests/js/render_readiness.js`): one
+`ready` fixture in which every blocking check passes, then each test breaks
+exactly one thing — schema pending/newer, integrity, broker session and
+account identity, static IP (unconfirmed / user-confirmed / verified /
+failed / stale observation), trading lock, notional and ₹ daily-loss unset,
+worker dead / stalled / failing, reconciliation stale / critical /
+reviewed / non-critical, UNKNOWN / needs-review / stale-submitting live
+orders, strategy vs research history freshness, calendar coverage. Isolation
+is proven by a digest of every table before and after (the pre-flight writes
+nothing), by FakeKite recording no mutating call, and by the read-only proxy
+refusing every mutating attribute. The confirm-time gate
+(`LIVE_PREREQUISITE_MISSING`) is tested for live refusal before any broker
+call, for dry run and exits never being blocked, and for Emergency Exit. The
+`conftest.py` `env` fixture seeds deliberately generous prerequisites
+(`seed_live_prerequisites`) so other tests' live entries are unaffected;
+`clear_live_prerequisites` removes them. `tests/fixtures/kite_payload_shapes.json`
+is the key/type structure (no values) of a real read-only Kite snapshot, and a
+test pins the fields the PK-14/15 exposure maths reads to it. The `/ws/ticks`
+handler is tested to end when a tab closes while no tick flows (the shutdown
+hang LIVE-0 fixed).
+
 ### 1.5 Known coverage gaps
 
 These are not currently exercised by automated tests — treat them as a
@@ -193,7 +215,8 @@ manually (see §2):
   known-answer tests in `tests/test_backtest_realism.py`; the ratios do not).
 - No test for dashboard panel reordering edge cases beyond a single field
   change.
-- No test of the `/ws/ticks` WebSocket tick delivery itself.
+- `/ws/ticks`: overflow (PK-22), event-before-tick ordering and ending on a
+  closed tab (LIVE-0) are tested; a live KiteTicker feed end-to-end is not.
 - No load or rate-limit test for the Kite historical-data queue.
 
 ## 2. Manual Verification Checklist
@@ -299,7 +322,9 @@ Approvals (the **Chart** link on the card) and confirm:
 ### 2.5 Live-mode-only checks (use extreme caution — real money)
 
 Only perform these with small position sizes, ideally on a test/small
-account, and only after all Dry Run checks above pass:
+account, and only after all Dry Run checks above pass. The first live order
+follows [FIRST_LIVE_TRADE.md](FIRST_LIVE_TRADE.md), starting from a Live
+Readiness page that shows nothing blocking except the trading lock:
 
 - [ ] Switching to Live requires the explicit confirmation dialog and is
       logged as a `system_events` row.

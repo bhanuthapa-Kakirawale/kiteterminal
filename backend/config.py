@@ -172,3 +172,27 @@ WORKER_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 # client reconnects and resyncs, rather than losing one.
 WS_MAX_PENDING_EVENTS = 1000
 WS_MAX_COALESCED_TOKENS = 5000
+
+# LIVE-0: a live-safety worker whose last successful cycle is older than this
+# is treated as stalled by the live preflight (backend/live_preflight.py).
+# Each worker.cycle() wraps every loop iteration, idle ones included, so a
+# healthy worker refreshes last_ok_at once per interval; the thresholds allow
+# about three missed cycles plus slack.
+WORKER_STALE_AFTER_SECONDS = {
+    "order_monitor": 3 * ORDER_MONITOR_INTERVAL_SECONDS + 60,         # 120 s
+    "order_monitor_paper": 3 * ORDER_MONITOR_INTERVAL_SECONDS + 60,   # 120 s
+    "trailing": 3 * TRAILING_CHECK_INTERVAL_SECONDS + 45,             # 180 s
+    "reconciliation": 3 * RECONCILIATION_INTERVAL_SECONDS + 60,       # 600 s
+}
+
+# LIVE-0: one read-only broker snapshot is reused for this long, so repeated
+# preflight refreshes do not repeat the six broker reads.
+PREFLIGHT_BROKER_SNAPSHOT_CACHE_SECONDS = 30
+
+# LIVE-0: the deliberate, user-triggered outbound-IP observation (a plain
+# HTTPS GET that returns the caller's public IP as text).
+EGRESS_IP_ECHO_URL = "https://api.ipify.org"
+EGRESS_IP_TIMEOUT_SECONDS = 5.0
+# An outbound-IP observation older than this no longer counts either way:
+# the machine (or its NAT) may have changed since.
+EGRESS_OBSERVATION_MAX_AGE_HOURS = 24

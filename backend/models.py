@@ -81,6 +81,13 @@ class BreakerResetRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 
+class StaticIpConfirmRequest(BaseModel):
+    # LIVE-0: the user's statement that `ip` is the static IP whitelisted in
+    # the Kite developer console. `confirm` must be true: never implied.
+    ip: str = Field(max_length=64)
+    confirm: bool = False
+
+
 class TicketEditRequest(BaseModel):
     # Same shape as TicketCreateRequest — a full replace, only ever allowed
     # server-side when the ticket's current status is 'draft'. Same PK-17

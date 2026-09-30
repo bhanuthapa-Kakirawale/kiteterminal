@@ -5,10 +5,12 @@
     python -m backend.db_maintenance backup      online backup to kite_terminal.db.manual_<time>_bak
     python -m backend.db_maintenance analyze     refresh query-planner statistics (ANALYZE)
     python -m backend.db_maintenance vacuum      compact the file — STOP THE APP FIRST
+    python -m backend.db_maintenance migrate     apply pending migrations — STOP THE APP FIRST
 
-None of these migrates the schema: that happens only when the app starts
-(backend/db.init_db, with its own pre-migration backup). `--db PATH` points
-any command at another file (for example a copy).
+Only `migrate` changes the schema, and it runs exactly what an app start
+runs (backend/db.init_db, with its own verified pre-migration backup), minus
+the server and workers (LIVE-0). `--db PATH` points any command at another
+file (for example a copy).
 """
 
 import argparse
@@ -26,15 +28,53 @@ def _connect(path: Path):
     return conn
 
 
+def migrate(path: Path) -> int:
+    """LIVE-0: bring a database current deliberately, without starting the
+    server, the workers or the ticker — exactly the application's own
+    initialisation (backend/db.init_db: the verified pre-migration backup,
+    the ordered migrations, the startup invariants). STOP THE APP FIRST.
+
+    The encryption key must come from .env: init_db() would otherwise mint a
+    new key, and the stored (encrypted) Kite token could never be read again.
+    """
+    import os
+
+    from dotenv import load_dotenv
+
+    from backend import crypto
+    load_dotenv(crypto.ENV_PATH)
+    if not os.environ.get(crypto.ENV_VAR):
+        print(f"{crypto.ENV_VAR} is not set (no .env at {crypto.ENV_PATH}): refusing to migrate — a new key "
+              f"would make the stored Kite token unreadable.", file=sys.stderr)
+        return 2
+    db.DB_PATH = path
+    conn = _connect(path)
+    try:
+        before = db.schema_status(conn)
+    finally:
+        conn.close()
+    if not before["supported"]:
+        print(f"refused: {before['error']}", file=sys.stderr)
+        return 1
+    db.init_db()
+    print(f"database:            {path}")
+    print(f"schema:              v{before['current_version']} -> v{db.last_init['schema_version']}")
+    print(f"applied migrations:  {db.last_init['applied_migrations'] or 'none'}")
+    print(f"startup row changes: {db.last_init['startup_row_changes']}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m backend.db_maintenance")
-    parser.add_argument("command", choices=["status", "integrity", "backup", "analyze", "vacuum"])
+    parser.add_argument("command", choices=["status", "integrity", "backup", "analyze", "vacuum", "migrate"])
     parser.add_argument("--db", type=Path, default=db.DB_PATH, help="database file (default: the app's)")
     args = parser.parse_args(argv)
     path: Path = args.db
     if not path.exists():
         print(f"No database at {path}", file=sys.stderr)
         return 2
+    if args.command == "migrate":
+        return migrate(path)
     conn = _connect(path)
     try:
         if args.command == "status":

@@ -1642,6 +1642,50 @@ body.sd-open { overflow: hidden; }
 .diag-row-bad td { color: var(--pnl-negative); }
 #view-diagnostics h3 { font-size: 0.9rem; margin: 8px 0 4px; }
 
+/* LIVE-0: Live Readiness (read-only pre-flight). READY is deliberately the
+   neutral accent, not P&L green: it is operational readiness, not a signal. */
+.form-note { color: var(--text-secondary); font-size: 12.5px; margin: 4px 0 0; line-height: 1.5; }
+.rd-verdict { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; padding: 12px 16px;
+  border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 8px; }
+.rd-verdict strong { font-size: 15px; letter-spacing: 0.02em; }
+.rd-ready { background: var(--accent-soft); color: var(--text-primary); border-color: var(--accent); }
+.rd-lock { background: var(--accent-amber-bg); color: var(--accent-amber); }
+.rd-not-ready { background: var(--pnl-negative-bg); color: var(--pnl-negative); }
+.rd-disclaimer { margin: 0 0 4px; font-size: 12.5px; color: var(--text-secondary); font-style: italic; }
+.rd-meta { margin: 0 0 10px; font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; }
+.rd-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0 12px; }
+.rd-section summary { display: flex; align-items: center; gap: 10px; }
+.rd-issues { margin: 4px 0 8px; padding-left: 20px; }
+.rd-issues li { margin: 4px 0; overflow-wrap: anywhere; }
+.rd-none { color: var(--text-secondary); margin: 4px 0 8px; }
+.rd-error { color: var(--pnl-negative); }
+.rd-table { width: 100%; min-width: 0; table-layout: fixed; }   /* overrides the global table min-width */
+.rd-table th { cursor: default; }
+.rd-table th:nth-child(1), .rd-table td:nth-child(1) { width: 136px; }
+.rd-table th:nth-child(2), .rd-table td:nth-child(2) { width: 84px; }
+.rd-msg { overflow-wrap: anywhere; line-height: 1.45; }
+.rd-kind { color: var(--text-muted); font-size: 12px; }
+.rd-row-bad .rd-msg { color: var(--pnl-negative); }
+.rd-chip { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
+  letter-spacing: 0.03em; border: 1px solid var(--border); white-space: nowrap; }
+.rd-chip-pass { color: var(--text-secondary); }
+.rd-chip-warn, .rd-chip-user_action { color: var(--accent-amber); background: var(--accent-amber-bg); }
+.rd-chip-fail { color: var(--pnl-negative); background: var(--pnl-negative-bg); }
+.rd-link { color: var(--accent); white-space: nowrap; }
+.rd-ip, .rd-checklist { border-top: 1px solid var(--border); margin-top: 10px; padding-top: 10px; }
+.rd-ip-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+.rd-ip-row input { max-width: 260px; flex: 1 1 180px; }
+.rd-tick { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0; line-height: 1.4; }
+.rd-tick input { margin-top: 3px; flex: none; }
+.rd-help, .rd-facts, .rd-ip-status { font-size: 12.5px; color: var(--text-secondary); margin: 4px 0; overflow-wrap: anywhere; }
+.rd-ip-status { color: var(--pnl-negative); }
+@media (max-width: 600px) {
+  .rd-table, .rd-table tbody, .rd-table tr, .rd-table td { display: block; width: 100% !important; }
+  .rd-table thead { display: none; }
+  .rd-table tr { padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .rd-table td { padding: 2px 0; border: 0; height: auto; }
+}
+
 /* ---------------------------------------------------------------- PK-26 price-volume research
    Research view. Neutral colours only: the score and every evidence value use
    the ordinary text colour — no P&L green/red, no badge for a high score. */

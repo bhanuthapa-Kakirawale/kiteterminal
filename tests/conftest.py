@@ -61,6 +61,40 @@ def seed_ohlc(db, instrument_token: int, symbol: str, candles: list[dict]) -> No
         conn.close()
 
 
+# LIVE-0: a live NEW entry now requires an absolute notional cap, a rupee
+# daily loss limit and a confirmed static IP (account_safety.
+# check_live_prerequisites). Every test database gets deliberately generous
+# ones, so tests about other behaviour are unaffected; the LIVE-0 tests
+# (test_live_preflight.py) clear them to test the gate itself. 203.0.113.10
+# is a documentation address (TEST-NET-3), never a real one.
+TEST_STATIC_IP = "203.0.113.10"
+GENEROUS_NOTIONAL = 1_000_000_000.0
+GENEROUS_DAILY_LOSS = 1_000_000_000.0
+
+
+def seed_live_prerequisites(db) -> None:
+    conn = db.get_connection()
+    try:
+        account_id = conn.execute("SELECT id FROM accounts WHERE is_default = 1").fetchone()["id"]
+        conn.execute("UPDATE risk_settings SET max_order_notional = ?, max_daily_loss_amount = ? WHERE account_id = ?",
+                     (GENEROUS_NOTIONAL, GENEROUS_DAILY_LOSS, account_id))
+        conn.execute("INSERT OR REPLACE INTO live_readiness (account_id, static_ip, static_ip_confirmed_at) "
+                     "VALUES (?, ?, datetime('now'))", (account_id, TEST_STATIC_IP))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_live_prerequisites(db) -> None:
+    conn = db.get_connection()
+    try:
+        conn.execute("UPDATE risk_settings SET max_order_notional = NULL, max_daily_loss_amount = NULL")
+        conn.execute("DELETE FROM live_readiness")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def add_watch(db, symbol: str, instrument_token: int) -> None:
     conn = db.get_connection()
     try:
@@ -101,6 +135,7 @@ def env(tmp_path, monkeypatch):
         conn.commit()
     finally:
         conn.close()
+    seed_live_prerequisites(db)
 
     fake = FakeKite(
         holdings=[{
@@ -196,5 +231,5 @@ def ticket_row(db, ticket_id: int) -> dict:
 
 
 __all__ = ["FakeKite", "make_candles", "seed_ohlc", "add_watch", "account_id", "set_mode", "displayed_mode", "ticket_row",
-           "as_pre_pk22_database",
+           "as_pre_pk22_database", "seed_live_prerequisites", "clear_live_prerequisites", "TEST_STATIC_IP",
            "last_weekday", "IST", "TERMINAL_ORIGIN", "TERMINAL_HEADERS", "terminal_client"]

@@ -94,7 +94,8 @@ def test_1_2_clean_database_restarts_without_schema_churn(env):
     _restart(env)
     after = sqlite3.connect(env.db.DB_PATH).execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall()
     assert before == after
-    assert [r["version"] for r in _rows(env, "SELECT version FROM schema_version")] == [1, 2, 3, 4]
+    assert [r["version"] for r in _rows(env, "SELECT version FROM schema_version")] == \
+        [v for v, _, _ in env.db.MIGRATIONS]
 
 
 def test_3_pending_live_order_survives_and_is_never_resubmitted(env, market_open):
