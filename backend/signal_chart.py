@@ -20,7 +20,8 @@ from datetime import date
 
 import pandas as pd
 
-from backend import config, execution, indicators, kite_chart, market, trading_calendar
+from backend import config, execution, indicators, kite_chart, market, trading_calendar, volume_intelligence
+from backend.db import get_connection
 from backend.strategies import STRATEGIES
 
 logger = logging.getLogger(__name__)
@@ -380,6 +381,30 @@ def _exit_plan(ticket: dict, module, params: dict) -> dict:
     return {"trailing": trailing, "shared_rules": rules}
 
 
+def _volume_context(ticket: dict, module, params: dict) -> dict | None:
+    """PK-23 volume features as of the SIGNAL bar (not today's), with the
+    strategy's own volume rule alongside. Context only — it plays no part in
+    the signal, its sizing or its risk checks. A failure here degrades this
+    one section; it must never take the rest of the evidence panel down."""
+    token = ticket.get("instrument_token")
+    if not token:
+        return None
+    try:
+        conn = get_connection()
+        try:
+            return volume_intelligence.features_for_instrument(
+                conn, token, ticket["symbol"], as_of=ticket.get("signal_date"),
+                strategy=module.STRATEGY_NAME if module is not None else None, params=params,
+            )
+        finally:
+            conn.close()
+    except Exception:
+        logger.exception("Volume features failed for ticket %s", ticket.get("id"))
+        return {"data_quality": {"status": volume_intelligence.UNAVAILABLE, "codes": ["COMPUTATION_FAILED"]},
+                "warnings": ["Volume features could not be computed for this signal."],
+                "interpretation": ["Volume features could not be computed for this signal."]}
+
+
 def build_payload(ticket: dict, settings=None) -> dict:
     """The whole Signal Detail payload for one ticket.
 
@@ -481,6 +506,7 @@ def build_payload(ticket: dict, settings=None) -> dict:
         },
         "bars_available": bars_available,
         "diagnostic": diagnostic,
+        "volume_intelligence": _volume_context(ticket, module, params),
     }
 
 

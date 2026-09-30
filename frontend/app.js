@@ -5138,6 +5138,96 @@ function sdRankLine(rank) {
     barely ? " This one only just made the cut." : ""}</p>`;
 }
 
+// PK-23 — volume context. Descriptive only: none of these numbers took part
+// in the signal, its sizing or its risk checks. Every value is set through
+// esc()/fmt(); the wording comes from the server's factual interpretation.
+function sdVolumeRow(label, value, context, note) {
+  return `<div class="sd-calc-row">
+    <span class="sd-calc-label">${esc(label)}</span>
+    <span class="sd-calc-formula">${esc(context || "")}</span>
+    <strong class="sd-calc-value">${esc(value)}</strong>
+    ${note ? `<div class="sd-calc-note">${esc(note)}</div>` : ""}
+  </div>`;
+}
+
+function sdTimes(x) {
+  return x == null ? "—" : `${fmt(x, 2)}×`;
+}
+
+function sdCrore(x) {
+  return x == null ? "—" : `₹${fmt(x / 1e7, 2)} cr`;
+}
+
+function sdOrdinal(n) {
+  const s = n % 100 >= 11 && n % 100 <= 13 ? "th" : ({ 1: "st", 2: "nd", 3: "rd" }[n % 10] || "th");
+  return `${n}${s}`;
+}
+
+function sdVolumeHtml(v) {
+  if (!v) {
+    return `<p class="muted-note">No stored price history is linked to this ticket, so there is no volume
+      context to show.</p>`;
+  }
+  const quality = v.data_quality || {};
+  const banner = quality.status && quality.status !== "OK"
+    ? `<div class="sd-warn ${quality.status === "UNAVAILABLE" ? "warn" : "info"}">
+        <strong>${quality.status === "UNAVAILABLE" ? "Volume features unavailable." : "Partial volume features."}</strong>
+        ${(v.warnings || []).map(esc).join(" ")}</div>`
+    : "";
+  if (quality.status === "UNAVAILABLE" || !v.relative_volume) return banner;
+
+  const rv = v.relative_volume, liq = v.liquidity, st = v.structure, obv = v.obv;
+  const ev = v.evidence, con = v.contraction, pb = v.pullback, bo = v.breakout;
+  const rows = [];
+  rows.push(sdVolumeRow("RVOL20", sdTimes(rv.rvol_20), "vs prior 20 sessions (signal bar excluded)"));
+  rows.push(sdVolumeRow("RVOL20 (median)", sdTimes(rv.rvol_median_20), "vs the prior-20 median"));
+  rows.push(sdVolumeRow("Volume percentile", rv.volume_percentile_60 == null ? "—"
+    : sdOrdinal(Math.round(rv.volume_percentile_60)), "of the prior 60 sessions"));
+  rows.push(sdVolumeRow("Traded value", sdCrore(liq.traded_value),
+    `20-session avg ${sdCrore(liq.avg_traded_value_20)}`,
+    liq.liquidity_warning ? `Below the ${sdCrore(liq.low_liquidity_threshold)} low-liquidity analytics threshold.` : null));
+  rows.push(sdVolumeRow("Close location", st.close_location == null ? "—" : fmt(st.close_location, 2),
+    "1.00 = closed at the high, 0.00 = at the low"));
+  const divergence = {
+    obv_leads_price: "OBV at a 20-session high, price not",
+    price_unconfirmed: "price at a 20-session high, OBV not",
+    confirmed: "OBV and price both at 20-session highs",
+    none: "",
+  }[obv.divergence] || "";
+  rows.push(sdVolumeRow("OBV trend (20)", obv.trend == null ? "—" : `${obv.trend} (${fmt(obv.slope_20, 2)})`,
+    divergence));
+  rows.push(sdVolumeRow("Accumulation- / distribution-like",
+    ev.accumulation_like_10 == null ? "—" : `${ev.accumulation_like_10} / ${ev.distribution_like_10}`,
+    ev.accumulation_like_20 == null ? "last 10 sessions"
+      : `last 10 sessions (${ev.accumulation_like_20} / ${ev.distribution_like_20} over 20)`));
+  rows.push(sdVolumeRow("Volume contraction", sdTimes(con.contraction_ratio_5_20),
+    con.contraction_ratio_5_20 == null ? "prior-5 vs prior-20 average"
+      : `prior-5 vs prior-20 average — ${con.pre_breakout_volume_contraction ? "contracting" : "not contracting"}`));
+  if (bo && bo.is_breakout) {
+    rows.push(sdVolumeRow("Breakout participation", sdTimes(bo.volume_ratio),
+      `close ${fmt(bo.close_above_level_pct, 2)}% above the prior ${bo.lookback}-session closing high; `
+      + `close location ${bo.close_quality == null ? "—" : fmt(bo.close_quality, 2)}`));
+  }
+  if (pb && pb.in_pullback && pb.pullback_volume_ratio != null) {
+    rows.push(sdVolumeRow("Pullback volume", sdTimes(pb.pullback_volume_ratio),
+      `${pb.pullback_bars} session(s), ${fmt(Math.abs(pb.pullback_depth_pct), 1)}% off the 20-session high; `
+      + `this bar ${sdTimes(pb.recovery_volume_ratio)} the pullback's volume`));
+  }
+  const cmp = v.strategy_comparison;
+  const rule = cmp && cmp.has_volume_rule
+    ? `<p class="sd-vi-rule">Strategy rule: ${esc(sdTimes(cmp.legacy_multiple))} its 20-day average
+        <em>including</em> the signal bar (needs more than ${esc(sdTimes(cmp.required_multiple))},
+        ${cmp.legacy_pass ? "met" : "not met"}); prior-only RVOL20 is ${esc(sdTimes(cmp.rvol_20_prior_only))}.</p>`
+    : (cmp ? `<p class="sd-vi-rule">${esc(cmp.rule)}</p>` : "");
+  const summary = (v.interpretation || []).length
+    ? `<details class="sd-vi-summary"><summary>In words</summary><ul>${
+      v.interpretation.map((line) => `<li>${esc(line)}</li>`).join("")}</ul></details>`
+    : "";
+  return `${banner}${rows.join("")}${rule}${summary}
+    <p class="sd-vi-foot">As of the ${esc(v.as_of_date || "—")} candle · feature v${esc(v.feature_version)} ·
+      descriptive measurements, not part of the signal.</p>`;
+}
+
 function sdRenderEvidence() {
   const d = sd.data;
   const t = sd.ticket;
@@ -5156,6 +5246,9 @@ function sdRenderEvidence() {
     ? d.conditions.map(sdConditionRowHtml).join("")
     : `<p class="muted-note">This ticket was not produced by a strategy scan, so there are no
        entry conditions to show.</p>`));
+
+  // PK-23 — VOLUME CONTEXT at the signal bar (context, never a condition).
+  sections.push(sdSection("volume", "Volume context", sdVolumeHtml(d.volume_intelligence)));
 
   // D3 — RISK CHECKS, expanded from the card's "6/6" badge, rendered through
   // the same rows the confirm dialog uses.

@@ -63,6 +63,7 @@ from backend.routes import (
     strategies as strategies_routes,
     tickets,
     ui_prefs,
+    volume_intelligence as volume_intelligence_routes,
     watchlist as watchlist_routes,
     ws,
 )
@@ -170,6 +171,7 @@ app.include_router(automation_routes.router)
 app.include_router(account_safety_routes.router)
 app.include_router(diagnostics_routes.router)
 app.include_router(data_health_routes.router)
+app.include_router(volume_intelligence_routes.router)
 
 # Registered innermost first; each add_middleware wraps the previous, so a
 # request meets them in reverse order: security headers, then the Host check

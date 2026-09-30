@@ -153,6 +153,11 @@ SQLITE_BUSY_TIMEOUT_SECONDS = 10.0
 # back-adjusted the history (split/bonus): the symbol is marked NEEDS_REFRESH.
 HISTORY_ADJUSTMENT_TOLERANCE_PCT = 2.0
 
+# PK-23: the 20-session average traded value (close x volume, in rupees)
+# below which Volume Intelligence reports a low-liquidity warning. Analytics
+# only: nothing rejects, sizes or ranks a trade by it.
+VOLUME_INTEL_LOW_LIQUIDITY_INR = 5_00_00_000  # Rs 5 crore/day
+
 # PK-22E: rotating log file (enabled by the launcher, KITE_TERMINAL_LOG_FILE).
 # Disk use is bounded at LOG_FILE_MAX_BYTES x (LOG_FILE_BACKUP_COUNT + 1).
 LOG_FILE_MAX_BYTES = 10 * 1024 * 1024
