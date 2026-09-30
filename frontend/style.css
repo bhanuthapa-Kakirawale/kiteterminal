@@ -1641,3 +1641,58 @@ body.sd-open { overflow: hidden; }
 .diag-kv td:first-child { width: 40%; color: var(--text-secondary); font-weight: 500; }
 .diag-row-bad td { color: var(--pnl-negative); }
 #view-diagnostics h3 { font-size: 0.9rem; margin: 8px 0 4px; }
+
+/* ---------------------------------------------------------------- PK-26 price-volume research
+   Research view. Neutral colours only: the score and every evidence value use
+   the ordinary text colour — no P&L green/red, no badge for a high score. */
+.vr-notice { border: 1px solid var(--border); background: var(--surface-2); border-radius: var(--radius); padding: 10px 14px; margin-bottom: 12px; font-size: 12.5px; line-height: 1.55; color: var(--text-secondary); }
+.vr-notice p { margin: 0 0 4px; }
+.vr-notice strong { color: var(--text-primary); }
+.vr-validation { display: block; }
+.vr-disclaimer { font-style: italic; color: var(--text-secondary); font-size: 12px; margin: 6px 0 0; }
+.vr-controls { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+.vr-asof { max-width: 200px; }
+.vr-asof input { height: 32px; border: 1px solid var(--border-strong); border-radius: var(--radius); padding: 0 8px; background: var(--surface-2); }
+.vr-presets { display: flex; flex-wrap: wrap; gap: 6px; }
+.vr-preset { font: inherit; font-size: 12px; padding: 5px 10px; border-radius: 999px; border: 1px solid var(--border-strong); background: var(--surface-2); color: var(--text-secondary); cursor: pointer; }
+.vr-preset:hover { color: var(--text-primary); }
+.vr-preset.active { border-color: var(--accent); color: var(--text-primary); box-shadow: 0 0 0 2px var(--accent-soft); }
+.vr-preset-def { font-size: 12px; color: var(--text-secondary); margin: 6px 0 0; }
+.vr-conds { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; margin-top: 2px; }
+.vr-filters { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px 12px; }
+.vr-filters .field, .vr-sms-filter .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.vr-sms-filter { border: 1px dashed var(--border-strong); border-radius: var(--radius); margin: 10px 0; padding: 6px 12px 10px; }
+.vr-sms-filter legend { font-size: 11.5px; color: var(--text-secondary); padding: 0 4px; }
+.vr-sms-filter .filter-row { display: grid; grid-template-columns: repeat(2, minmax(0, 140px)); gap: 10px; }
+.vr-inline-warn { font-size: 12px; margin: 8px 0 0; padding: 6px 9px; border-radius: var(--radius); background: var(--accent-amber-bg); border: 1px solid var(--accent-amber); color: var(--text-primary); }
+.vr-status { font-size: 12px; color: var(--text-secondary); margin: 6px 0 8px; overflow-wrap: anywhere; }
+.vr-table-wrap { max-width: 100%; }
+.vr-table { min-width: 980px; font-size: 12.5px; }
+.vr-table th.vr-nosort { cursor: default; }
+.vr-row { cursor: pointer; }
+.vr-row:focus-visible td { outline: 2px solid var(--accent); outline-offset: -2px; }
+.vr-unavailable td { color: var(--text-muted); }
+.vr-sym { font-weight: 700; }
+.vr-sub { font-size: 11px; color: var(--text-muted); font-weight: 400; }
+.vr-sms { color: var(--text-primary); font-weight: 400; }
+.vr-signal { display: inline-block; margin-top: 3px; font-size: 10.5px; font-weight: 500; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border-strong); color: var(--text-secondary); }
+.vr-warncount { font-size: 11px; color: var(--text-secondary); cursor: help; }
+.vr-empty { text-align: center; color: var(--text-secondary); font-weight: 400; }
+.vr-detail-dialog { max-width: 760px; }
+.vr-detail h2 { margin-bottom: 4px; }
+.vr-detail h3 { font-size: 13px; margin: 14px 0 6px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-secondary); }
+.vr-detail h4 { font-size: 12px; margin: 8px 0 4px; }
+.vr-kv { display: grid; grid-template-columns: minmax(120px, 34%) 1fr; gap: 10px; padding: 5px 0; border-bottom: 1px solid var(--border); font-size: 12.5px; }
+.vr-k { color: var(--text-secondary); }
+.vr-v { overflow-wrap: anywhere; }
+.vr-reasons, .vr-contrib { margin: 4px 0; padding-left: 18px; font-size: 12px; line-height: 1.5; color: var(--text-secondary); }
+.vr-pts { font-variant-numeric: tabular-nums; color: var(--text-primary); }
+.vr-sms-line { font-size: 13px; margin: 4px 0; }
+.vr-validation-box { border: 1px solid var(--border); background: var(--surface-2); border-radius: var(--radius); padding: 8px 12px; margin-top: 10px; font-size: 12px; }
+.vr-validation-box p { margin: 0 0 4px; color: var(--text-secondary); }
+.vr-validation-box strong { color: var(--text-primary); }
+.vr-words summary { cursor: pointer; font-size: 12px; color: var(--text-secondary); margin-top: 8px; }
+@media (max-width: 600px) {
+  .vr-kv { grid-template-columns: 1fr; gap: 2px; }
+  .vr-asof { max-width: none; }
+}

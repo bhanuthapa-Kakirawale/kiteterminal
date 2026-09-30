@@ -59,6 +59,7 @@ from backend.routes import (
     portfolio,
     positions as positions_routes,
     reconciliation as reconciliation_routes,
+    research_scanner as research_scanner_routes,
     risk,
     smart_money_score as smart_money_score_routes,
     strategies as strategies_routes,
@@ -174,6 +175,7 @@ app.include_router(diagnostics_routes.router)
 app.include_router(data_health_routes.router)
 app.include_router(volume_intelligence_routes.router)
 app.include_router(smart_money_score_routes.router)
+app.include_router(research_scanner_routes.router)
 
 # Registered innermost first; each add_middleware wraps the previous, so a
 # request meets them in reverse order: security headers, then the Host check

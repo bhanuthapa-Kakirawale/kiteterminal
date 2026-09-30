@@ -155,6 +155,10 @@
         <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9L12 3Z"/></svg></span>
         <span class="nav-label">Watchlist</span>
       </button>
+      <button class="nav-item" data-section-id="volume-research" hidden>
+        <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 20V10M9 20V4M14 20v-7M19 20v-4"/></svg></span>
+        <span class="nav-label">Price-Volume Research</span>
+      </button>
       <button class="nav-item" data-section-id="strategies" hidden>
         <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg></span>
         <span class="nav-label">Strategies</span>
@@ -828,6 +832,26 @@
       <div id="watchlist-empty-note" class="banner banner-neutral" hidden>
         No panels visible — turn on Customize layout and use Add Panel.
       </div>
+    </div>
+    <!-- PK-26: research / exploration only — descriptive evidence, no ranking. -->
+    <div class="view" id="view-volume-research" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Price-Volume Research</h1>
+          <p class="page-sub">Explore price-volume evidence across the watchlist.</p>
+        </div>
+        <div class="page-actions">
+          <button id="vr-reload-btn" class="btn btn-ghost btn-small" type="button">Reload</button>
+          <a id="vr-export-link" class="btn btn-ghost btn-small" href="/api/research/volume-scan.csv" download>Export CSV</a>
+        </div>
+      </div>
+      <div id="volume-research-root"></div>
+      <dialog id="vr-detail-dialog" class="vr-detail-dialog" aria-label="Price-volume evidence">
+        <div id="vr-detail-body"></div>
+        <div class="dialog-actions">
+          <button id="vr-detail-close-btn" class="btn" type="button">Close</button>
+        </div>
+      </dialog>
     </div>
     <div class="view" id="view-strategies" hidden>
       <div class="page-head">
@@ -1553,6 +1577,7 @@
   <!-- PK-19: renderers for the server-derived lifecycle; app.js uses them. -->
   <script src="/static/lifecycle.js"></script>
   <script src="/static/diagnostics.js"></script>
+  <script src="/static/research.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

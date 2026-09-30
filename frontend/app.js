@@ -4059,6 +4059,7 @@ const SECTIONS = [
   { id: "ticket-history", el: document.getElementById("view-ticket-history") },
   { id: "orders-trades", el: document.getElementById("view-orders-trades") },
   { id: "watchlist", el: document.getElementById("view-watchlist") },
+  { id: "volume-research", el: document.getElementById("view-volume-research") },
   { id: "strategies", el: document.getElementById("view-strategies") },
   { id: "todays-actions", el: document.getElementById("view-todays-actions") },
   { id: "journal", el: document.getElementById("view-journal") },
@@ -4080,8 +4081,17 @@ function showSection(id) {
   if (id === "orders-trades") refreshOrderBooks();
   if (id === "positions") loadAppPositions();
   if (id === "diagnostics") window.KTDiagnostics.load(document.getElementById("diagnostics-root"));
+  if (id === "volume-research") window.KTResearch.load(document.getElementById("volume-research-root"));
   window.scrollTo({ top: 0 });
 }
+
+// PK-26: Price-Volume Research — reload re-reads the batch; the detail dialog closes.
+document.getElementById("vr-reload-btn").addEventListener("click", () => {
+  window.KTResearch.load(document.getElementById("volume-research-root"));
+});
+document.getElementById("vr-detail-close-btn").addEventListener("click", () => {
+  document.getElementById("vr-detail-dialog").close();
+});
 
 // PK-22H: re-check forces a fresh database integrity check.
 document.getElementById("diagnostics-refresh-btn").addEventListener("click", () => {
@@ -4102,7 +4112,7 @@ window.addEventListener("hashchange", () => {
 function revealTradingNavItems() {
   for (const id of [
     "approvals", "new-ticket", "ticket-history", "orders-trades", "settings", "watchlist", "strategies",
-    "trade-queue", "todays-actions", "journal", "positions",
+    "trade-queue", "todays-actions", "journal", "positions", "volume-research",
   ]) {
     const btn = document.querySelector(`.nav-item[data-section-id="${id}"]`);
     if (btn) btn.hidden = false;
