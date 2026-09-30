@@ -1,0 +1,150 @@
+{
+  "classification_inputs": {
+    "dic": -0.063459,
+    "dic_hi": 0.056293,
+    "dic_lo": -0.175936,
+    "filter60_dd_ratio": 0.893406,
+    "filter60_expectancy_delta": 0.3016,
+    "h2_diff": 0.085,
+    "n10": 97,
+    "rho10": -0.11723,
+    "rho10_hi": 0.176061,
+    "rho10_lo": -0.324809,
+    "strat_neg": 3,
+    "strat_pos": 0,
+    "wf_mean_dic": -0.219011,
+    "wf_share_dic_pos": 0.333333,
+    "wf_share_h2_pos": 0.5,
+    "wf_share_rho_neg": 0.333333,
+    "wf_share_rho_pos": 0.666667
+  },
+  "classification_preview_note": "No classification is issued before the holdout; the criteria are applied once, to holdout results.",
+  "experiment": "PK-25 smart money score v1.0 out-of-sample validation",
+  "filter_summary": {
+    "all": {
+      "expectancy_r": 0.1164,
+      "max_drawdown_pct": 1.7243,
+      "total_net_r": 8.6158,
+      "trades": 74
+    },
+    "score>=60": {
+      "expectancy_r": 0.418,
+      "max_drawdown_pct": 1.5405,
+      "total_net_r": 19.6454,
+      "trades": 47
+    },
+    "score>=75": {
+      "expectancy_r": 0.0262,
+      "max_drawdown_pct": 1.4434,
+      "total_net_r": 0.9422,
+      "trades": 36
+    }
+  },
+  "headline_set": "validation",
+  "hypotheses": {
+    "H1": {
+      "ci_high": 0.176061,
+      "ci_low": -0.324809,
+      "n": 97,
+      "p_boot_greater": 0.771114,
+      "p_boot_less": 0.229385,
+      "p_naive_two_sided": 0.253523,
+      "rho": -0.11723
+    },
+    "H2": {
+      "ci_high": 2.5845,
+      "ci_low": -5.0282,
+      "diff": 0.085,
+      "n_a": 36,
+      "n_b": 24,
+      "p_boot_greater": 0.598701,
+      "p_boot_less": 0.401799
+    },
+    "H3": {
+      "ci_high": 0.056293,
+      "ci_low": -0.175936,
+      "delta_ic": -0.063459,
+      "p_boot_greater": 0.851574,
+      "wf_folds": 3,
+      "wf_mean_delta_ic": -0.219011,
+      "wf_share_delta_ic_positive": 0.333333
+    },
+    "H4": {
+      "mae": {
+        "ci_high": 0.041497,
+        "ci_low": -0.38786,
+        "n": 97,
+        "p_boot_greater": 0.955522,
+        "p_boot_less": 0.044978,
+        "p_naive_two_sided": 0.02557,
+        "rho": -0.226297
+      },
+      "mfe": {
+        "ci_high": 0.165922,
+        "ci_low": -0.30907,
+        "n": 97,
+        "p_boot_greater": 0.711644,
+        "p_boot_less": 0.288856,
+        "p_naive_two_sided": 0.365207,
+        "rho": -0.093123
+      }
+    },
+    "H5": {
+      "per_strategy": {
+        "momentum_breakout": {
+          "n": 36,
+          "rho": -0.308276
+        },
+        "rsi_mean_reversion": {
+          "n": 23,
+          "rho": -0.361118
+        },
+        "trend_pullback": {
+          "n": 38,
+          "rho": -0.121355
+        }
+      },
+      "strategies_eligible": 3,
+      "strategies_negative": 3,
+      "strategies_positive": 0,
+      "wf_folds": 3,
+      "wf_share_h2_positive": 0.5,
+      "wf_share_rho_negative": 0.333333,
+      "wf_share_rho_positive": 0.666667
+    },
+    "primary_p_holm": {
+      "H1": 1.0,
+      "H2": 1.0,
+      "H3": 1.0
+    },
+    "primary_p_one_sided": {
+      "H1": 0.771114,
+      "H2": 0.598701,
+      "H3": 0.851574
+    }
+  },
+  "segment_counts": {
+    "development": {
+      "eligible": 178,
+      "eligible_unpurged_with_ret10": 160,
+      "purged": 18,
+      "signals": 181
+    },
+    "holdout": {
+      "eligible": 102,
+      "signals": 102
+    },
+    "validation": {
+      "eligible": 127,
+      "eligible_unpurged_with_ret10": 97,
+      "purged": 30,
+      "signals": 127
+    }
+  },
+  "splits": {
+    "holdout_start": "2026-02-01",
+    "rule": "first day of the month nearest the (0.45, 0.7) quantiles of eligible signal dates",
+    "validation_start": "2025-09-01"
+  },
+  "stage": "pre_holdout"
+}

@@ -1,0 +1,10 @@
+eval_set,strategy,scenario,period_start,period_end,evaluable_signals,evaluable_signals_filtered_out,trades,net_pnl,net_return_pct,net_cagr_pct,total_net_r,expectancy_r,win_rate,profit_factor,max_drawdown_pct,exposure_pct,time_in_market_pct,skipped_signals,missed_winners,avoided_losers
+holdout,momentum_breakout,all,2026-02-01,2026-09-22,43,0,28,26483.43,2.6483,,5.2239,0.1866,0.571429,1.745719,1.8981,16.9564,91.8239,11,0,0
+holdout,momentum_breakout,score>=60,2026-02-01,2026-09-22,43,5,26,23989.06,2.3989,,4.7038,0.1809,0.538462,1.739061,1.3174,15.8469,87.4214,10,1,3
+holdout,momentum_breakout,score>=75,2026-02-01,2026-09-22,43,16,20,14.87,0.0015,,-0.0571,-0.0029,0.5,1.000485,1.3727,11.5893,83.0189,5,8,6
+holdout,trend_pullback,all,2026-02-01,2026-09-22,41,0,28,12611.06,1.2611,,2.7135,0.0969,0.5,1.446257,1.4167,13.2229,89.9371,10,0,0
+holdout,trend_pullback,score>=60,2026-02-01,2026-09-22,41,8,25,10264.73,1.0265,,2.2257,0.089,0.56,1.371368,1.3943,11.9896,93.7107,6,1,6
+holdout,trend_pullback,score>=75,2026-02-01,2026-09-22,41,22,16,-11403.77,-1.1404,,-2.102,-0.1314,0.4375,0.606319,1.7723,6.9629,61.6352,3,8,10
+holdout,rsi_mean_reversion,all,2026-02-01,2026-09-22,18,0,16,-9060.31,-0.906,,-5.2045,-0.3253,0.3125,0.520877,1.5246,2.4915,20.7547,1,0,0
+holdout,rsi_mean_reversion,score>=60,2026-02-01,2026-09-22,18,18,0,0,0.0,,0.0,,,,0.0,0.0,0.0,0,4,10
+holdout,rsi_mean_reversion,score>=75,2026-02-01,2026-09-22,18,18,0,0,0.0,,0.0,,,,0.0,0.0,0.0,0,4,10

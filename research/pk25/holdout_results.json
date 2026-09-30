@@ -1,0 +1,189 @@
+{
+  "classification": {
+    "checks": {
+      "CONTRARIAN": {
+        "negative_in_strategies_or_folds": false,
+        "rho10_ci_high_below_0": false,
+        "rho10_le_minus_effect": false,
+        "top_median_below_neutral": false
+      },
+      "INCONCLUSIVE_SAMPLE": {
+        "n10_below_min": false
+      },
+      "LIMITED": {
+        "h1_directional": true,
+        "h2_directional": true,
+        "h3_directional": false
+      },
+      "NO_EDGE": {
+        "abs_rho10_below_effect": false,
+        "delta_ic_ci_contains_0_or_not_positive": true,
+        "rho10_ci_contains_0": true,
+        "rho10_ci_precise": false
+      },
+      "PROMISING": {
+        "filter60_drawdown_ok": true,
+        "filter60_expectancy_not_worse": true,
+        "h1_ci_low_above_0": false,
+        "h1_rho10_ge_effect": true,
+        "h2_top_above_neutral": true,
+        "h3_delta_ic_ge_min": false,
+        "h3_wf_mean_delta_ic_positive": false,
+        "h5_folds_positive": true,
+        "h5_strategies_positive": true
+      }
+    },
+    "label": "LIMITED",
+    "rule": "LIMITED"
+  },
+  "classification_inputs": {
+    "dic": -0.140485,
+    "dic_hi": 0.121086,
+    "dic_lo": -0.350413,
+    "filter60_dd_ratio": 0.734577,
+    "filter60_expectancy_delta": 0.0979,
+    "h2_diff": 1.5685,
+    "n10": 98,
+    "rho10": 0.137813,
+    "rho10_hi": 0.364356,
+    "rho10_lo": -0.068876,
+    "strat_neg": 0,
+    "strat_pos": 2,
+    "wf_mean_dic": -0.177393,
+    "wf_share_dic_pos": 0.0,
+    "wf_share_h2_pos": 0.6,
+    "wf_share_rho_neg": 0.333333,
+    "wf_share_rho_pos": 0.666667
+  },
+  "experiment": "PK-25 smart money score v1.0 out-of-sample validation",
+  "filter_summary": {
+    "all": {
+      "expectancy_r": 0.038,
+      "max_drawdown_pct": 1.8981,
+      "total_net_r": 2.7329,
+      "trades": 72
+    },
+    "score>=60": {
+      "expectancy_r": 0.1359,
+      "max_drawdown_pct": 1.3943,
+      "total_net_r": 6.9295,
+      "trades": 51
+    },
+    "score>=75": {
+      "expectancy_r": -0.06,
+      "max_drawdown_pct": 1.7723,
+      "total_net_r": -2.1591,
+      "trades": 36
+    }
+  },
+  "headline_set": "holdout",
+  "hypotheses": {
+    "H1": {
+      "ci_high": 0.364356,
+      "ci_low": -0.068876,
+      "n": 98,
+      "p_boot_greater": 0.111444,
+      "p_boot_less": 0.889055,
+      "p_naive_two_sided": 0.176429,
+      "rho": 0.137813
+    },
+    "H2": {
+      "ci_high": 3.1975,
+      "ci_low": -0.187137,
+      "diff": 1.5685,
+      "n_a": 46,
+      "n_b": 21,
+      "p_boot_greater": 0.036982,
+      "p_boot_less": 0.963518
+    },
+    "H3": {
+      "ci_high": 0.121086,
+      "ci_low": -0.350413,
+      "delta_ic": -0.140485,
+      "p_boot_greater": 0.86057,
+      "wf_folds": 6,
+      "wf_mean_delta_ic": -0.177393,
+      "wf_share_delta_ic_positive": 0.0
+    },
+    "H4": {
+      "mae": {
+        "ci_high": 0.321715,
+        "ci_low": -0.205046,
+        "n": 98,
+        "p_boot_greater": 0.377311,
+        "p_boot_less": 0.623188,
+        "p_naive_two_sided": 0.648666,
+        "rho": 0.046711
+      },
+      "mfe": {
+        "ci_high": 0.322491,
+        "ci_low": -0.1646,
+        "n": 98,
+        "p_boot_greater": 0.230885,
+        "p_boot_less": 0.769615,
+        "p_naive_two_sided": 0.408153,
+        "rho": 0.084661
+      }
+    },
+    "H5": {
+      "per_strategy": {
+        "momentum_breakout": {
+          "n": 43,
+          "rho": 0.020086
+        },
+        "rsi_mean_reversion": {
+          "n": 14,
+          "rho": -0.063736
+        },
+        "trend_pullback": {
+          "n": 41,
+          "rho": 0.203406
+        }
+      },
+      "strategies_eligible": 2,
+      "strategies_negative": 0,
+      "strategies_positive": 2,
+      "wf_folds": 6,
+      "wf_share_h2_positive": 0.6,
+      "wf_share_rho_negative": 0.333333,
+      "wf_share_rho_positive": 0.666667
+    },
+    "primary_p_holm": {
+      "H1": 0.222888,
+      "H2": 0.110946,
+      "H3": 0.86057
+    },
+    "primary_p_one_sided": {
+      "H1": 0.111444,
+      "H2": 0.036982,
+      "H3": 0.86057
+    }
+  },
+  "next_step": "PK-26 may show the score descriptively but must not prioritise signals strongly by it.",
+  "segment_counts": {
+    "development": {
+      "eligible": 178,
+      "eligible_unpurged_with_ret10": 160,
+      "purged": 18,
+      "signals": 181
+    },
+    "holdout": {
+      "eligible": 102,
+      "eligible_unpurged_with_ret10": 98,
+      "purged": 0,
+      "signals": 102
+    },
+    "validation": {
+      "eligible": 127,
+      "eligible_unpurged_with_ret10": 97,
+      "purged": 30,
+      "signals": 127
+    }
+  },
+  "splits": {
+    "holdout_start": "2026-02-01",
+    "rule": "first day of the month nearest the (0.45, 0.7) quantiles of eligible signal dates",
+    "validation_start": "2025-09-01"
+  },
+  "stage": "holdout"
+}

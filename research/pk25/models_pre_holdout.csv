@@ -1,0 +1,10 @@
+eval_set,model,features,n_train,n_test,ic,ic_winsor,r2_oos,r2_oos_winsor,mae,auc,log_loss,brier,comparison,delta_ic,ci_low,ci_high,p_boot_greater,delta_auc
+validation,M0,strategy+,160,97,-0.046317,-0.046317,-0.018783,-0.024741,5.094914,0.468332,0.783643,0.29349,,,,,,
+validation,M1,strategy+log_rvol_20,160,97,-0.134518,-0.112096,-0.020024,-0.026925,5.107893,0.438448,0.784716,0.294024,,,,,,
+validation,M2,strategy+log_rvol_20+close_location+obv_slope_20+net_accumulation_20,160,97,-0.187667,-0.182768,-0.095634,-0.119835,5.292858,0.486173,0.784026,0.293225,,,,,,
+validation,M3,strategy+smart_money_score,160,97,-0.142449,-0.140923,-0.031562,-0.038022,5.138582,0.563782,0.768263,0.285306,,,,,,
+validation,M4,strategy+log_rvol_20+smart_money_score,160,97,-0.197977,-0.197536,-0.034059,-0.041747,5.155772,0.555754,0.768601,0.28547,,,,,,
+validation,M5,strategy+log_rvol_20+close_location+obv_slope_20+net_accumulation_20+smart_money_score,160,97,-0.187621,-0.180118,-0.096145,-0.120038,5.293798,0.540143,0.771338,0.286421,,,,,,
+validation,,,,97,,,,,,,,,M4-M1,-0.063459,-0.185908,0.047311,0.836582,0.117306
+validation,,,,97,,,,,,,,,M5-M2,4.6e-05,-0.010611,0.011203,0.424288,0.05397
+validation,,,,97,,,,,,,,,M3-M0,-0.096132,-0.202934,0.048414,0.89905,0.09545

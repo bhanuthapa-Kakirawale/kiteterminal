@@ -1,0 +1,4 @@
+eval_set,strategy,n,score_mean,score_median,score_p10,score_p90,rho_n,rho_rho,rho_ci_low,rho_ci_high,rho_p_boot_greater,rho_p_boot_less,rho_p_naive_two_sided,n_top_75_100,median_ret10_top,lowest_bucket,n_lowest,median_ret10_lowest,rho_score_trade_net_r,n_trades,delta_ic_M4_M1_within
+holdout,momentum_breakout,43,75.474419,76.8,59.74,87.04,43,0.020086,-0.25659,0.311626,0.443278,0.557221,0.898899,27,0.3953,45-59,5,-1.0403,0.087765,38,-0.080942
+holdout,trend_pullback,41,70.439024,73.3,54.0,83.2,41,0.203406,-0.099188,0.5159,0.091954,0.908546,0.20351,19,1.4293,25-44,1,-0.8142,-0.026385,36,-0.29669
+holdout,rsi_mean_reversion,18,45.688889,45.95,40.47,51.6,14,-0.063736,-0.498552,0.392542,0.671164,0.334333,0.83236,0,,25-44,5,-0.5907,0.103297,14,0.10989

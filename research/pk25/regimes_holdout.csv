@@ -1,0 +1,12 @@
+eval_set,dimension,cell,n,n_ret10,rho_score_ret10,n_top,median_ret10_top,n_neutral,median_ret10_neutral,interpretable
+holdout,mkt_above_200dma,above,12,12,0.373665,8,1.9307,1,-0.4483,False
+holdout,mkt_above_200dma,below,90,86,0.100637,38,0.20775,20,-0.71915,True
+holdout,mkt_vol_regime,high,45,45,0.29941,22,2.3792,9,-0.4483,True
+holdout,mkt_vol_regime,low,19,15,-0.196396,11,-0.2161,1,-2.0455,True
+holdout,mkt_vol_regime,mid,38,38,0.074192,13,-0.5922,11,-0.6562,True
+holdout,quarter,2026Q1,22,22,0.087819,8,-2.28775,7,-1.0049,True
+holdout,quarter,2026Q2,38,38,0.32656,16,2.9723,7,0.6609,True
+holdout,quarter,2026Q3,42,38,0.036266,22,-0.2161,7,-0.6562,True
+holdout,liquidity_bucket,large,93,91,0.121643,46,0.9123,18,-0.71915,True
+holdout,liquidity_bucket,mid,3,3,-0.5,0,,3,-0.1839,False
+holdout,liquidity_bucket,thin,6,4,-1.0,0,,0,,False

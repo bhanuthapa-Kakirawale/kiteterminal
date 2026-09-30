@@ -1,0 +1,389 @@
+{
+  "design_freeze": {
+    "analysis_code_sha256": {
+      "backend/smart_money_validation.py": "dbd38621fcb0f3b39dd95f87bc2d35a6f85a53eb4ee1577e315f6c9e146abfcd",
+      "backend/smart_money_validation_stats.py": "5e29e178bf04c9b4998417761f27f61ef3e71e93df000ec0cd9a3fcfc2487eb1"
+    },
+    "dataset_rows": 410,
+    "dataset_sha256": "1ccadaceb5525c8d9f288a8e82f397c24668bb8f4343cf82fbb25b26141431f0",
+    "design": {
+      "bootstrap": {
+        "cluster": "ISO week of signal_date",
+        "reps": 2000,
+        "seed": 25
+      },
+      "buckets": [
+        [
+          "0-24",
+          0.0,
+          25.0
+        ],
+        [
+          "25-44",
+          25.0,
+          45.0
+        ],
+        [
+          "45-59",
+          45.0,
+          60.0
+        ],
+        [
+          "60-74",
+          60.0,
+          75.0
+        ],
+        [
+          "75-100",
+          75.0,
+          100.0001
+        ]
+      ],
+      "dataset_start": "2024-09-01",
+      "decision_criteria": {
+        "delta_ic_min": 0.03,
+        "max_drawdown_ratio": 1.25,
+        "min_holdout_n": 60,
+        "no_edge_max_ci_half_width": 0.15,
+        "order": [
+          "INCONCLUSIVE_SAMPLE",
+          "CONTRARIAN",
+          "PROMISING",
+          "NO_EDGE",
+          "LIMITED",
+          "INCONCLUSIVE"
+        ],
+        "rho_effect": 0.1,
+        "strategy_min_count": 2,
+        "strategy_min_n": 15,
+        "wf_consistency": 0.6
+      },
+      "dedup_sessions": 10,
+      "exploratory": "Every other horizon, trade R, regime, cohort, quintile and robustness result is EXPLORATORY.",
+      "extreme_bar": {
+        "close_location_min": 0.75,
+        "price_change_pct_min": 8.0,
+        "rvol_20_min": 3.0
+      },
+      "filter_thresholds": [
+        null,
+        60.0,
+        75.0
+      ],
+      "horizons": [
+        5,
+        10,
+        20
+      ],
+      "hypotheses": [
+        {
+          "id": "H1",
+          "statement": "Spearman rho(smart_money_score, 10-session forward return) > 0 on the holdout primary set.",
+          "tier": "PRIMARY"
+        },
+        {
+          "id": "H2",
+          "statement": "Median 10-session forward return of the 75-100 bucket exceeds that of the 45-59 bucket.",
+          "tier": "PRIMARY"
+        },
+        {
+          "id": "H3",
+          "statement": "Out-of-sample Spearman IC of M4 (strategy + RVOL20 + score) exceeds M1 (strategy + RVOL20), on the holdout and as the mean walk-forward delta.",
+          "tier": "PRIMARY"
+        },
+        {
+          "id": "H4",
+          "statement": "rho(score, MFE_10) > 0 and rho(score, MAE_10) > 0 (a shallower adverse excursion).",
+          "tier": "SECONDARY"
+        },
+        {
+          "id": "H5",
+          "statement": "rho(score, 10-session return) is positive in >= 2 strategies with N >= 15 and in >= 60% of walk-forward folds.",
+          "tier": "SECONDARY"
+        },
+        {
+          "id": "O",
+          "statement": "Contrarian ordering check: 75-100 versus 60-74 versus 45-59 on forward returns, MFE and MAE.",
+          "tier": "SECONDARY"
+        }
+      ],
+      "liquidity_cuts_inr": [
+        50000000.0,
+        500000000.0
+      ],
+      "logistic_ridge": 0.001,
+      "market_proxy": "NIFTYBEES",
+      "model_pairs": [
+        [
+          "M4",
+          "M1"
+        ],
+        [
+          "M5",
+          "M2"
+        ],
+        [
+          "M3",
+          "M0"
+        ]
+      ],
+      "models": {
+        "M0": [],
+        "M1": [
+          "log_rvol_20"
+        ],
+        "M2": [
+          "log_rvol_20",
+          "close_location",
+          "obv_slope_20",
+          "net_accumulation_20"
+        ],
+        "M3": [
+          "smart_money_score"
+        ],
+        "M4": [
+          "log_rvol_20",
+          "smart_money_score"
+        ],
+        "M5": [
+          "log_rvol_20",
+          "close_location",
+          "obv_slope_20",
+          "net_accumulation_20",
+          "smart_money_score"
+        ]
+      },
+      "next_steps": {
+        "CONTRARIAN": "Do not invert the score automatically; recommend score redesign / v1.1 research.",
+        "INCONCLUSIVE": "Collect more forward (post-freeze) data before any use of the score.",
+        "LIMITED": "PK-26 may show the score descriptively but must not prioritise signals strongly by it.",
+        "NO_EDGE": "Do not build a scanner ranking around the score.",
+        "PROMISING": "PK-26 may expose ranking/scanner views based on the score (a separate approval is still required for any strategy use)."
+      },
+      "pf_min_n": 20,
+      "primary_horizon": 10,
+      "primary_set": "eligible signals (score not null, not a special-session bar), pooled",
+      "purge_sessions": 20,
+      "small_bucket_n": 10,
+      "split_quantiles": [
+        0.45,
+        0.7
+      ],
+      "top_symbols_dropped": 5,
+      "trim": 0.1,
+      "unconstrained": {
+        "capital": 1000000000000.0,
+        "notional": 100000.0
+      },
+      "vol_regime_min_history": 120,
+      "walk_forward_min_train": 80,
+      "winsor": [
+        0.01,
+        0.99
+      ]
+    },
+    "frozen_at": "2026-09-30T06:32:32+00:00",
+    "pre_holdout_output_sha256": {
+      "baselines_pre_holdout.csv": "2dead1fe08c2d80bab66d10232d634669d64354dadb365dd6ea5c5f6a2091fae",
+      "buckets_pre_holdout.csv": "9df4f8bd5ff480cb2ca3f8210fc9353ba79be9d42d76fbd183bd27b53ca72a3a",
+      "contrarian_pre_holdout.csv": "90a83960b737b4f881d2acf9b76c583ad6e774b3bff8d7d59855e352a0f74b01",
+      "extreme_bar_members_pre_holdout.csv": "60364de1485ef09ea03faa7d7f568657a0e4612dd9249354c2b5467ac97f74b9",
+      "extreme_bars_pre_holdout.csv": "a8a19c506e45561d841fbba79ce4a9042cb80cdb6ae7549d0f57b88f18ee0749",
+      "filter_simulation_pre_holdout.csv": "75785f46be9b73f0c3d315fe8d44e010f4f4353d6ff50caa6d2a482ee6c73dda",
+      "models_pre_holdout.csv": "4f0ef41cfa6a13f48655644194fa6b08c52d222f3c353b179421a8c0dc19120c",
+      "monotonicity_pre_holdout.csv": "0c117e4b9003ceacd8cb1cd74f265454c968e2109f4c1678b65dee27e0268ada",
+      "pre_holdout_results.json": "822a217463d96e36fcb8cf6edc5a4b3fe0fda5dbf619a5dafc4f0b283f78638f",
+      "regimes_pre_holdout.csv": "4dabf0c3a2c6d19a44443850154ad6efe386d119158c07e6cdbf7e01d3cddd29",
+      "robustness_pre_holdout.csv": "21e02fae249201f6880147ef5be638732938f24467548ef0224432a7e732b5ec",
+      "strategies_pre_holdout.csv": "a663017b8687bdc1f759ff1dffd0ec11713b825f9831cbea5173b0cb2a09ebbb",
+      "walk_forward_pre_holdout.csv": "54de7d070d3f430b2807d2f1aff362d6e2e948a96ce92b352952cb3567f64e49"
+    },
+    "splits": {
+      "holdout_start": "2026-02-01",
+      "rule": "first day of the month nearest the (0.45, 0.7) quantiles of eligible signal dates",
+      "validation_start": "2025-09-01"
+    },
+    "statement": "Every analysis choice above was fixed before the holdout statistics were computed."
+  },
+  "experiment": "PK-25 smart money score v1.0 out-of-sample validation",
+  "holdout_evaluated": {
+    "at": "2026-09-30T07:46:10+00:00",
+    "output_sha256": {
+      "baselines_holdout.csv": "8c61a66809900bcc15e4d8b4241966b2b9f64dd93cd351c22c65babdb7455041",
+      "buckets_holdout.csv": "d6a34f47156ea865c56fa762a348c0870235d61030189d626604794b34fe0653",
+      "contrarian_holdout.csv": "8062c275f321f1c113c660c3d3a9bab9304cca689b9a856b7f82fdad96338917",
+      "extreme_bar_members_holdout.csv": "01dc7422d8ac4da98ece2fcc459f389033fccc5d3dab5237aa945a905189e07b",
+      "extreme_bars_holdout.csv": "5ed79ff8436188fa2fb2751b88dae9a379705fbcfd31bd4c08be662c96b68efa",
+      "filter_simulation_holdout.csv": "0ce8b25a8d55ddd2a22775beea8299eba4e82d292a4398e2d378e94985222115",
+      "holdout_results.json": "b4561ff1ee7088a94aecc191fd428a492f6f19ee369ca00a4633c1b019f0fec9",
+      "models_holdout.csv": "e7fbc3649772df6b1cbda1ec824bad9ef67aaa2655c86f7aaf4e76c4c4968de1",
+      "monotonicity_holdout.csv": "d65f3f85fe2fe2dee1bf0687e4d028b404d246b80bd799dcc42add61eb0a1308",
+      "regimes_holdout.csv": "a967137c500aba6dd200d4e2e0543d45351d00b6f78d37e1035498cbd19c0055",
+      "robustness_holdout.csv": "a774d2b620ddc2a060a26966a09e0c954d55c29a53668ec513d1ff34f5e5995a",
+      "strategies_holdout.csv": "f1196faf69f00cf47ff3442359a4378d536a3fe6aec214e306af16e217ab2e49",
+      "walk_forward_holdout.csv": "189b6cb015a3b8e98eba43d498dcd6d96e6a4c5235fb1726898e19008e58cce2"
+    }
+  },
+  "model_freeze": {
+    "bands": [
+      [
+        75.0,
+        "strong",
+        "Strong accumulation-like evidence"
+      ],
+      [
+        60.0,
+        "moderate",
+        "Moderate accumulation-like evidence"
+      ],
+      [
+        40.0,
+        "mixed",
+        "Mixed / neutral evidence"
+      ],
+      [
+        25.0,
+        "limited",
+        "Limited accumulation-like evidence"
+      ],
+      [
+        0.0,
+        "weak",
+        "Weak accumulation-like evidence; distribution-like evidence dominates"
+      ]
+    ],
+    "frozen_at": "2026-09-30T05:59:57+00:00",
+    "git_head": "53915868eeeca842a9675080ff62bc8848c664c4",
+    "model_file_sha256": {
+      "backend/smart_money_score.py": "7ca2b95dd76f6586e8b8f3a65909a45b7fdcdacd1217e470dd436425e18242c7",
+      "backend/volume_intelligence.py": "0b2a47574fc767faa706476f06e015cdb7299df16e4855dc4796759360f32a01"
+    },
+    "production_file_sha256": {
+      "backend/backtest.py": "307734e1c9e15429535cc01ee8d52764666df28d35074863f748b41a042eccbe",
+      "backend/backtest_analytics.py": "2b92827690feb0293fab48b2f1de54e94efc27ca7c4ef3d6f2bd53d5faac11a9",
+      "backend/backtest_costs.py": "ef94ccca826f458aac4fe2b5e663296d782221590a3cc932282298919d71813d",
+      "backend/execution.py": "0ac964820c30ffe9e6a68e10d34bb17d26f4def27e43c96d63eb7f7b8f74c0bf",
+      "backend/risk_engine.py": "91f0cab08ea0b2fc6109d190fce73aaa06ff5877602ddee25711f39916a0121d",
+      "backend/strategies/__init__.py": "af52a82ebdb115a1590b2462d34cd186663165a33dd1904c6d707cfcd2412f77",
+      "backend/strategies/momentum_breakout.py": "74663d353039740a97dbd2891dc1c6cc07c445d3814ff6a1309aa4c3f0c147dd",
+      "backend/strategies/rsi_mean_reversion.py": "25cbb0b48272ac49b3fc0e9b5545e0e79c42650a4c486e6832579ba6901e01cb",
+      "backend/strategies/trend_pullback.py": "2e5c21c70836fd0851009d05732725165d807b4475edbf8230bc208e16546e77",
+      "backend/strategy_engine.py": "ec891aff7ca67f3692d8148e4c49609a450cb835e81cae5a88e395ac4d919801",
+      "backend/volume_research.py": "c3d1f1c10fb6c2134a0c435eb94ac9e483847a965acf0588827a880140a36ff6"
+    },
+    "ramps": {
+      "breakout_fail": [
+        0.0,
+        1.0
+      ],
+      "breakout_pierce": [
+        0.0,
+        1.0
+      ],
+      "contraction": [
+        0.1,
+        0.4
+      ],
+      "evidence_count": [
+        0.0,
+        3.0
+      ],
+      "exhaustion_range": [
+        4.0,
+        8.0
+      ],
+      "exhaustion_rvol_median": [
+        3.0,
+        6.0
+      ],
+      "exhaustion_weak_close": [
+        0.4,
+        0.8
+      ],
+      "liquidity_thin": [
+        0.0,
+        1.0
+      ],
+      "non_weak_close": [
+        0.35,
+        0.65
+      ],
+      "obv_slope": [
+        0.0,
+        0.4
+      ],
+      "price_overextended": [
+        6.0,
+        12.0
+      ],
+      "price_up": [
+        0.0,
+        2.5
+      ],
+      "pullback_quiet": [
+        0.1,
+        0.5
+      ],
+      "recovery_up": [
+        0.0,
+        1.0
+      ],
+      "recovery_volume": [
+        1.0,
+        2.0
+      ],
+      "reversal_count": [
+        0.0,
+        3.0
+      ],
+      "rvol_20": [
+        1.0,
+        2.5
+      ],
+      "rvol_median_20": [
+        1.0,
+        3.0
+      ],
+      "strong_close": [
+        0.5,
+        0.9
+      ],
+      "upper_wick": [
+        0.3,
+        0.6
+      ],
+      "volume_percentile_60": [
+        50.0,
+        95.0
+      ],
+      "weak_close": [
+        0.5,
+        0.9
+      ],
+      "wick_close": [
+        0.0,
+        0.3
+      ]
+    },
+    "required_feature_version": 1,
+    "smart_money_score_version": "1.0",
+    "statement": "Score v1.0 was frozen before out-of-sample evaluation.",
+    "volume_feature_version": 1,
+    "weights": {
+      "accumulation_frequency": 13.0,
+      "breakout_participation": 4.0,
+      "close_quality": 6.0,
+      "contraction_expansion": 5.0,
+      "distribution_frequency": 13.0,
+      "exhaustion_shock": 8.0,
+      "failed_breakout": 6.0,
+      "high_volume_weak_close": 8.0,
+      "obv_confirmation": 8.0,
+      "obv_non_confirmation": 8.0,
+      "participation": 5.0,
+      "price_response": 3.0,
+      "pullback_participation": 6.0,
+      "upper_wick_rejection": 7.0
+    }
+  }
+}

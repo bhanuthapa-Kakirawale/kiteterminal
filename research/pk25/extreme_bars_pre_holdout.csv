@@ -1,0 +1,10 @@
+eval_set,group,scope,n,score_median,share_score_ge_75,median_outcome_fwd_ret_5_pct,median_outcome_fwd_ret_10_pct,median_outcome_fwd_ret_20_pct,median_outcome_mfe_10_pct,median_outcome_mae_10_pct
+validation,bar_cohort_all,bars 2024-09-01 to before 2026-02-01,18,76.5,0.555556,-1.9115,-2.71065,-3.8283,5.52115,-5.6971
+validation,bar_cohort_0-24,bars 2024-09-01 to before 2026-02-01,0,,,,,,,
+validation,bar_cohort_25-44,bars 2024-09-01 to before 2026-02-01,0,,,,,,,
+validation,bar_cohort_45-59,bars 2024-09-01 to before 2026-02-01,3,56.8,0.0,-1.7668,-2.8531,-5.0982,6.8082,-7.1881
+validation,bar_cohort_60-74,bars 2024-09-01 to before 2026-02-01,5,70.4,0.0,-1.0304,-2.5682,-1.6276,4.8731,-4.1161
+validation,bar_cohort_75-100,bars 2024-09-01 to before 2026-02-01,10,78.7,1.0,-2.4519,-2.07735,-3.8283,3.91775,-5.7741
+validation,signal_cohort,validation signals,7,76.0,0.714286,-2.8205,2.5574,1.8614,3.0,-4.25
+validation,signal_non_cohort_75_100,validation signals,31,80.3,1.0,0.0498,0.3789,0.5064,2.5307,-2.9238
+validation,all_full_window_bars (unconditional),bars 2024-09-01 to before 2026-02-01,20080,,,-0.11783,-0.048991,-0.014989,2.881166,-3.064768

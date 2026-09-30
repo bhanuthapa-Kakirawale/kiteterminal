@@ -1,0 +1,53 @@
+{
+  "ambiguous_exchange_series": "none: the universe is NSE-cache tokens only (BSE duplicates never loaded)",
+  "by_strategy": {
+    "momentum_breakout": 145,
+    "rsi_mean_reversion": 106,
+    "trend_pullback": 159
+  },
+  "excluded_series": [],
+  "exclusions": {
+    "eligible": 407,
+    "special_session_bar": 3
+  },
+  "first_signal": "2024-09-03",
+  "labelled_not_excluded": {
+    "data_quality_degraded": 65,
+    "liquidity_warning": 13,
+    "special_session_baseline": 62
+  },
+  "last_signal": "2026-09-17",
+  "missing_outcome": {
+    "fwd_ret_10": 4,
+    "fwd_ret_20": 7,
+    "fwd_ret_5": 4
+  },
+  "rows": 410,
+  "sector_analysis": "skipped: sector_mapping holds 1 row, not a usable classification",
+  "segments": {
+    "development": {
+      "eligible": 178,
+      "eligible_unpurged_with_ret10": 160,
+      "purged": 18,
+      "signals": 181
+    },
+    "holdout": {
+      "eligible": 102,
+      "eligible_unpurged_with_ret10": 98,
+      "purged": 0,
+      "signals": 102
+    },
+    "validation": {
+      "eligible": 127,
+      "eligible_unpurged_with_ret10": 97,
+      "purged": 30,
+      "signals": 127
+    }
+  },
+  "splits": {
+    "holdout_start": "2026-02-01",
+    "rule": "first day of the month nearest the (0.45, 0.7) quantiles of eligible signal dates",
+    "validation_start": "2025-09-01"
+  },
+  "symbols": 59
+}

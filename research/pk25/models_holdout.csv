@@ -1,0 +1,10 @@
+eval_set,model,features,n_train,n_test,ic,ic_winsor,r2_oos,r2_oos_winsor,mae,auc,log_loss,brier,comparison,delta_ic,ci_low,ci_high,p_boot_greater,delta_auc
+holdout,M0,strategy+,257,98,0.048477,0.048477,0.001627,0.000931,3.731165,0.433737,0.704631,0.255728,,,,,,
+holdout,M1,strategy+log_rvol_20,257,98,0.145299,0.135257,0.009552,0.010762,3.724745,0.477425,0.702742,0.254789,,,,,,
+holdout,M2,strategy+log_rvol_20+close_location+obv_slope_20+net_accumulation_20,257,98,-0.008965,-0.008895,-0.035858,-0.027984,3.82562,0.461957,0.718447,0.26245,,,,,,
+holdout,M3,strategy+smart_money_score,257,98,-0.051268,-0.055584,-0.025457,-0.021802,3.871775,0.408236,0.75598,0.28033,,,,,,
+holdout,M4,strategy+log_rvol_20+smart_money_score,257,98,0.004814,0.008091,-0.017598,-0.012491,3.867609,0.426003,0.753505,0.279002,,,,,,
+holdout,M5,strategy+log_rvol_20+close_location+obv_slope_20+net_accumulation_20+smart_money_score,257,98,-0.036159,-0.030969,-0.042447,-0.033819,3.849392,0.386288,0.776892,0.289853,,,,,,
+holdout,,,,98,,,,,,,,,M4-M1,-0.140485,-0.3395,0.10261,0.867566,-0.051421
+holdout,,,,98,,,,,,,,,M5-M2,-0.027194,-0.061385,0.003268,0.961019,-0.075669
+holdout,,,,98,,,,,,,,,M3-M0,-0.099745,-0.304274,0.110355,0.813593,-0.025502

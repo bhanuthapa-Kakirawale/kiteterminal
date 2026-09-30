@@ -1,0 +1,10 @@
+eval_set,strategy,scenario,period_start,period_end,evaluable_signals,evaluable_signals_filtered_out,trades,net_pnl,net_return_pct,net_cagr_pct,total_net_r,expectancy_r,win_rate,profit_factor,max_drawdown_pct,exposure_pct,time_in_market_pct,skipped_signals,missed_winners,avoided_losers
+validation,momentum_breakout,all,2025-09-01,2026-01-31,36,0,24,53377.38,5.3377,,10.7757,0.449,0.666667,3.147942,1.2825,24.1385,96.1538,11,0,0
+validation,momentum_breakout,score>=60,2025-09-01,2026-01-31,36,4,24,52282.14,5.2282,,10.5679,0.4403,0.625,3.020933,1.2825,24.0406,96.1538,8,2,0
+validation,momentum_breakout,score>=75,2025-09-01,2026-01-31,36,16,20,5629.58,0.563,,1.3693,0.0685,0.55,1.19693,1.4434,20.3399,96.1538,2,9,2
+validation,trend_pullback,all,2025-09-01,2026-01-31,38,0,26,46794.16,4.6794,,9.2496,0.3558,0.576923,2.985971,1.7243,21.9679,96.1538,10,0,0
+validation,trend_pullback,score>=60,2025-09-01,2026-01-31,38,9,22,51185.65,5.1186,,10.1759,0.4625,0.636364,3.311698,1.5405,20.2878,96.1538,5,2,5
+validation,trend_pullback,score>=75,2025-09-01,2026-01-31,38,22,16,-2422.64,-0.2423,,-0.4271,-0.0267,0.4375,0.896411,1.2345,14.2861,91.3462,2,7,9
+validation,rsi_mean_reversion,all,2025-09-01,2026-01-31,23,0,24,-14234.74,-1.4235,,-11.4095,-0.4754,0.333333,0.342113,1.5809,2.5978,22.1154,0,0,0
+validation,rsi_mean_reversion,score>=60,2025-09-01,2026-01-31,23,23,1,-2541.88,-0.2542,,-1.0984,-1.0984,0.0,0.0,0.2542,0.0,0.0,0,7,10
+validation,rsi_mean_reversion,score>=75,2025-09-01,2026-01-31,23,23,0,0,0.0,,0.0,,,,0.0,0.0,0.0,0,7,10
