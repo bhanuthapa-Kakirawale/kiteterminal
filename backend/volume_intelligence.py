@@ -340,7 +340,8 @@ def compute_series(df: pd.DataFrame, thresholds: dict | None = None) -> pd.DataF
 
     # Columns are collected in a dict and framed once at the end (inserting
     # ~60 columns one by one into a DataFrame dominated the run time).
-    out: dict[str, pd.Series] = {"date": frame["date"], "volume": v, "close": c, "prev_close": prev_close}
+    out: dict[str, pd.Series] = {"date": frame["date"], "volume": v, "close": c, "prev_close": prev_close,
+                                 "open": o, "high": h, "low": l}
 
     # B — relative volume
     avg_5 = prior.rolling(5).mean()
@@ -506,8 +507,12 @@ def _assemble(row: pd.Series, thr: dict) -> dict:
     close = float(row["close"])
     is_breakout = None if level is None else close > level
     return {
+        # open/high/low were added in PK-24 (additive; no existing value
+        # changed, FEATURE_VERSION unchanged): the score's failed-breakout
+        # check needs the bar's high against the breakout level.
         "bar": {
             "volume": _num(row["volume"], 0), "close": _num(close, 2), "prev_close": _num(row["prev_close"], 2),
+            "open": _num(row["open"], 2), "high": _num(row["high"], 2), "low": _num(row["low"], 2),
         },
         "relative_volume": {
             "avg_volume_20": _num(row["avg_volume_20"], 2),

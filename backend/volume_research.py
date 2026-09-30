@@ -10,7 +10,9 @@ returns, excursions, the PK-21 backtest trade result) in clearly separated
 Separation rule: features for a signal on bar i are computed from the frame
 cut at i (`df.iloc[: i + 1]`), so they cannot see a later row. forward_outcomes
 is the ONLY function here that reads rows after i, and its values are never
-passed back into a feature. Nothing in the live scanner, API or UI imports
+passed back into a feature. The PK-24 score columns (score_record) are
+computed from the same signal-bar feature object before the outcomes, and the
+score itself rejects any outcome_* key. Nothing in the live scanner, API or UI imports
 this module.
 
 CLI (reads a database COPY, opened read-only and immutable):
@@ -28,7 +30,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from backend import volume_intelligence as vi
+from backend import smart_money_score as sms, volume_intelligence as vi
 from backend.strategies import STRATEGIES
 
 OUTCOME_PREFIX = "outcome_"
@@ -81,6 +83,15 @@ FEATURE_FIELDS = (
 )
 FEATURE_COLUMNS = tuple(name for name, _ in FEATURE_FIELDS)
 
+# PK-24 score columns. They are FEATURES (built from the signal-bar feature
+# object only, before any outcome is measured), never labels.
+SCORE_COLUMNS = (
+    "smart_money_score", "smart_money_score_version", "smart_money_confidence",
+    *(f"sms_{name}" for name, *_ in sms.COMPONENTS),
+    "sms_positive", "sms_negative", "sms_liquidity_factor", "sms_failed_breakout", "sms_exhaustion",
+)
+_MAJOR_FLAG_POINTS = 1.0   # a penalty at or beyond this many points counts as "present"
+
 
 def _dig(features: dict, path: tuple):
     value = features
@@ -94,6 +105,27 @@ def _dig(features: dict, path: tuple):
 def feature_record(features: dict) -> dict:
     """The flat, CSV-friendly subset of one VolumeFeatures object."""
     return {name: _dig(features, path) for name, path in FEATURE_FIELDS}
+
+
+def score_record(features: dict) -> dict:
+    """The flat PK-24 score columns for one VolumeFeatures object. The score
+    sees the feature object and nothing else — in particular no outcome."""
+    result = sms.score(features)
+    components = result["components"]
+    record = {
+        "smart_money_score": result["score"],
+        "smart_money_score_version": result["score_version"],
+        "smart_money_confidence": result["confidence"],
+        **{f"sms_{name}": (components[name]["points"] if name in components else None)
+           for name, *_ in sms.COMPONENTS},
+        "sms_positive": result["positive_score"],
+        "sms_negative": result["negative_penalty"],
+        "sms_liquidity_factor": result["liquidity_factor"],
+    }
+    for flag, name in (("sms_failed_breakout", "failed_breakout"), ("sms_exhaustion", "exhaustion_shock")):
+        points = components[name]["points"] if name in components else None
+        record[flag] = None if points is None else points <= -_MAJOR_FLAG_POINTS
+    return record
 
 
 def forward_outcomes(df: pd.DataFrame, i: int) -> dict:
@@ -152,6 +184,7 @@ def signal_feature_rows(module, frames: dict[str, pd.DataFrame], params: dict, s
                 "data_quality": features["data_quality"]["status"],
                 **feature_record(features),
                 "legacy_volume_pass": comparison.get("legacy_pass"),
+                **score_record(features),   # scored BEFORE any outcome exists for this row
             }
             if with_outcomes:
                 row.update(forward_outcomes(df, i))
@@ -180,7 +213,7 @@ def attach_backtest_trades(rows: list[dict], module, frames: dict[str, pd.DataFr
 def write_csv(rows: list[dict], path: Path) -> list[str]:
     """Identity, then features, then every outcome_* column last."""
     if not rows:
-        columns = [*IDENTITY_COLUMNS, *FEATURE_COLUMNS, "legacy_volume_pass"]
+        columns = [*IDENTITY_COLUMNS, *FEATURE_COLUMNS, "legacy_volume_pass", *SCORE_COLUMNS]
     else:
         keys = list(rows[0])
         columns = [k for k in keys if not k.startswith(OUTCOME_PREFIX)] + \

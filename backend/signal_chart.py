@@ -20,7 +20,8 @@ from datetime import date
 
 import pandas as pd
 
-from backend import config, execution, indicators, kite_chart, market, trading_calendar, volume_intelligence
+from backend import (config, execution, indicators, kite_chart, market, smart_money_score, trading_calendar,
+                     volume_intelligence)
 from backend.db import get_connection
 from backend.strategies import STRATEGIES
 
@@ -405,6 +406,25 @@ def _volume_context(ticket: dict, module, params: dict) -> dict | None:
                 "interpretation": ["Volume features could not be computed for this signal."]}
 
 
+def _smart_money(volume: dict | None) -> dict | None:
+    """PK-24 score from the SAME signal-bar feature snapshot the Volume
+    context section shows — never today's, and no second feature
+    computation. Context only: approval, risk and sizing never read it. A
+    failure degrades this one section."""
+    if volume is None:
+        return None
+    try:
+        return smart_money_score.score(volume)
+    except Exception:
+        logger.exception("Smart money score failed for %s", volume.get("symbol"))
+        return {"name": smart_money_score.NAME, "score": None, "confidence": smart_money_score.INSUFFICIENT_DATA,
+                "score_version": smart_money_score.SMART_MONEY_SCORE_VERSION,
+                "as_of_date": volume.get("as_of_date"), "disclaimer": smart_money_score.DISCLAIMER,
+                "data_quality": {"status": volume_intelligence.UNAVAILABLE, "codes": ["COMPUTATION_FAILED"]},
+                "confidence_reasons": ["The score could not be computed for this signal."],
+                "top_positive": [], "top_negative": [], "warnings": []}
+
+
 def build_payload(ticket: dict, settings=None) -> dict:
     """The whole Signal Detail payload for one ticket.
 
@@ -465,6 +485,7 @@ def build_payload(ticket: dict, settings=None) -> dict:
         ticket.get("instrument_token"), ticket.get("kite_chart_status") or kite_chart.STATUS_OK,
     )
 
+    volume = _volume_context(ticket, module, params)
     return {
         "ticket_id": ticket["id"],
         "symbol": ticket["symbol"],
@@ -506,7 +527,8 @@ def build_payload(ticket: dict, settings=None) -> dict:
         },
         "bars_available": bars_available,
         "diagnostic": diagnostic,
-        "volume_intelligence": _volume_context(ticket, module, params),
+        "volume_intelligence": volume,
+        "smart_money_score": _smart_money(volume),
     }
 
 

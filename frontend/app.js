@@ -5138,6 +5138,53 @@ function sdRankLine(rank) {
     barely ? " This one only just made the cut." : ""}</p>`;
 }
 
+// PK-24 — accumulation-evidence score, from the same signal-bar feature
+// snapshot as the Volume context section. A description of accumulation-like
+// price/volume evidence: it plays no part in the signal, approval, risk or
+// sizing. Neutral styling on purpose (no P&L colours, no trade instruction).
+// Its display name and disclaimer come from the server (NAME, DISCLAIMER);
+// kept outside the PK-23 volume functions, whose wording test forbids the
+// name. Every value is set through esc()/fmt().
+function sdSmartMoneyList(items) {
+  return `<ul class="sd-sm-list">${items.map((t) => `<li>${esc(t.reason || t.label)}</li>`).join("")}</ul>`;
+}
+
+function sdSmartMoneyHtml(s) {
+  if (!s) {
+    return `<p class="muted-note">No stored price history is linked to this ticket, so there is no score.</p>`;
+  }
+  const disclaimer = `<p class="sd-sm-disclaimer">${esc(s.disclaimer || "")}</p>`;
+  const confidence = { HIGH: "High", MEDIUM: "Medium", LOW: "Low", INSUFFICIENT_DATA: "Insufficient data" }[
+    s.confidence] || s.confidence || "—";
+  if (s.score == null) {
+    return `<div class="sd-warn info"><strong>Score not available.</strong>
+      ${(s.confidence_reasons || []).map(esc).join(" ")}</div>
+      <div class="sd-calc-row"><span class="sd-calc-label">Confidence</span>
+      <span class="sd-calc-formula"></span><strong class="sd-calc-value">${esc(confidence)}</strong></div>
+      ${disclaimer}`;
+  }
+  const width = Math.max(0, Math.min(100, Number(s.score)));
+  const reasons = (s.confidence_reasons || []).length
+    ? `<div class="sd-calc-note">${(s.confidence_reasons || []).map(esc).join(" ")}</div>` : "";
+  const positives = (s.top_positive || []).length
+    ? `<p class="sd-sm-sub">Top positives</p>${sdSmartMoneyList(s.top_positive)}`
+    : `<p class="muted-note">No component added meaningful accumulation-like evidence.</p>`;
+  const cautions = (s.top_negative || []).length
+    ? `<p class="sd-sm-sub">Cautions</p>${sdSmartMoneyList(s.top_negative)}` : "";
+  const warnings = (s.warnings || []).length
+    ? `<div class="sd-warn info">${(s.warnings || []).map(esc).join(" ")}</div>` : "";
+  return `<div class="sd-sm-head">
+      <span class="sd-sm-score">${esc(s.name || "Score")}: ${esc(fmt(s.score, 0))} / 100</span>
+      <span class="sd-sm-band">${esc((s.band || {}).label || "")}</span>
+      <span class="sd-sm-conf">Confidence: <strong>${esc(confidence)}</strong></span>
+    </div>
+    <div class="sd-sm-meter" role="img" aria-label="${esc(`Score ${fmt(s.score, 0)} of 100; 50 is neutral`)}">
+      <span style="width:${width}%"></span><i></i></div>
+    ${reasons}${warnings}${positives}${cautions}${disclaimer}
+    <p class="sd-vi-foot">Score as of the ${esc(s.as_of_date || "—")} candle · score v${esc(s.score_version)}
+      (features v${esc(s.feature_version)}) · 50 is neutral · context only, not part of the signal.</p>`;
+}
+
 // PK-23 — volume context. Descriptive only: none of these numbers took part
 // in the signal, its sizing or its risk checks. Every value is set through
 // esc()/fmt(); the wording comes from the server's factual interpretation.
@@ -5249,6 +5296,9 @@ function sdRenderEvidence() {
 
   // PK-23 — VOLUME CONTEXT at the signal bar (context, never a condition).
   sections.push(sdSection("volume", "Volume context", sdVolumeHtml(d.volume_intelligence)));
+
+  // PK-24 — score at the signal bar (context, never a condition).
+  sections.push(sdSection("smartmoney", "Accumulation evidence", sdSmartMoneyHtml(d.smart_money_score)));
 
   // D3 — RISK CHECKS, expanded from the card's "6/6" badge, rendered through
   // the same rows the confirm dialog uses.
