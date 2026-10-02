@@ -1,0 +1,1032 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kite Terminal Blueprint</title>
+<meta name="description" content="Training path, daily routine, document map, verification checklists and best practices for getting the most out of Kite Terminal.">
+<style>
+:root {
+  --bg: #f7f6f2;
+  --surface: #ffffff;
+  --surface-2: #f0eee8;
+  --text: #1d1f23;
+  --muted: #5d636e;
+  --border: #dedad0;
+  --accent: #2f5fd0;
+  --accent-soft: #e7eefc;
+  --ok: #1d7a4a;
+  --ok-soft: #e3f3ea;
+  --warn: #9a5b00;
+  --warn-soft: #fbf0dc;
+  --bad: #b3261e;
+  --bad-soft: #fbe6e4;
+  --code-bg: #f2f1ec;
+  --shadow: 0 1px 2px rgba(20, 20, 30, .06), 0 4px 16px rgba(20, 20, 30, .04);
+  --radius: 12px;
+  --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, "Liberation Mono", monospace;
+  --sans: "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121418;
+    --surface: #1a1d23;
+    --surface-2: #22262e;
+    --text: #e7e9ee;
+    --muted: #9aa1ad;
+    --border: #2f343e;
+    --accent: #7ea2ff;
+    --accent-soft: #1f2a44;
+    --ok: #5cc98e;
+    --ok-soft: #173225;
+    --warn: #f0b04f;
+    --warn-soft: #3a2c14;
+    --bad: #ff8a80;
+    --bad-soft: #3d1c1a;
+    --code-bg: #20242b;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .3);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #121418;
+  --surface: #1a1d23;
+  --surface-2: #22262e;
+  --text: #e7e9ee;
+  --muted: #9aa1ad;
+  --border: #2f343e;
+  --accent: #7ea2ff;
+  --accent-soft: #1f2a44;
+  --ok: #5cc98e;
+  --ok-soft: #173225;
+  --warn: #f0b04f;
+  --warn-soft: #3a2c14;
+  --bad: #ff8a80;
+  --bad-soft: #3d1c1a;
+  --code-bg: #20242b;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .3);
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 72px; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15.5px/1.6 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); }
+code, kbd, pre { font-family: var(--mono); font-size: .88em; }
+code { background: var(--code-bg); padding: .1em .35em; border-radius: 5px; overflow-wrap: anywhere; }
+h1, h2, h3, h4 { line-height: 1.25; margin: 0; }
+h2 { font-size: 1.6rem; letter-spacing: -.01em; }
+h3 { font-size: 1.12rem; }
+h4 { font-size: .98rem; }
+p { margin: .5em 0; }
+ul, ol { padding-left: 1.3em; margin: .4em 0; }
+li { margin: .2em 0; }
+
+/* ---------- top bar ---------- */
+.topbar {
+  position: sticky; top: 0; z-index: 10;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+}
+.topbar-inner {
+  max-width: 1120px; margin: 0 auto; padding: 10px 16px;
+  display: flex; gap: 14px; align-items: center;
+}
+.brand { font-weight: 700; white-space: nowrap; }
+.toc { display: flex; gap: 4px; overflow-x: auto; flex: 1; scrollbar-width: none; }
+.toc::-webkit-scrollbar { display: none; }
+.toc a {
+  text-decoration: none; color: var(--muted); font-size: .86rem;
+  padding: 5px 10px; border-radius: 999px; white-space: nowrap;
+}
+.toc a:hover { background: var(--surface-2); color: var(--text); }
+.icon-btn {
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  border-radius: 8px; padding: 5px 10px; cursor: pointer; font: inherit; font-size: .85rem;
+}
+.icon-btn:hover { background: var(--surface-2); }
+
+/* ---------- layout ---------- */
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 16px 80px; }
+section { padding-top: 56px; }
+.section-head { margin-bottom: 18px; }
+.section-head .kicker {
+  font-size: .78rem; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--accent); font-weight: 700; margin-bottom: 4px;
+}
+.section-head p { color: var(--muted); max-width: 760px; }
+
+.hero { padding: 48px 0 8px; }
+.hero h1 { font-size: clamp(2rem, 5vw, 2.8rem); letter-spacing: -.02em; }
+.hero .lede { font-size: 1.1rem; color: var(--muted); max-width: 760px; margin-top: 10px; }
+
+.card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 18px 20px; box-shadow: var(--shadow);
+}
+.grid { display: grid; gap: 14px; }
+.g2 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.g3 { grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
+.muted { color: var(--muted); }
+.small { font-size: .88rem; }
+
+.callout {
+  border-radius: var(--radius); padding: 14px 18px; border: 1px solid;
+  margin: 14px 0;
+}
+.callout.info { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+.callout.warn { background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
+.callout.bad  { background: var(--bad-soft);  border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+.callout.ok   { background: var(--ok-soft);   border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
+.callout strong:first-child { display: block; margin-bottom: 2px; }
+
+.pill {
+  display: inline-block; font-size: .74rem; font-weight: 650; padding: 2px 9px;
+  border-radius: 999px; background: var(--surface-2); color: var(--muted);
+  border: 1px solid var(--border); vertical-align: middle; white-space: nowrap;
+}
+.pill.accent { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
+.pill.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.pill.bad { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
+
+/* ---------- rules strip ---------- */
+.rules { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-top: 22px; }
+.rule { padding: 14px 16px; border-radius: var(--radius); background: var(--surface); border: 1px solid var(--border); }
+.rule .n { font-family: var(--mono); color: var(--accent); font-weight: 700; font-size: .85rem; }
+.rule b { display: block; margin: 2px 0 2px; }
+.rule span { color: var(--muted); font-size: .9rem; }
+
+/* ---------- pipeline ---------- */
+.pipeline { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; counter-reset: step; }
+.stage {
+  position: relative; background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px; counter-increment: step;
+}
+.stage::before {
+  content: counter(step); position: absolute; top: 10px; right: 12px;
+  font-family: var(--mono); font-size: .8rem; color: var(--muted);
+}
+.stage .who { font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; font-weight: 700; }
+.stage .who.auto { color: var(--muted); }
+.stage .who.you { color: var(--accent); }
+.stage h4 { margin: 4px 0 4px; }
+.stage p { font-size: .86rem; color: var(--muted); margin: 0; }
+.stage.you-stage { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+
+/* ---------- training ---------- */
+.progress-wrap { display: flex; align-items: center; gap: 12px; margin: 6px 0 18px; flex-wrap: wrap; }
+.bar { flex: 1; min-width: 180px; height: 10px; background: var(--surface-2); border-radius: 999px; overflow: hidden; border: 1px solid var(--border); }
+.bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .25s; }
+.stages { display: grid; gap: 14px; }
+details.train {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+}
+details.train > summary {
+  list-style: none; cursor: pointer; padding: 16px 20px;
+  display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center;
+}
+details.train > summary::-webkit-details-marker { display: none; }
+.badge-num {
+  width: 38px; height: 38px; border-radius: 10px; display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent); font-weight: 800; font-family: var(--mono);
+}
+details.train.done .badge-num { background: var(--ok-soft); color: var(--ok); }
+.train-title b { display: block; font-size: 1.04rem; }
+.train-title span { color: var(--muted); font-size: .88rem; }
+.train-meta { text-align: right; font-size: .82rem; color: var(--muted); white-space: nowrap; }
+.train-body { padding: 0 20px 18px 72px; }
+.train-body h4 { margin: 12px 0 6px; color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; }
+.donewhen { margin-top: 12px; padding: 10px 14px; border-left: 3px solid var(--ok); background: var(--ok-soft); border-radius: 0 8px 8px 0; font-size: .92rem; }
+
+ul.checks { list-style: none; padding: 0; margin: 4px 0; }
+ul.checks li { margin: 0; }
+ul.checks label {
+  display: grid; grid-template-columns: 20px 1fr; gap: 10px; align-items: start;
+  padding: 6px 8px; border-radius: 8px; cursor: pointer;
+}
+ul.checks label:hover { background: var(--surface-2); }
+ul.checks input { margin-top: 4px; width: 16px; height: 16px; accent-color: var(--accent); }
+ul.checks input:checked + span { color: var(--muted); text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--muted) 60%, transparent); }
+
+/* ---------- daily timeline ---------- */
+.timeline { position: relative; display: grid; gap: 14px; }
+.slot {
+  display: grid; grid-template-columns: 150px 1fr; gap: 18px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 16px 20px; box-shadow: var(--shadow);
+}
+.slot .time { font-family: var(--mono); font-weight: 700; font-size: .95rem; }
+.slot .time small { display: block; font-family: var(--sans); font-weight: 500; color: var(--muted); font-size: .8rem; margin-top: 2px; }
+.slot h3 { margin-bottom: 4px; }
+.slot-tools { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+
+/* ---------- tables ---------- */
+.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: .92rem; }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { font-size: .76rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); background: var(--surface-2); font-weight: 700; }
+tr:last-child td { border-bottom: 0; }
+td.file { white-space: nowrap; font-family: var(--mono); font-size: .85rem; }
+
+/* ---------- commands ---------- */
+.cmd {
+  position: relative; background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 44px 10px 14px; margin: 8px 0;
+  font-family: var(--mono); font-size: .84rem; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.cmd .copy {
+  position: absolute; top: 6px; right: 6px; font-size: .72rem; padding: 3px 7px;
+}
+.cmd .c { color: var(--muted); }
+
+/* ---------- screens ---------- */
+.screen { padding: 14px 16px; }
+.screen h4 { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.screen p { font-size: .9rem; color: var(--muted); margin: 4px 0 0; }
+
+.tip { display: grid; grid-template-columns: 34px 1fr; gap: 12px; }
+.tip .ico {
+  width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent);
+}
+.tip .ico svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.tip h4 { margin-bottom: 2px; }
+.tip p { font-size: .91rem; margin: 0; color: var(--muted); }
+
+footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border); color: var(--muted); font-size: .85rem; }
+
+@media (max-width: 720px) {
+  body { font-size: 15px; }
+  .slot { grid-template-columns: 1fr; gap: 6px; }
+  .train-body { padding: 0 16px 16px 16px; }
+  details.train > summary { grid-template-columns: auto 1fr; padding: 14px 16px; }
+  .train-meta { grid-column: 1 / -1; text-align: left; }
+  .brand { display: none; }
+  section { padding-top: 40px; }
+}
+@media print {
+  .topbar, .icon-btn, .copy { display: none !important; }
+  details.train { break-inside: avoid; }
+  details.train:not([open]) > .train-body { display: block; }
+  body { background: #fff; }
+}
+</style>
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem("ktb-theme");
+      if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+    } catch (e) {}
+  })();
+</script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">Kite Terminal Blueprint</div>
+    <nav class="toc" aria-label="Sections">
+      <a href="#rules">Rules</a>
+      <a href="#how">How it works</a>
+      <a href="#training">Training</a>
+      <a href="#daily">Daily routine</a>
+      <a href="#docs">Which .md</a>
+      <a href="#testing">Testing</a>
+      <a href="#advantage">Max advantage</a>
+      <a href="#incidents">If it goes wrong</a>
+      <a href="#commands">Commands</a>
+    </nav>
+    <button class="icon-btn" id="theme-btn" type="button" aria-label="Toggle theme">Theme</button>
+  </div>
+</header>
+
+<main class="wrap">
+
+<!-- ================= HERO ================= -->
+<div class="hero" id="rules">
+  <div class="pill accent" style="white-space:normal">docs/KITE_TERMINAL_BLUEPRINT.html · written for the LIVE-0 build (commit ef6ac53)</div>
+  <h1 style="margin-top:14px">How to learn, run and get the most out of Kite Terminal</h1>
+  <p class="lede">
+    Kite Terminal is a semi-automated trading assistant. It scans your NSE watchlist after the close,
+    puts every proposed trade in front of you for approval, sizes it against your risk limits, places
+    the protective stop, trails it and reconciles with Zerodha. You decide what gets traded. This page
+    gives you a training path, a daily routine, the doc to read for each job, what to verify, and how to use the app well.
+  </p>
+  <p class="small muted">Ticks on this page are saved only in this browser. The daily-routine ticks clear themselves each new day.</p>
+
+  <div class="rules">
+    <div class="rule"><div class="n">RULE 1</div><b>Nothing trades without your click</b><span>Every signal and manual trade becomes a ticket you approve in a confirmation dialog.</span></div>
+    <div class="rule"><div class="n">RULE 2</div><b>Dry Run until the Journal says otherwise</b><span>Stay in paper mode until your Dry Run Journal shows positive expectancy over 30 or more trades.</span></div>
+    <div class="rule"><div class="n">RULE 3</div><b>Kite is the source of truth</b><span>When the app and the broker disagree, look at Kite first. Reconciliation flags it and never auto-corrects.</span></div>
+    <div class="rule"><div class="n">RULE 4</div><b>Lock first, investigate second</b><span>The trading lock blocks only new entries. Exits, stops and monitoring keep running.</span></div>
+    <div class="rule"><div class="n">RULE 5</div><b>Never resubmit an UNKNOWN order</b><span>A duplicate real order is worse than a delayed one. Wait for the order monitor's verdict.</span></div>
+    <div class="rule"><div class="n">RULE 6</div><b>Never edit the database by hand</b><span>Every state has a supported path in the UI. Back up before any code change.</span></div>
+  </div>
+</div>
+
+<!-- ================= HOW IT WORKS ================= -->
+<section id="how">
+  <div class="section-head">
+    <div class="kicker">The mental model</div>
+    <h2>How a trade moves through the app</h2>
+    <p>The app automates all of these steps except one: the approval is yours. Once you know which part does what, you know where to look when something seems wrong.</p>
+  </div>
+
+  <div class="pipeline">
+    <div class="stage"><div class="who auto">Automatic · 16:00 IST</div><h4>Sync data</h4><p>The Autopilot downloads the day's daily candles for watchlist and holdings, checks freshness and expires stale signals.</p></div>
+    <div class="stage"><div class="who auto">Automatic</div><h4>Strategy scan</h4><p>Momentum Breakout and Trend Pullback look for entries. Exit and breakeven checks run on open positions.</p></div>
+    <div class="stage"><div class="who auto">Automatic</div><h4>Risk engine</h4><p>Runs six checks: R:R, capital per trade, stock and sector exposure, open positions, portfolio risk. Signals that fail go to "Blocked by risk".</p></div>
+    <div class="stage you-stage"><div class="who you">You</div><h4>Approvals</h4><p>Open Signal Detail, read the evidence, then Approve and place, or Reject.</p></div>
+    <div class="stage"><div class="who auto">Automatic</div><h4>Execution</h4><p>Places a LIMIT entry (or AMO). In Dry Run this is a <code>PAPER-O-…</code> paper order. When it fills, the app places a protective GTT.</p></div>
+    <div class="stage"><div class="who auto">Automatic · every 20–180 s</div><h4>Guard</h4><p>The order monitor checks every 20 s, the trailing stop every 45 s and reconciliation every 3 min.</p></div>
+    <div class="stage"><div class="who auto">Automatic</div><h4>Journal</h4><p>A position closes only after the broker confirms the exit. Results land in the Journal, with Dry Run and Live kept separate.</p></div>
+  </div>
+
+  <h3 style="margin:28px 0 12px">The screens, and what each one is for</h3>
+  <div class="grid g3">
+    <div class="card screen"><h4>Dashboard <span class="pill">Overview</span></h4><p>Portfolio, holdings, day P&amp;L, alerts for concentration, losses, session expiry and low margin.</p></div>
+    <div class="card screen"><h4>Approvals <span class="pill accent">Daily</span></h4><p>Your inbox: entry signals, exit signals, stop adjustments, signals blocked by risk, and the Autopilot run log.</p></div>
+    <div class="card screen"><h4>Today's Actions <span class="pill accent">Daily</span></h4><p>Pre-market briefing: buy and exit candidates, breakeven adjustments, and a list of stocks near a breakout.</p></div>
+    <div class="card screen"><h4>Positions <span class="pill accent">Daily</span></h4><p>Lifecycle state for each position (ENTRY WORKING → OPEN → EXITING → CLOSED), whether it's protected, and its GTT. You can cancel a working order here.</p></div>
+    <div class="card screen"><h4>Trade Queue</h4><p>Tickets grouped as ready, waiting, rejected or executed, plus <b>reconciliation findings</b> that need "Mark reviewed".</p></div>
+    <div class="card screen"><h4>Orders &amp; Trades</h4><p>The broker order book, fills and GTTs, each linked to its ticket. You can cancel from here.</p></div>
+    <div class="card screen"><h4>New Ticket</h4><p>Manual trades. They go through the same risk checks, sizing and confirmation as strategy signals.</p></div>
+    <div class="card screen"><h4>Watchlist</h4><p>The universe the scans run on. Shows price, trend, RSI-14 and distance to the 20-day high. Holdings are always included.</p></div>
+    <div class="card screen"><h4>Price-Volume Research</h4><p>Describes volume evidence across the watchlist (RVOL, OBV, traded value). It's a research tool and does not generate signals.</p></div>
+    <div class="card screen"><h4>Strategies <span class="pill">Weekly</span></h4><p>Enable or disable strategies, edit parameters (each change is versioned), Scan Now, and the realistic Backtest.</p></div>
+    <div class="card screen"><h4>Journal <span class="pill">Weekly</span></h4><p>Win rate, expectancy in R, profit factor, drawdown and equity curve, broken down by strategy and symbol.</p></div>
+    <div class="card screen"><h4>Ticket History</h4><p>Full audit log you can filter by status, source, symbol and date.</p></div>
+    <div class="card screen"><h4>Settings</h4><p>Risk limits, account safety (max order value, ₹ daily loss, entries per day), and sector mappings.</p></div>
+    <div class="card screen"><h4>Live Readiness <span class="pill warn">Before live</span></h4><p>Read-only pre-flight with 30+ checks. Answers READY or NOT READY for a live entry.</p></div>
+    <div class="card screen"><h4>Diagnostics <span class="pill accent">Daily</span></h4><p>Schema, integrity, worker health, session, flagged price history (with Rebuild history).</p></div>
+  </div>
+</section>
+
+<!-- ================= TRAINING ================= -->
+<section id="training">
+  <div class="section-head">
+    <div class="kicker">App training</div>
+    <h2>Training path: from install to your first live trade</h2>
+    <p>Work through the stages in order. Each stage ends with a <b>done when</b> test, so finish that before moving on. Stages 4 and 5 run alongside each other for several weeks, and that's where most of the learning happens.</p>
+  </div>
+
+  <div class="progress-wrap">
+    <span class="small"><b id="train-count">0</b> of <b id="train-total">0</b> training steps done</span>
+    <div class="bar"><i id="train-bar"></i></div>
+    <button class="icon-btn" type="button" data-reset="train">Reset training ticks</button>
+  </div>
+
+  <div class="stages" id="train-list">
+
+    <details class="train" data-stage>
+      <summary>
+        <div class="badge-num">1</div>
+        <div class="train-title"><b>Install and first start</b><span>Get the app running safely on this machine</span></div>
+        <div class="train-meta">Day 1 · ~1 hour<br><span class="stage-count"></span></div>
+      </summary>
+      <div class="train-body">
+        <h4>Read</h4>
+        <p><code>USER_GUIDE.md</code> §1–§4 · <code>DEPLOYMENT.md</code> "Mode A — Local desktop"</p>
+        <h4>Do</h4>
+        <ul class="checks">
+          <li><label><input type="checkbox" data-k="t1-1"><span>Get your Kite Connect API key and secret from developers.kite.trade, then put them in <code>.env</code> (copied from <code>.env.example</code>).</span></label></li>
+          <li><label><input type="checkbox" data-k="t1-2"><span>Install dependencies: <code>pip install -r requirements.txt</code> (and <code>requirements-dev.txt</code> for tests).</span></label></li>
+          <li><label><input type="checkbox" data-k="t1-3"><span>Start with <code>python -m backend.server</code>. Never use <code>--reload</code> or <code>--workers</code>.</span></label></li>
+          <li><label><input type="checkbox" data-k="t1-4"><span>Find the startup log line <code>Security summary:</code> and confirm it shows <code>bind=127.0.0.1</code>, <code>remote_exposure=no</code>, <code>reload=no</code>, <code>workers=1</code>.</span></label></li>
+          <li><label><input type="checkbox" data-k="t1-5"><span>Open <code>http://127.0.0.1:8000</code>, click Login and finish the Zerodha login. You'll need to do this every trading day.</span></label></li>
+          <li><label><input type="checkbox" data-k="t1-6"><span>Check that the mode pill reads <b>Dry Run</b>, the WebSocket dot is green and the trailing heartbeat is alive.</span></label></li>
+          <li><label><input type="checkbox" data-k="t1-7"><span>Check that <code>.env</code> now contains <code>KITE_TERMINAL_ENCRYPTION_KEY</code>, and back the file up somewhere safe. If you lose it, the stored token can't be read.</span></label></li>
+        </ul>
+        <div class="donewhen"><b>Done when:</b> the app starts with a clean security summary, you're logged in, and the top bar shows Dry Run with a green connection.</div>
+      </div>
+    </details>
+
+    <details class="train" data-stage>
+      <summary>
+        <div class="badge-num">2</div>
+        <div class="train-title"><b>Practice on the demo server</b><span>A copy of the real app with sample data, a throwaway database and no broker</span></div>
+        <div class="train-meta">Day 1–2 · 2–3 hours<br><span class="stage-count"></span></div>
+      </summary>
+      <div class="train-body">
+        <p>The demo server runs the real app against a 10-symbol synthetic universe that already has pending signals, a risk-blocked signal, open positions with GTTs, exit and breakeven proposals, and closed trades. Use it to make mistakes where nothing is at stake. Approving and rejecting changes its data, so restart it for a fresh copy.</p>
+        <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>.venv\Scripts\python.exe tests\demo_server.py --port 8765</div>
+        <h4>Exercises (open http://127.0.0.1:8765)</h4>
+        <ul class="checks">
+          <li><label><input type="checkbox" data-k="t2-1"><span>Open every sidebar section once and say in one sentence what it's for. Use the screen list above to check.</span></label></li>
+          <li><label><input type="checkbox" data-k="t2-2"><span>In Approvals, open the <b>Chart</b> (Signal Detail) for one signal from each strategy. Read all six "Why this signal" sections.</span></label></li>
+          <li><label><input type="checkbox" data-k="t2-3"><span>Find the <b>TCS</b> signal under "Blocked by risk" and identify which check failed and why (single-stock exposure).</span></label></li>
+          <li><label><input type="checkbox" data-k="t2-4"><span>Find <b>NEWLISTCO</b> and see the sector check shown as <i>skipped</i>, not as a pass.</span></label></li>
+          <li><label><input type="checkbox" data-k="t2-5"><span>Work out the position sizing by hand for one signal: quantity = floor(risk budget ÷ risk per share).</span></label></li>
+          <li><label><input type="checkbox" data-k="t2-6"><span>Approve one signal, reject one, and archive the rejected one. Use ← / → in Signal Detail to move between signals.</span></label></li>
+          <li><label><input type="checkbox" data-k="t2-7"><span>Confirm a breakeven stop adjustment and act on an exit signal.</span></label></li>
+          <li><label><input type="checkbox" data-k="t2-8"><span>Create a manual trade in New Ticket. Use the suggested quantity, watch the live preview and submit it.</span></label></li>
+          <li><label><input type="checkbox" data-k="t2-9"><span>Open the Emergency Exit dialog and see that nothing happens until you type <code>EXIT ALL</code> exactly.</span></label></li>
+          <li><label><input type="checkbox" data-k="t2-10"><span>Read the Journal: expectancy (R), profit factor, the equity curve and the by-strategy table.</span></label></li>
+        </ul>
+        <div class="donewhen"><b>Done when:</b> you can explain any pending signal without looking anything up, covering why it fired, why it's this size and what will close it.</div>
+      </div>
+    </details>
+
+    <details class="train" data-stage>
+      <summary>
+        <div class="badge-num">3</div>
+        <div class="train-title"><b>Learn the strategies and set your risk</b><span>Know the rules well enough to check a signal by hand</span></div>
+        <div class="train-meta">Day 2–3 · 2 hours<br><span class="stage-count"></span></div>
+      </summary>
+      <div class="train-body">
+        <h4>Read</h4>
+        <p><code>DESIGN.md</code> §4 (ticket lifecycle), §5 (risk and safety), §6 (strategy rules and the September 2026 revision) · <code>USER_GUIDE.md</code> §6–§8, §16</p>
+        <div class="table-wrap" style="margin:10px 0">
+          <table>
+            <thead><tr><th>Strategy</th><th>In plain words</th><th>Status</th><th>Backtest, net of costs</th></tr></thead>
+            <tbody>
+              <tr><td>Momentum Breakout</td><td>New 30-day high on 3× normal volume while in a long-term uptrend. Wide stop that trails.</td><td><span class="pill ok">Enabled</span></td><td>+16.9R · 137 trades · PF 1.43</td></tr>
+              <tr><td>Trend Pullback</td><td>Uptrending stock dips to its 20-EMA, then turns up on heavy volume.</td><td><span class="pill ok">Enabled</span></td><td>+15.2R · 165 trades · PF 1.43</td></tr>
+              <tr><td>RSI Mean Reversion</td><td>Oversold (RSI below 35) inside an uptrend, starting to turn up.</td><td><span class="pill bad">Disabled</span></td><td>No setting tested reached breakeven</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ul class="checks">
+          <li><label><input type="checkbox" data-k="t3-1"><span>For each enabled strategy, write its entry rule, stop rule and exits (trailing, thesis invalidation, time exit) in your own words.</span></label></li>
+          <li><label><input type="checkbox" data-k="t3-2"><span>Settings → <b>Risk settings</b>: set starting capital, max capital per trade, stock and sector exposure, max open positions, max portfolio risk and minimum R:R.</span></label></li>
+          <li><label><input type="checkbox" data-k="t3-3"><span>Settings → <b>Sector mappings</b>: map every symbol the "unmapped symbols" helper lists. An unmapped symbol skips the sector check.</span></label></li>
+          <li><label><input type="checkbox" data-k="t3-4"><span>Watchlist: add liquid NSE stocks you'd actually trade. Avoid thin names, because volume rules mean little on them.</span></label></li>
+          <li><label><input type="checkbox" data-k="t3-5"><span>Leave RSI Mean Reversion disabled. Re-enable it only to experiment in Dry Run.</span></label></li>
+        </ul>
+        <div class="donewhen"><b>Done when:</b> your risk settings are saved, every watchlist symbol has a sector, and you can state each strategy's rules from memory.</div>
+      </div>
+    </details>
+
+    <details class="train" data-stage>
+      <summary>
+        <div class="badge-num">4</div>
+        <div class="train-title"><b>Paper-trade with real market data</b><span>Dry Run with your real Kite session. The paper broker fills only when the market allows it.</span></div>
+        <div class="train-meta">Weeks 1–8+ · daily<br><span class="stage-count"></span></div>
+      </summary>
+      <div class="train-body">
+        <p>In Dry Run, an approval places a <b>paper order</b> that fills only when the real price reaches your limit, with 5 bps of slippage, and then goes through the same lifecycle as a live position. This is the closest you'll get to live trading without risking money. Paper P&amp;L is <i>gross</i>: brokerage and taxes aren't deducted.</p>
+        <ul class="checks">
+          <li><label><input type="checkbox" data-k="t4-1"><span>Follow the <a href="#daily">daily routine</a> every trading day, and keep the server running and logged in at 16:00 IST.</span></label></li>
+          <li><label><input type="checkbox" data-k="t4-2"><span>Before you approve anything, open its Signal Detail, and write a one-line reason for each rejection.</span></label></li>
+          <li><label><input type="checkbox" data-k="t4-3"><span>Watch at least 5 paper positions complete the whole lifecycle: ENTRY WORKING → OPEN → EXITING → CLOSED.</span></label></li>
+          <li><label><input type="checkbox" data-k="t4-4"><span>Make sure you've seen each of these happen once: an unfilled limit order you cancelled, a trailing stop moving up, a breakeven adjustment, and a time exit.</span></label></li>
+          <li><label><input type="checkbox" data-k="t4-5"><span>Reach <b>20 closed trades</b>, when the small-sample warning disappears.</span></label></li>
+          <li><label><input type="checkbox" data-k="t4-6"><span>Reach <b>30+ closed trades</b> with positive expectancy (R) for each strategy you plan to use live, after allowing about 0.08–0.10R per trade for costs.</span></label></li>
+        </ul>
+        <div class="donewhen"><b>Done when:</b> the Dry Run Journal shows 30+ trades with positive expectancy after costs, and you never skipped Signal Detail.</div>
+      </div>
+    </details>
+
+    <details class="train" data-stage>
+      <summary>
+        <div class="badge-num">5</div>
+        <div class="train-title"><b>Verify the app yourself</b><span>Work through the TESTING.md manual checklist while you paper-trade</span></div>
+        <div class="train-meta">Weeks 1–4 · alongside stage 4<br><span class="stage-count"></span></div>
+      </summary>
+      <div class="train-body">
+        <h4>Read</h4>
+        <p><code>TESTING.md</code> §2 (manual checklist) and §3 (regression policy). The condensed version is in <a href="#testing">Testing</a> below.</p>
+        <ul class="checks">
+          <li><label><input type="checkbox" data-k="t5-1"><span>Run <code>pytest</code> once. As of LIVE-0 it reports about 1,654 passed and 0 failed.</span></label></li>
+          <li><label><input type="checkbox" data-k="t5-2"><span>Complete the environment, risk engine and manual ticket sections (TESTING §2.1–2.3).</span></label></li>
+          <li><label><input type="checkbox" data-k="t5-3"><span>Complete the strategy scan and Signal Detail checks (§2.4). The chart values must match the Entry Conditions values exactly.</span></label></li>
+          <li><label><input type="checkbox" data-k="t5-4"><span>Recalculate the Journal stats by hand for 5 trades (§2.6).</span></label></li>
+          <li><label><input type="checkbox" data-k="t5-5"><span>Backtest both enabled strategies with walk-forward and Monte Carlo, and check 2–3 trades by hand against the OHLC data (§2.7).</span></label></li>
+        </ul>
+        <div class="donewhen"><b>Done when:</b> every Dry Run item in TESTING.md §2 is ticked and nothing is left unexplained.</div>
+      </div>
+    </details>
+
+    <details class="train" data-stage>
+      <summary>
+        <div class="badge-num">6</div>
+        <div class="train-title"><b>Live readiness</b><span>Clear every blocker except the trading lock</span></div>
+        <div class="train-meta">1 evening<br><span class="stage-count"></span></div>
+      </summary>
+      <div class="train-body">
+        <div class="callout warn"><strong>Where your real account stood at LIVE-0 (30 Sep 2026)</strong>NOT READY, with four blockers, all of which are yours to clear: <code>STATIC_IP</code> unconfirmed, <code>MAX_ORDER_NOTIONAL_SET</code> not set, <code>DAILY_LOSS_AMOUNT_SET</code> not set, and <code>TRADING_LOCK</code> on (deliberately). Every technical check passed.</div>
+        <h4>Read</h4>
+        <p><code>FIRST_LIVE_TRADE.md</code> (start to finish, before you begin) · <code>LIVE0_PRODUCTION_READINESS_REPORT.md</code> · <code>USER_GUIDE.md</code> §16 "Live Readiness"</p>
+        <ul class="checks">
+          <li><label><input type="checkbox" data-k="t6-1"><span>In the Kite developer console, register this machine's <b>static IP</b> on your Kite Connect app.</span></label></li>
+          <li><label><input type="checkbox" data-k="t6-2"><span>Write down your first-live limits: max order value (₹), daily loss (₹), and 1 new entry per day.</span></label></li>
+          <li><label><input type="checkbox" data-k="t6-3"><span>Settings → <b>Fill FIRST LIVE / CAUTIOUS profile…</b>, type your two ₹ limits, review every other field, then <b>Save</b>.</span></label></li>
+          <li><label><input type="checkbox" data-k="t6-4"><span>Live Readiness → Static IP: enter it, tick the box, click <b>Confirm static IP</b>. You can also run the outbound-IP check.</span></label></li>
+          <li><label><input type="checkbox" data-k="t6-5"><span>Click <b>Run broker check (read-only)</b> and confirm the verdict reads <i>NOT READY — trading lock is ON / every other check passed</i>.</span></label></li>
+        </ul>
+        <div class="donewhen"><b>Done when:</b> the only remaining blocker is the trading lock you deliberately left on.</div>
+      </div>
+    </details>
+
+    <details class="train" data-stage>
+      <summary>
+        <div class="badge-num">7</div>
+        <div class="train-title"><b>First live trade</b><span>One small BUY + CNC trade, followed through its whole lifecycle</span></div>
+        <div class="train-meta">1–3 weeks<br><span class="stage-count"></span></div>
+      </summary>
+      <div class="train-body">
+        <p>Follow <code>FIRST_LIVE_TRADE.md</code> step by step. Keep its "If something goes wrong" table open while the trade is live.</p>
+        <ul class="checks">
+          <li><label><input type="checkbox" data-k="t7-1"><span>Switch the mode to Live (this doesn't unlock trading). Create one small BUY + CNC LIMIT ticket while the lock is still on.</span></label></li>
+          <li><label><input type="checkbox" data-k="t7-2"><span>Inspect it: quantity, limit, stop, target, mode LIVE, notional within your cap, all checks PASS.</span></label></li>
+          <li><label><input type="checkbox" data-k="t7-3"><span>Unlock with a reason. Live Readiness should now read <b>READY</b>. Tick the 10-item first-live checklist yourself.</span></label></li>
+          <li><label><input type="checkbox" data-k="t7-4"><span>Approve that <b>one</b> ticket. Check that it has a real broker order id (not <code>PAPER-…</code>), and that after the fill it has a GTT id and reads PROTECTED.</span></label></li>
+          <li><label><input type="checkbox" data-k="t7-5"><span>Cross-check in Kite web: the order shows COMPLETE, the holding exists, and both GTT legs have the right quantity. Then <b>re-lock</b>.</span></label></li>
+          <li><label><input type="checkbox" data-k="t7-6"><span>Once the exit fills and the position is CLOSED, check there's exactly one LIVE Journal row and compare its P&amp;L with Kite's contract note.</span></label></li>
+        </ul>
+        <div class="donewhen"><b>Done when:</b> one live trade has completed the full lifecycle with no reconciliation finding, and the app's numbers agree with Kite's.</div>
+      </div>
+    </details>
+
+    <details class="train" data-stage>
+      <summary>
+        <div class="badge-num">8</div>
+        <div class="train-title"><b>Scale up slowly</b><span>Raise limits one at a time, based on the live Journal</span></div>
+        <div class="train-meta">Ongoing<br><span class="stage-count"></span></div>
+      </summary>
+      <div class="train-body">
+        <ul class="checks">
+          <li><label><input type="checkbox" data-k="t8-1"><span>Raise one limit at a time (entries per day, then max order value), and only after a clean week.</span></label></li>
+          <li><label><input type="checkbox" data-k="t8-2"><span>Every month, compare the live Journal's expectancy with the paper Journal and the backtest. If live is clearly worse, find out why before you scale further.</span></label></li>
+          <li><label><input type="checkbox" data-k="t8-3"><span>Leave the trading lock on overnight and whenever you're away for days. Exits keep working.</span></label></li>
+        </ul>
+        <div class="donewhen"><b>Done when:</b> this stage never finishes. Size follows evidence.</div>
+      </div>
+    </details>
+
+  </div>
+</section>
+
+<!-- ================= DAILY ================= -->
+<section id="daily">
+  <div class="section-head">
+    <div class="kicker">What to do daily</div>
+    <h2>The daily routine (IST)</h2>
+    <p>The strategies trade on daily candles, so this isn't screen-watching. Most of the work is a short morning check and an evening review of what the Autopilot found. The background workers handle everything during the session.</p>
+  </div>
+
+  <div class="slot-tools">
+    <span class="small"><b id="daily-count">0</b> of <b id="daily-total">0</b> done today · <span id="daily-date" class="muted"></span></span>
+    <button class="icon-btn" type="button" data-reset="daily">Clear today's ticks</button>
+  </div>
+
+  <div class="timeline">
+    <div class="slot">
+      <div class="time">08:30 – 09:10<small>Pre-market · 15 min</small></div>
+      <div>
+        <h3>Start, log in, health check</h3>
+        <ul class="checks">
+          <li><label><input type="checkbox" data-d="d1"><span>Start the server (if it isn't already running) and <b>log in to Kite</b>, which is required every day. Check the mode pill shows what you intend (Dry Run or Live).</span></label></li>
+          <li><label><input type="checkbox" data-d="d2"><span><b>Diagnostics</b>: schema current, integrity ok, workers running and not stale, session VALID, no flagged price history.</span></label></li>
+          <li><label><input type="checkbox" data-d="d3"><span><b>Positions</b>: every OPEN position reads <b>PROTECTED</b> and has a GTT id. If anything is UNPROTECTED, lock trading and fix it now.</span></label></li>
+          <li><label><input type="checkbox" data-d="d4"><span><b>Trade Queue → reconciliation</b>: no unreviewed findings. Look into any you find in Kite before marking them reviewed.</span></label></li>
+          <li><label><input type="checkbox" data-d="d5"><span><b>Today's Actions</b>: read the briefing. Exit candidates come first.</span></label></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="slot">
+      <div class="time">09:15 – 09:45<small>Market open · 10 min</small></div>
+      <div>
+        <h3>Act on pending signals</h3>
+        <ul class="checks">
+          <li><label><input type="checkbox" data-d="d6"><span>Handle <b>exit signals</b> and <b>breakeven adjustments</b> first. Exits are never blocked.</span></label></li>
+          <li><label><input type="checkbox" data-d="d7"><span>For any entry you held over from last night, check Signal Detail → <i>Context &amp; warnings</i> for how far price has moved from your limit. Approve or reject.</span></label></li>
+          <li><label><input type="checkbox" data-d="d8"><span>Check entries move to ENTRY WORKING and then OPEN with a GTT. If a limit order doesn't fill, <b>cancel it rather than chasing</b> with a new order.</span></label></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="slot">
+      <div class="time">09:45 – 15:30<small>Session · hands off</small></div>
+      <div>
+        <h3>Let the guards work</h3>
+        <p class="muted">The order monitor (20 s), trailing engine (45 s) and reconciliation (3 min) run on their own. Glance at the alert banner and Positions badge now and then. If something looks wrong, <b>lock trading first</b>. Don't manually trade the same stocks in Kite, because reconciliation will flag the mismatch.</p>
+        <ul class="checks">
+          <li><label><input type="checkbox" data-d="d9"><span>Midday glance: the trailing heartbeat is alive, the WebSocket dot is green, and there are no new alerts.</span></label></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="slot">
+      <div class="time">16:00<small>Autopilot · automatic</small></div>
+      <div>
+        <h3>Post-close pipeline</h3>
+        <p class="muted">Sync candles → check freshness → expire stale signals → run every enabled strategy → queue tickets. The app must be <b>running and logged in</b>. If it was off, the run catches up the next time you start the server or log in.</p>
+        <ul class="checks">
+          <li><label><input type="checkbox" data-d="d10"><span>Approvals → <b>Autopilot run log</b>: today's run finished. If not, use Strategies → <b>Scan Now</b>.</span></label></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="slot">
+      <div class="time">16:15 – 21:00<small>Evening review · 20–30 min</small></div>
+      <div>
+        <h3>The decision window</h3>
+        <ul class="checks">
+          <li><label><input type="checkbox" data-d="d11"><span>Open <b>Signal Detail</b> for each new entry. Check the conditions, risk checks (any <i>skipped</i>?), sizing, exit plan and volume context.</span></label></li>
+          <li><label><input type="checkbox" data-d="d12"><span>Look at the chart in Kite with the <b>Kite</b> link (your levels only appear on the in-app chart). Check for results or news days.</span></label></li>
+          <li><label><input type="checkbox" data-d="d13"><span>Decide: approve now with <b>Send as AMO</b> ticked, or keep it for the morning. A signal stays valid until the next day's 16:00 run expires it.</span></label></li>
+          <li><label><input type="checkbox" data-d="d14"><span>Open "Blocked by risk" and learn why each one was blocked. Repeated blocks may mean your limits or watchlist need adjusting.</span></label></li>
+          <li><label><input type="checkbox" data-d="d15"><span>Live only: re-lock trading for the night if you unlocked it.</span></label></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <h3 style="margin:28px 0 12px">Weekly, monthly, yearly</h3>
+  <div class="grid g3">
+    <div class="card">
+      <h4>Weekly (weekend, 30–45 min)</h4>
+      <ul>
+        <li>Journal: expectancy and profit factor by strategy and by symbol.</li>
+        <li>Database backup: <code>python -m backend.db_maintenance backup</code>, then <code>integrity</code>.</li>
+        <li>Price-Volume Research: review the watchlist, and drop names with low traded value.</li>
+        <li>Settings → Sector mappings: map any new symbols.</li>
+        <li>Diagnostics → Historical price data: rebuild any <code>NEEDS_REFRESH</code> symbols (splits or bonuses).</li>
+        <li>Skim <code>logs/kite_terminal.log</code> for errors.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Monthly</h4>
+      <ul>
+        <li>Backtest each enabled strategy over the latest 6–12 months, with walk-forward. Read the <b>net</b> figures.</li>
+        <li>Compare live, paper and backtest expectancy. If they drift apart, find out why.</li>
+        <li>Review risk settings against your current capital.</li>
+        <li>Check <code>python -m backend.db_maintenance status</code> for size and schema, and run <code>vacuum</code> with the app stopped if needed.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Yearly (December) and after code updates</h4>
+      <ul>
+        <li>Add next year's NSE holidays to <code>backend/calendar_data/nse_equity_holidays.json</code> (DEPLOYMENT.md). Without them you'll see a <code>CALENDAR_YEAR_UNCOVERED</code> warning.</li>
+        <li>Before any code change: git tag + branch + DB snapshot. After it: run <code>pytest</code> and the relevant manual checks.</li>
+        <li>Re-run Live Readiness after any update.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ================= DOCS ================= -->
+<section id="docs">
+  <div class="section-head">
+    <div class="kicker">Which .md to follow</div>
+    <h2>The documents, and when to use each one</h2>
+    <p>All files are in <code>docs/</code>. You'll use the five core documents regularly. The reports are background reading for when you need to know why something works the way it does.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Document</th><th>Read it when</th><th>What you get from it</th></tr></thead>
+      <tbody>
+        <tr><td class="file">USER_GUIDE.md</td><td><span class="pill accent">Start here</span> Training stages 1–3, and as a reference</td><td>Every screen explained: setup, modes, Approvals and Signal Detail, manual tickets, strategies, kill switch, Journal, Settings, Live Readiness, a suggested routine and troubleshooting.</td></tr>
+        <tr><td class="file">FIRST_LIVE_TRADE.md</td><td><span class="pill warn">Before going live</span> Stage 6–7, and <b>whenever something goes wrong live</b></td><td>The step-by-step first live order protocol, the 10-item checklist, and the incident table (REJECTED, UNKNOWN, PARTIAL, GTT missing, quantity mismatch, double sell, circuit breaker).</td></tr>
+        <tr><td class="file">TESTING.md</td><td>Stage 5, after every code or settings change</td><td>How to run the automated tests, the manual verification checklist (§2), known coverage gaps (§1.5) and the regression policy (§3).</td></tr>
+        <tr><td class="file">DEPLOYMENT.md</td><td>Setup, weekly maintenance, December, before running on a VM</td><td>Safe ways to run the app (local or private VM), health and readiness endpoints, logs, database migrations and backups, holiday calendar updates, rebuilding price history.</td></tr>
+        <tr><td class="file">DESIGN.md</td><td>Stage 3, and whenever you check a signal by hand</td><td>Architecture, ticket lifecycle (§4), risk and safety design (§5), <b>exact strategy rules</b> (§6), backtest model (§7), config constants (§8).</td></tr>
+        <tr><td class="file">LIVE0_PRODUCTION_READINESS_REPORT.md</td><td>Before going live</td><td>What the pre-flight checks, the hard gate at confirm time, and the blockers left on your real account.</td></tr>
+        <tr><td class="file">OPUS55_AUDIT_REPORT.md</td><td>When you want the background</td><td>The independent audit (P0/P1/P2 findings) that the PK packets below fix.</td></tr>
+        <tr><td class="file">KITE_TERMINAL_BLUEPRINT.html</td><td>This page</td><td>Training path, routine and checklists. Read it again when you return after a break.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 style="margin:28px 0 12px">PK implementation reports: look up by topic</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>If you want to understand…</th><th>Report</th></tr></thead>
+      <tbody>
+        <tr><td>Why a double-click can't place two orders</td><td class="file">PK-1 · PK-4</td></tr>
+        <tr><td>What "SUBMISSION UNKNOWN" means and why you must not resubmit</td><td class="file">PK-2</td></tr>
+        <tr><td>Why a position stays in the mode it was opened in</td><td class="file">PK-3 · PK-11</td></tr>
+        <tr><td>Browser and network security (cross-origin, host checks, deployment)</td><td class="file">PK-5 · PK-18</td></tr>
+        <tr><td>How stops (GTTs) are watched, and why a position closes only after broker confirmation</td><td class="file">PK-6 · PK-7 · PK-8 · PK-16</td></tr>
+        <tr><td>Cancelling, Emergency Exit behaviour</td><td class="file">PK-9/10/11</td></tr>
+        <tr><td>Trading lock, daily loss, max order value, circuit breaker</td><td class="file">PK-12</td></tr>
+        <tr><td>Partial fills and GTT quantity</td><td class="file">PK-13</td></tr>
+        <tr><td>Sector mapping and how exposure is measured</td><td class="file">PK-14/15</td></tr>
+        <tr><td>Why only BUY + CNC long positions are allowed</td><td class="file">PK-17</td></tr>
+        <tr><td>The Positions view and lifecycle states</td><td class="file">PK-19</td></tr>
+        <tr><td>How Dry Run paper fills work</td><td class="file">PK-20</td></tr>
+        <tr><td>Why backtests charge costs and fill at the next open</td><td class="file">PK-21</td></tr>
+        <tr><td>Migrations, NSE calendar, data integrity, Diagnostics page</td><td class="file">PK-22</td></tr>
+        <tr><td>The Volume context section (RVOL, OBV, traded value)</td><td class="file">PK-23</td></tr>
+        <tr><td>The Smart Money Accumulation Score and what it does <i>not</i> mean</td><td class="file">PK-24</td></tr>
+        <tr><td>Why the score is rated <b>LIMITED</b> and shouldn't be used to rank signals</td><td class="file">PK-25</td></tr>
+        <tr><td>The Price-Volume Research page</td><td class="file">PK-26</td></tr>
+        <tr><td>The test suite that checks the live-safety behaviour</td><td class="file">PK-0</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ================= TESTING ================= -->
+<section id="testing">
+  <div class="section-head">
+    <div class="kicker">While testing, what to verify</div>
+    <h2>Verification checklist</h2>
+    <p>This is a condensed version of <code>TESTING.md</code> §2. Run it in <b>Dry Run against a real Kite session</b> before trusting the app, and again after any change to strategy logic, risk settings or execution code. Ticks are saved with the training progress.</p>
+  </div>
+
+  <div class="grid g2">
+    <div class="card">
+      <h3>A. Automated suite</h3>
+      <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>pip install -r requirements-dev.txt
+pytest</div>
+      <ul class="checks">
+        <li><label><input type="checkbox" data-k="v-a1"><span><code>pytest</code> shows 0 failed. About 1,654 passed at LIVE-0. A lower count than the last run means tests were skipped or removed.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-a2"><span>E2E UI test against a <b>fresh</b> demo server passes, with no console errors.</span></label></li>
+      </ul>
+      <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>.venv\Scripts\python.exe tests\demo_server.py --port 8765
+<span class="c"># second terminal:</span>
+.venv\Scripts\python.exe tests\e2e_ui.py --base http://127.0.0.1:8765 --out &lt;output-dir&gt;</div>
+      <p class="small muted">The automated tests don't cover the <code>data_jobs</code> worker loop in isolation, Sharpe/Sortino/Monte Carlo maths, a live KiteTicker feed, or load and rate limits (TESTING §1.5). Check these more carefully by hand.</p>
+    </div>
+
+    <div class="card">
+      <h3>B. Environment and risk engine</h3>
+      <ul class="checks">
+        <li><label><input type="checkbox" data-k="v-b1"><span>Clean start, a good security summary line, login works, instrument cache refreshes.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-b2"><span>Watchlist and holdings both appear in the scan universe. Mode defaults to Dry Run.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-b3"><span>A reasonable manual ticket passes all six checks.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-b4"><span>Going over capital per trade, stock exposure, sector exposure or max positions is each rejected <b>with that specific check named</b>.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-b5"><span>An unmapped-sector symbol <i>skips</i> the sector check rather than failing it.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-b6"><span>An exit for a position that doesn't exist is rejected. A changed risk setting applies to the next ticket and shows in history.</span></label></li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h3>C. Strategy scans and Signal Detail</h3>
+      <ul class="checks">
+        <li><label><input type="checkbox" data-k="v-c1"><span>Pick a symbol you expect to trigger, check the rule by hand (DESIGN §6), and confirm the scan agrees.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-c2"><span>Stop, target and trailing distance match the formula for that strategy.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-c3"><span>The <code>max_signals_per_day</code> cap keeps the highest-ranked signals. A second scan doesn't create duplicates.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-c4"><span><b>Hover the signal bar. The tooltip's SMA-200, Donchian, 20-EMA and RSI values equal the Entry Conditions numbers exactly.</b> If they differ, stop and investigate.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-c5"><span>The entry, stop and target lines sit at the ticket's prices, and the shading matches the R:R.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-c6"><span>Sizing works out by hand: quantity = floor(risk budget ÷ risk per share).</span></label></li>
+        <li><label><input type="checkbox" data-k="v-c7"><span>A parameter change creates a new version, and enable/disable doesn't. A stale signal auto-expires the next day.</span></label></li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h3>D. Dry Run execution flow</h3>
+      <ul class="checks">
+        <li><label><input type="checkbox" data-k="v-d1"><span>A draft can be created, edited and deleted. An executed ticket can't be edited.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-d2"><span>An approval creates a <code>PAPER-O-…</code> order that fills only when the price allows, and then a <code>PAPER-G-…</code> GTT.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-d3"><span>Outside market hours, the order is refused unless "Send as AMO" is ticked.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-d4"><span>An exit closes the position and creates exactly one Journal row.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-d5"><span>Cancel All Pending clears the queue and leaves positions untouched.</span></label></li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h3>E. Journal and backtest</h3>
+      <ul class="checks">
+        <li><label><input type="checkbox" data-k="v-e1"><span>Dry Run and Live histories are completely separate.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-e2"><span>Win rate, expectancy, profit factor and drawdown match your own calculation on a small sample. Breakdowns add up to the totals.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-e3"><span>Backtest trades checked against raw OHLC: entry at the next open, gap-through stops fill at the open.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-e4"><span>Walk-forward reports each window separately. Monte Carlo returns a distribution.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-e5"><span>You read the <b>net</b> figures, and noticed the warning when the universe was "current watchlist" (survivorship bias).</span></label></li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h3>F. Live-only (small size, after A–E)</h3>
+      <ul class="checks">
+        <li><label><input type="checkbox" data-k="v-f1"><span>Switching to Live needs the dialog and is logged.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-f2"><span>A filled entry immediately gets the correct GTT: a single-leg stop if trailing, otherwise an OCO stop + target.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-f3"><span>The trailing stop ratchets up and snaps to the tick grid.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-f4"><span>Delete a GTT directly in Kite and confirm reconciliation flags it and waits for "Mark reviewed".</span></label></li>
+        <li><label><input type="checkbox" data-k="v-f5"><span>Emergency Exit refuses to run without typing <code>EXIT ALL</code> exactly.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-f6"><span>The Journal's live P&amp;L matches Kite's contract note (the journal leaves out some charges).</span></label></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>Regression policy (TESTING §3)</strong>
+    After any change to strategy logic, risk thresholds or execution code: (1) run the full <code>pytest</code>; (2) re-run the matching manual section (C for strategy, B for risk, F for execution); (3) for parameter changes, run a fresh backtest and compare with the baseline; (4) judge on <b>net</b> figures, since costs of about 0.08–0.10R per round trip can turn a strategy that's positive before costs negative; (5) prefer a value in the middle of a broad range that works in both halves of the data over the single best point.
+  </div>
+</section>
+
+<!-- ================= ADVANTAGE ================= -->
+<section id="advantage">
+  <div class="section-head">
+    <div class="kicker">Max advantage</div>
+    <h2>How to get the most out of the app</h2>
+    <p>The app helps you most by making each trade carefully, not by trading more often. These habits make the difference.</p>
+  </div>
+
+  <div class="grid g2">
+    <div class="card tip"><div class="ico"><svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m7 14 4-4 3 3 5-6"/></svg></div><div><h4>Never approve from the card alone</h4><p>Signal Detail shows the exact candles the strategy used, each condition with its threshold, the six risk checks with real numbers, and how the size was calculated. One minute per signal there catches most bad trades.</p></div></div>
+    <div class="card tip"><div class="ico"><svg viewBox="0 0 24 24"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"/></svg></div><div><h4>A better watchlist gives better signals</h4><p>The scans only see your watchlist and holdings. Keep it to liquid names you understand, and use Price-Volume Research to spot low traded value. The volume filters are what made both strategies profitable after costs.</p></div></div>
+    <div class="card tip"><div class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg></div><div><h4>Use the Smart Money score as context, not a ranking</h4><p>Out-of-sample validation (PK-25) rated it <b>LIMITED</b>. Scores of 75 or more <i>reduced</i> expectancy in both test periods. Read the Volume context and Accumulation evidence to understand the bar, but don't filter or rank signals by the score.</p></div></div>
+    <div class="card tip"><div class="ico"><svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg></div><div><h4>Trust the revised defaults and don't over-tune</h4><p>The September 2026 parameters were picked from the middle of ranges that worked in both halves of the data at costs up to 0.70%. A market-regime gate and a 52-week-high variant were tested and added nothing. Before changing a parameter, prove it with a net backtest and walk-forward.</p></div></div>
+    <div class="card tip"><div class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div><div><h4>Keep the Autopilot running</h4><p>Keep the server running and logged in at 16:00 IST so the scan uses the day's final candle. If you miss it, starting the server or logging in catches up. Signals expire after a day, so review every evening.</p></div></div>
+    <div class="card tip"><div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div><div><h4>Use all the safety controls</h4><p>Use the trading lock, ₹ daily loss limit, max order value and 1 entry per day at first. They block only new entries, so you can be strict with them without risking getting stuck in a position.</p></div></div>
+    <div class="card tip"><div class="ico"><svg viewBox="0 0 24 24"><path d="M9 11l3 3 8-8"/><path d="M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h9"/></svg></div><div><h4>Map every sector</h4><p>An unmapped symbol skips the sector-exposure check without blocking anything. Clear the "unmapped symbols" helper every week so the risk engine can apply all six checks.</p></div></div>
+    <div class="card tip"><div class="ico"><svg viewBox="0 0 24 24"><path d="M7 7h13l-3-3M17 17H4l3 3"/></svg></div><div><h4>Act on exits and breakeven first</h4><p>Exit signals and breakeven proposals protect profit you already have. Handle them before looking at new entries, every session.</p></div></div>
+    <div class="card tip"><div class="ico"><svg viewBox="0 0 24 24"><path d="M3 12h4l2-5 4 10 2-5h6"/></svg></div><div><h4>Let the Journal decide</h4><p>Check expectancy by strategy, not just the overall total. Ignore the numbers until there are at least 20 trades, and wait for 30 before going live. If a strategy is negative over a real sample, disable it, however good it looked in backtests.</p></div></div>
+    <div class="card tip"><div class="ico"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg></div><div><h4>Keep your data clean</h4><p>Rebuild <code>NEEDS_REFRESH</code> symbols after splits and bonuses, since the live scan skips them. Back up weekly. The database holds your tickets, about 47k candles and the instrument cache, and git doesn't restore any of them.</p></div></div>
+  </div>
+
+  <div class="callout bad" style="margin-top:18px">
+    <strong>Don't do these</strong>
+    Run with <code>--reload</code> or more than one worker · expose port 8000 to the internet (the app has no login of its own) · resubmit an order whose outcome is UNKNOWN · place a second order to "fix" a partial fill · trade the same symbols by hand in Kite while the app manages them · edit <code>kite_terminal.db</code> by hand · enable RSI Mean Reversion live · rank signals by the Smart Money score.
+  </div>
+</section>
+
+<!-- ================= INCIDENTS ================= -->
+<section id="incidents">
+  <div class="section-head">
+    <div class="kicker">When it goes wrong</div>
+    <h2>Quick incident guide</h2>
+    <p>For live incidents, <b>lock trading first</b>, then look at Kite itself. The full table is in <code>FIRST_LIVE_TRADE.md</code> → "If something goes wrong".</p>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>You see</th><th>It usually means</th><th>Do this</th></tr></thead>
+      <tbody>
+        <tr><td>"Session expired"</td><td>It's a new trading day</td><td>Log in again. Kite requires a login every day.</td></tr>
+        <tr><td>Live order rejected, "IP not allowed"</td><td>Your static IP isn't registered</td><td>Developer console → static IP, and Live Readiness → Static IP. Create a <i>new</i> ticket; the failed one can't be reused.</td></tr>
+        <tr><td><code>LIVE_PREREQUISITE_MISSING</code></td><td>Notional cap, ₹ daily loss, static IP, or an UNKNOWN order</td><td>Open Live Readiness. It lists exactly which one.</td></tr>
+        <tr><td>SUBMISSION UNKNOWN</td><td>The network failed while the order was being sent</td><td>Lock. <b>Do not resubmit.</b> Search Kite's order book for the ticket's tag, and wait up to 15 minutes for the monitor's verdict.</td></tr>
+        <tr><td>Protection failed / UNPROTECTED</td><td>The entry filled but the GTT couldn't be placed</td><td>Lock. Place a stop-loss <b>in Kite</b> immediately, then mark the finding reviewed.</td></tr>
+        <tr><td>ENTRY PARTIAL</td><td>Only part of the order filled</td><td>The GTT already covers the filled quantity. Let the rest keep working or cancel it. Never place a second order.</td></tr>
+        <tr><td>Quantity mismatch / possible double sell</td><td>The app and Kite disagree about what you hold</td><td>Lock. Compare holdings and GTTs in Kite, delete any GTT on shares you no longer hold, then mark reviewed.</td></tr>
+        <tr><td>Circuit breaker OPEN</td><td>The broker or connection failed repeatedly</td><td>Find the cause in Diagnostics and the logs. Reset only once you understand it.</td></tr>
+        <tr><td>A signal disappeared</td><td>It expired because it was based on an old candle</td><td>Nothing to do. This is intended, so you never approve against old prices.</td></tr>
+        <tr><td><code>INVALID_HOST</code></td><td>The browser address isn't allowed</td><td>Use <code>127.0.0.1:8000</code> or <code>localhost:8000</code>.</td></tr>
+        <tr><td>Something you can't explain</td><td>—</td><td>Lock trading and investigate. Use Emergency Exit (type <code>EXIT ALL</code>) only if every position has to be closed.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ================= COMMANDS ================= -->
+<section id="commands">
+  <div class="section-head">
+    <div class="kicker">Cheat sheet</div>
+    <h2>Commands</h2>
+    <p>Run these from the project root, <code>D:\Claude_WS\kite-terminal</code>, with the virtual environment active.</p>
+  </div>
+  <div class="grid g2">
+    <div class="card">
+      <h4>Run</h4>
+      <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>.venv\Scripts\activate
+python -m backend.server</div>
+      <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>python -m backend.server --port 8001</div>
+      <h4 style="margin-top:12px">Practice / test</h4>
+      <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>.venv\Scripts\python.exe tests\demo_server.py --port 8765</div>
+      <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>pytest</div>
+    </div>
+    <div class="card">
+      <h4>Database maintenance</h4>
+      <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>python -m backend.db_maintenance status</div>
+      <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>python -m backend.db_maintenance integrity</div>
+      <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>python -m backend.db_maintenance backup</div>
+      <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>python -m backend.db_maintenance vacuum   <span class="c"># app stopped!</span></div>
+    </div>
+    <div class="card">
+      <h4>Health endpoints (browser or curl)</h4>
+      <ul class="small">
+        <li><code>/api/health</code>: the process is up</li>
+        <li><code>/api/ready</code>: ready to trade, or 503 with a list of blockers</li>
+        <li><code>/api/diagnostics</code>: everything on the Diagnostics page</li>
+        <li><code>/api/live-readiness</code>: the LIVE-0 pre-flight (<code>?broker=true</code> adds a read-only Kite snapshot)</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Before changing any code</h4>
+      <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>git tag backup-pre-&lt;work&gt;
+git branch backup/pre-&lt;work&gt;
+copy backend\kite_terminal.db backend\kite_terminal.db.pre_&lt;work&gt;_bak</div>
+      <p class="small muted">The database isn't tracked by git, so a git backup alone only covers half of a rollback.</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  Kite Terminal Blueprint · based on <code>USER_GUIDE.md</code>, <code>TESTING.md</code>, <code>FIRST_LIVE_TRADE.md</code>, <code>DEPLOYMENT.md</code>, <code>DESIGN.md</code> and the LIVE-0 / PK-0…PK-26 reports, as of 2 Oct 2026.
+  Backtest figures are historical results on the symbols tested, not a promise of returns. READY on Live Readiness means the app is technically ready; it says nothing about whether a trade is a good idea.
+</footer>
+
+</main>
+
+<script>
+(function () {
+  var TRAIN_KEY = "ktb-train-v1";
+  var DAILY_KEY = "ktb-daily-v1";
+
+  function load(key) {
+    try { return JSON.parse(localStorage.getItem(key) || "{}") || {}; } catch (e) { return {}; }
+  }
+  function save(key, val) {
+    try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {}
+  }
+  function todayStr() {
+    var d = new Date();
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+  }
+
+  var train = load(TRAIN_KEY);
+  var daily = load(DAILY_KEY);
+  if (daily.date !== todayStr()) daily = { date: todayStr(), ticks: {} };
+
+  var trainBoxes = Array.prototype.slice.call(document.querySelectorAll("input[data-k]"));
+  var dailyBoxes = Array.prototype.slice.call(document.querySelectorAll("input[data-d]"));
+
+  trainBoxes.forEach(function (b) { b.checked = !!train[b.dataset.k]; });
+  dailyBoxes.forEach(function (b) { b.checked = !!daily.ticks[b.dataset.d]; });
+
+  function refresh() {
+    var stageBoxes = document.querySelectorAll("#train-list input[data-k]");
+    var done = 0;
+    stageBoxes.forEach(function (b) { if (b.checked) done++; });
+    document.getElementById("train-count").textContent = done;
+    document.getElementById("train-total").textContent = stageBoxes.length;
+    document.getElementById("train-bar").style.width = (stageBoxes.length ? (done / stageBoxes.length * 100) : 0) + "%";
+
+    document.querySelectorAll("details[data-stage]").forEach(function (d) {
+      var bs = d.querySelectorAll("input[data-k]");
+      var n = 0;
+      bs.forEach(function (b) { if (b.checked) n++; });
+      d.querySelector(".stage-count").textContent = n + " / " + bs.length + " done";
+      d.classList.toggle("done", bs.length > 0 && n === bs.length);
+    });
+
+    var dd = 0;
+    dailyBoxes.forEach(function (b) { if (b.checked) dd++; });
+    document.getElementById("daily-count").textContent = dd;
+    document.getElementById("daily-total").textContent = dailyBoxes.length;
+    document.getElementById("daily-date").textContent = daily.date;
+  }
+
+  trainBoxes.forEach(function (b) {
+    b.addEventListener("change", function () {
+      if (b.checked) train[b.dataset.k] = 1; else delete train[b.dataset.k];
+      save(TRAIN_KEY, train); refresh();
+    });
+  });
+  dailyBoxes.forEach(function (b) {
+    b.addEventListener("change", function () {
+      if (b.checked) daily.ticks[b.dataset.d] = 1; else delete daily.ticks[b.dataset.d];
+      save(DAILY_KEY, daily); refresh();
+    });
+  });
+
+  document.querySelectorAll("[data-reset]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var which = btn.dataset.reset;
+      if (which === "train") {
+        if (!confirm("Clear all training and verification ticks?")) return;
+        train = {}; save(TRAIN_KEY, train);
+        trainBoxes.forEach(function (b) { b.checked = false; });
+      } else {
+        daily = { date: todayStr(), ticks: {} }; save(DAILY_KEY, daily);
+        dailyBoxes.forEach(function (b) { b.checked = false; });
+      }
+      refresh();
+    });
+  });
+
+  // Open the first unfinished training stage.
+  var stages = document.querySelectorAll("details[data-stage]");
+  refresh();
+  for (var i = 0; i < stages.length; i++) {
+    if (!stages[i].classList.contains("done")) { stages[i].open = true; break; }
+  }
+
+  // Copy buttons.
+  document.querySelectorAll(".cmd .copy").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var clone = btn.parentNode.cloneNode(true);
+      clone.querySelectorAll(".copy, .c").forEach(function (n) { n.remove(); });
+      var text = clone.textContent.replace(/^\s+|\s+$/g, "");
+      function ok() { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy"; }, 1200); }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(ok, function () {});
+      }
+    });
+  });
+
+  // Theme toggle.
+  document.getElementById("theme-btn").addEventListener("click", function () {
+    var root = document.documentElement;
+    var cur = root.getAttribute("data-theme");
+    if (!cur) cur = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    var next = cur === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem("ktb-theme", next); } catch (e) {}
+  });
+})();
+</script>
+</body>
+</html>
