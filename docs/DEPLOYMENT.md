@@ -50,6 +50,7 @@ All settings are environment variables, which can go in `.env`; see
 | `KITE_TERMINAL_DEV_RELOAD` | `0` | Development only: restart on file changes (`--dev-reload`). |
 | `KITE_TERMINAL_WORKERS` | `1` | Must be 1. |
 | `KITE_TERMINAL_LOG_FILE` | `logs/kite_terminal.log` (launcher) | PK-22: rotating log file, 10 MB × 11 files at most. `off` disables it (console only). Bare `uvicorn` and the tests log to the console unless it is set. |
+| `KITE_REST_PROXY` | *(empty)* | NET-1: `http://host:port` (or `https://`) proxy for **every Kite REST call** only — login, reads, historical data, orders, GTTs. KiteTicker stays direct. No credentials. Malformed → refuses to start. See Mode A+. |
 | `KITE_TERMINAL_ENCRYPTION_KEY` | generated | Fernet key for the stored secret and token. The app appends a generated key to `.env` if none is set. For a VM, supply it from the service environment instead. A value already in the environment is never overridden by `.env`. |
 
 ## Mode A — Local desktop (default)
@@ -62,6 +63,75 @@ python -m backend.server
   `http://127.0.0.1:8000`.
 - TLS is not needed, because traffic never leaves the machine.
 - The Kite app's redirect URL is `http://127.0.0.1:8000/callback`.
+
+## Mode A+ — Local terminal, Kite REST via a static-IP proxy (NET-1)
+
+Use Mode A+ when the terminal runs on your own machine (here: Windows) but
+Kite must see a fixed static IP for order placement. Only the Kite **REST**
+traffic leaves through a small cloud VM. The application, its database and
+the browser stay local.
+
+```
+Windows: Kite Terminal on 127.0.0.1:8000 (unchanged)
+   │
+   ├── Kite REST (login, reads, historical, orders, GTTs)
+   │     KiteConnect(proxies=KITE_REST_PROXY)
+   │     → WireGuard 10.77.0.2 → 10.77.0.1:3128 (Squid, HTTP CONNECT)
+   │     → GCP static IPv4 → api.kite.trade
+   │
+   └── KiteTicker WebSocket (live ticks) → Kite DIRECTLY (never proxied)
+```
+
+Configuration (add to `.env`; it is not a secret):
+
+```
+KITE_REST_PROXY=http://10.77.0.1:3128
+```
+
+How the terminal uses it:
+
+- **One client factory.** Every KiteConnect is built by
+  `kite_client.create_kite_connect`, which passes
+  `proxies={"http": url, "https": url}` and makes the HTTP session ignore
+  environment proxy settings (`HTTP(S)_PROXY`, `NO_PROXY`, netrc). No
+  process-wide proxy variable is set, so nothing else is proxied.
+- **Fail closed.** A set but malformed value (no scheme, `ftp://`, no or
+  invalid port, credentials, a path) refuses to start. A configured proxy
+  that cannot be reached fails the call; it is never retried directly. A
+  failed order submission takes the usual UNKNOWN path (check Kite's order
+  book; never resubmit).
+- **Live Readiness → Kite REST Route.** PASS only after "Run broker check"
+  proves read-only Kite calls answer through the proxy; FAIL when the proxy
+  is unreachable (this blocks READY even with a confirmed static IP); WARN
+  when no proxy is configured.
+- **Outbound-IP check.** The optional, user-triggered "Verify outbound IP"
+  button goes through the same proxy, so it reports the IP Kite sees for
+  REST calls. Re-run it after enabling the proxy: an observation taken
+  before (the home ISP IP) is otherwise kept for up to 24 h.
+
+Security rules for the proxy (they live on the VM and in GCP, not in this
+app):
+
+- Squid listens on the WireGuard address `10.77.0.1` only.
+- Its source ACL allows the Windows peer `10.77.0.2` only. No proxy
+  username/password is needed, and none is accepted in `KITE_REST_PROXY`.
+- TCP 3128 is **never** opened in the GCP firewall. Only the WireGuard UDP
+  port is reachable from the internet.
+- The terminal itself stays bound to `127.0.0.1`.
+  `KITE_TERMINAL_ALLOW_REMOTE_BIND` is not needed, and the app is never
+  bound to `10.77.0.1` or `10.77.0.2`.
+
+Manual network sanity check (setup only; the app never calls it on its
+own):
+
+```
+curl.exe -x http://10.77.0.1:3128 https://api.ipify.org
+```
+
+This must print the VM's static public IP, the one whitelisted in the Kite
+developer console (currently `35.184.97.233`).
+
+Phase 2 (running order execution on the VM itself) is deliberately deferred.
 
 ## Mode B — Private cloud VM
 

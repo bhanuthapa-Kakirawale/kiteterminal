@@ -137,3 +137,32 @@ def test_cautious_profile_never_saves_or_invents_an_amount():
     assert '[name="max_new_entries_per_day"]\').value = 1' in handler
     assert not re.search(r'max_order_notional"\]\'\)\.value\s*=', handler)
     assert not re.search(r'max_daily_loss_amount"\]\'\)\.value\s*=', handler)
+
+
+# ---------------------------------------------------------------- NET-1: Kite REST route
+
+@needs_node
+def test_net1_route_is_shown_in_the_header_and_as_its_own_section(ready, monkeypatch):
+    monkeypatch.setenv("KITE_REST_PROXY", "http://10.77.0.1:3128")
+    model = _model(_evaluate())
+    assert model["restRoute"] == {"mode": "PROXY", "endpoint": "10.77.0.1:3128"}
+    assert model["meta"].endswith("· REST via PROXY 10.77.0.1:3128")
+    section = next(s for s in model["sections"] if s["key"] == "network")
+    assert section["title"] == "Kite REST Route" and section["worst"] == "PASS"
+    assert [(r["code"], r["status"]) for r in section["rows"]] == [("KITE_REST_ROUTE", "PASS")]
+    assert model["staticIp"]["egress_route"] == "PROXY" and model["staticIp"]["egress_proxy"] == "10.77.0.1:3128"
+
+
+@needs_node
+def test_net1_direct_and_invalid_route_texts():
+    assert run(["restRouteText", {"mode": "DIRECT", "endpoint": None}],
+               ["restRouteText", {"mode": "PROXY", "endpoint": "10.77.0.1:3128"}],
+               ["restRouteText", {"mode": "INVALID", "endpoint": None}],
+               ["restRouteText", None]) == ["REST DIRECT", "REST via PROXY 10.77.0.1:3128",
+                                            "REST proxy setting INVALID", ""]
+
+
+def test_net1_outbound_ip_button_names_the_proxy_route():
+    code = _code_only(READINESS_JS.read_text(encoding="utf-8"))
+    assert 'detail.egress_route === "PROXY"' in code
+    assert "Verify outbound IP via the Kite REST proxy" in code

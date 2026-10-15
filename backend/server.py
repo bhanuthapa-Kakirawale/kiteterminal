@@ -14,6 +14,9 @@ Safe defaults, and every widening of exposure is an explicit opt-in:
   same database, so ``KITE_TERMINAL_WORKERS`` other than 1 is refused.
 - **Proxy headers** ignored unless ``KITE_TERMINAL_TRUSTED_PROXY_IPS`` lists
   the reverse proxy's address. (uvicorn's own default trusts 127.0.0.1.)
+- **Kite REST proxy** (NET-1): a set but malformed ``KITE_REST_PROXY`` is
+  refused here, so the terminal never starts on a route other than the one
+  configured (backend/kite_rest_proxy.py).
 
 The same rules are re-checked inside the app at startup
 (``enforce_runtime_policy``), so ``uvicorn backend.main:app --host 0.0.0.0``
@@ -30,6 +33,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, MutableMapping, Sequence
+
+from backend import kite_rest_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +235,14 @@ def runtime_warnings(config: RuntimeConfig, allowed_hosts) -> list[str]:
     return warnings
 
 
+def check_kite_rest_route(env: Mapping[str, str]) -> dict:
+    """NET-1: refuse a set but malformed KITE_REST_PROXY."""
+    status = kite_rest_proxy.route_status(env)
+    if status["mode"] == kite_rest_proxy.INVALID:
+        raise RuntimeConfigError(status["error"])
+    return status
+
+
 def enforce_runtime_policy(env: Mapping[str, str] | None = None, argv: Sequence[str] | None = None,
                            allowed_hosts=None) -> RuntimeConfig:
     """Called first at app startup: refuse an unsafe runtime, log the summary."""
@@ -241,10 +254,12 @@ def enforce_runtime_policy(env: Mapping[str, str] | None = None, argv: Sequence[
     config = detect_runtime(env, argv)
     try:
         validate(config)
+        route = check_kite_rest_route(env)
     except RuntimeConfigError as e:
         logger.critical("Refusing to start: %s", e)
         raise
     logger.info(security_summary(config, allowed))
+    logger.info(kite_rest_proxy.describe(route))
     for warning in runtime_warnings(config, allowed):
         logger.warning(warning)
     return config
@@ -256,6 +271,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     load_dotenv()
     try:
         config = resolve_runtime(os.environ, sys.argv[1:] if argv is None else argv)
+        check_kite_rest_route(os.environ)
     except RuntimeConfigError as e:
         print(f"Refusing to start: {e}", file=sys.stderr)
         return 2

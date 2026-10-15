@@ -5,7 +5,7 @@ from cryptography.fernet import InvalidToken
 from fastapi import Depends, HTTPException
 from kiteconnect import KiteConnect
 
-from backend import crypto
+from backend import crypto, kite_rest_proxy
 from backend.accounts import get_account, get_default_account, get_trading_account
 from backend.db import get_connection
 from backend.redaction import register_secret
@@ -45,6 +45,22 @@ def _access_token_decrypted(account) -> str | None:
     return token
 
 
+def create_kite_connect(api_key: str) -> KiteConnect:
+    """NET-1: the one place a KiteConnect REST client is built. With
+    KITE_REST_PROXY set, every request it makes (login, reads, historical
+    data, orders, GTTs) goes through that proxy and nowhere else: an invalid
+    value raises KiteRestProxyError before any client exists, and the session
+    ignores environment proxy settings (HTTP(S)_PROXY, NO_PROXY, netrc) so
+    nothing can bypass or redirect the configured route. KiteTicker is not
+    built here and stays direct."""
+    proxy = kite_rest_proxy.from_env()
+    if proxy is None:
+        return KiteConnect(api_key=api_key)
+    kite = KiteConnect(api_key=api_key, proxies=proxy.requests_proxies)
+    kite.reqsession.trust_env = False
+    return kite
+
+
 def _resolve_account(account_id: int | None):
     if account_id is None:
         return get_default_account()
@@ -53,13 +69,13 @@ def _resolve_account(account_id: int | None):
 
 def build_login_url(account_id: int | None = None) -> str:
     account = _resolve_account(account_id)
-    kite = KiteConnect(api_key=_api_key(account))
+    kite = create_kite_connect(_api_key(account))
     return kite.login_url()
 
 
 def exchange_request_token(request_token: str, account_id: int | None = None) -> dict:
     account = _resolve_account(account_id)
-    kite = KiteConnect(api_key=_api_key(account))
+    kite = create_kite_connect(_api_key(account))
     register_secret(request_token)
     data = kite.generate_session(request_token, api_secret=_api_secret_decrypted(account))
     register_secret(data["access_token"])
@@ -131,7 +147,7 @@ def get_kite(account_id: int | None = None) -> KiteConnect:
     token = _access_token_decrypted(account)
     if not token:
         raise NoActiveSessionError()
-    kite = KiteConnect(api_key=_api_key(account))
+    kite = create_kite_connect(_api_key(account))
     kite.set_access_token(token)
     return kite
 
@@ -149,6 +165,13 @@ def require_kite() -> KiteConnect:
                 "error_code": "NO_SESSION",
                 "message": "Not connected to Zerodha. Please log in.",
             },
+        )
+    except kite_rest_proxy.KiteRestProxyError as e:
+        # Fail closed: a configured proxy that cannot be used is never
+        # replaced by a direct connection.
+        raise HTTPException(
+            status_code=503,
+            detail={"error_code": "KITE_REST_PROXY_INVALID", "message": str(e)},
         )
 
 

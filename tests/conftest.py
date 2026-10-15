@@ -33,6 +33,14 @@ TERMINAL_ORIGIN = "http://127.0.0.1:8000"
 TERMINAL_HEADERS = {"X-Kite-Terminal": "1", "Origin": TERMINAL_ORIGIN}
 
 
+@pytest.fixture(autouse=True)
+def _no_kite_rest_proxy(monkeypatch):
+    """NET-1: backend.main's load_dotenv() would copy a real .env's
+    KITE_REST_PROXY into the test process. Every test starts on the direct
+    route; a test that needs the proxy sets it explicitly."""
+    monkeypatch.delenv("KITE_REST_PROXY", raising=False)
+
+
 def terminal_client(app, **kwargs):
     from fastapi.testclient import TestClient
     return TestClient(app, base_url=TERMINAL_ORIGIN, headers=TERMINAL_HEADERS, **kwargs)

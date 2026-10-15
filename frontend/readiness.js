@@ -10,6 +10,9 @@
 // confirmation and the deliberate outbound-IP check. Every value is set with
 // textContent, never innerHTML.
 //
+// NET-1: the Kite REST route (DIRECT, or PROXY via host:port) is shown in
+// the header line, and the outbound-IP check says which route it uses.
+//
 // viewModel() is pure (no DOM) so tests/js/render_readiness.js can run it in
 // Node; render() only draws what it returns.
 (function (root) {
@@ -66,8 +69,16 @@
     };
   }
 
+  function restRouteText(route) {
+    if (!route || !route.mode) return "";
+    if (route.mode === "PROXY") return `REST via PROXY ${route.endpoint}`;
+    if (route.mode === "INVALID") return "REST proxy setting INVALID";
+    return "REST DIRECT";
+  }
+
   function viewModel(data) {
     const checks = data.checks || [];
+    const route = restRouteText(data.rest_route);
     const sections = (data.sections || []).map((s) => {
       const rows = checks.filter((c) => c.section === s.key).map((c) => ({
         code: c.code,
@@ -86,11 +97,13 @@
       verdict: verdict(data),
       disclaimer: data.disclaimer,
       meta: `Execution mode ${String(data.execution_mode || "").toUpperCase()} · checked ${data.checked_at} UTC · ` +
-        (data.broker_checked ? `broker read ${data.broker_snapshot_at} UTC (read-only)` : "broker not checked yet"),
+        (data.broker_checked ? `broker read ${data.broker_snapshot_at} UTC (read-only)` : "broker not checked yet") +
+        (route ? ` · ${route}` : ""),
       blocking: checks.filter(isBlockingFailure).map((c) => ({ code: c.code, label: statusLabel(c.status), message: c.message })),
       warnings: checks.filter((c) => c.status === "WARN").map((c) => ({ code: c.code, message: c.message })),
       sections,
       staticIp: staticIp && staticIp.detail ? staticIp.detail : null,
+      restRoute: data.rest_route || null,
       brokerChecked: Boolean(data.broker_checked),
       showChecklist: data.overall_status === "READY",
       checklist: FIRST_LIVE_CHECKLIST.map((text) => ({ text, checked: false })),
@@ -160,8 +173,10 @@
     const status = el("p", { class: "rd-ip-status", role: "status" });
     const confirmBtn = el("button", { type: "button", class: "btn btn-small btn-primary", text: "Confirm static IP" });
     const clearBtn = el("button", { type: "button", class: "btn btn-small btn-outline", text: "Clear" });
+    const viaProxy = Boolean(detail && detail.egress_route === "PROXY");
     const egressBtn = el("button", { type: "button", class: "btn btn-small btn-outline",
-      text: "Check this machine's outbound IP" });
+      text: viaProxy ? `Verify outbound IP via the Kite REST proxy (${detail.egress_proxy})`
+        : "Check this machine's outbound IP" });
     const run = async (button, fn) => {
       button.disabled = true;
       status.textContent = "";
@@ -192,8 +207,11 @@
       el("label", { class: "rd-tick", for: "rd-ip-confirm" }, tick,
         " I checked: this IP is whitelisted in my Kite developer console app"),
       el("div", { class: "rd-actions" }, confirmBtn, clearBtn, egressBtn),
-      el("p", { class: "rd-help", text: "The outbound-IP check makes one request to api.ipify.org, which sees only this " +
-        "machine's public IP. It is optional and only runs when you click it." }),
+      el("p", { class: "rd-help", text: viaProxy
+        ? `The outbound-IP check makes one request to api.ipify.org through the Kite REST proxy (${detail.egress_proxy}), ` +
+          "so it sees the public IP Kite sees for REST calls. It is optional and only runs when you click it."
+        : "The outbound-IP check makes one request to api.ipify.org, which sees only this " +
+          "machine's public IP. It is optional and only runs when you click it." }),
       status);
     return box;
   }
@@ -272,5 +290,5 @@
     }
   }
 
-  root.KTReadiness = { load, viewModel, statusLabel, FIRST_LIVE_CHECKLIST };
+  root.KTReadiness = { load, viewModel, statusLabel, restRouteText, FIRST_LIVE_CHECKLIST };
 })(typeof window !== "undefined" ? window : globalThis);

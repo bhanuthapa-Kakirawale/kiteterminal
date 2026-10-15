@@ -19,6 +19,12 @@ worker staleness, the absolute notional and rupee daily-loss limits, the
 static-IP prerequisite, unresolved UNKNOWN submissions, critical
 reconciliation findings, strategy-history freshness and a real broker read.
 
+NET-1: when KITE_REST_PROXY is configured, the same broker snapshot proves
+the Windows -> proxy -> Kite HTTPS route (KITE_REST_ROUTE). A configured
+proxy that does not reach Kite blocks readiness, whatever the static-IP
+attestation says. The deliberate outbound-IP check goes through that proxy
+too, so it observes the IP Kite sees for REST calls.
+
 Research analytics (Volume Research / scores) are never a prerequisite:
 their history staleness is reported as a warning only.
 
@@ -42,7 +48,9 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from backend import config, db, execution, obs, trading_calendar
+import requests
+
+from backend import config, db, execution, kite_rest_proxy, obs, trading_calendar
 
 logger = logging.getLogger(__name__)
 
@@ -230,9 +238,18 @@ def clear_static_ip(conn: sqlite3.Connection, account_id: int) -> dict:
 
 def _fetch_egress_ip() -> str:
     """One HTTPS GET to the configured echo service. Only ever called from
-    check_egress_ip(), which only a deliberate user action reaches."""
+    check_egress_ip(), which only a deliberate user action reaches.
+
+    NET-1: with KITE_REST_PROXY set it goes through that proxy (an explicit
+    ProxyHandler, which ignores environment proxies), so it observes the IP
+    Kite sees for REST calls, never silently the direct route."""
     request = urllib.request.Request(config.EGRESS_IP_ECHO_URL, headers={"User-Agent": "kite-terminal-preflight"})
-    with urllib.request.urlopen(request, timeout=config.EGRESS_IP_TIMEOUT_SECONDS) as response:  # noqa: S310
+    proxy = kite_rest_proxy.from_env()
+    if proxy is None:
+        opener = urllib.request.urlopen
+    else:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxy.requests_proxies)).open
+    with opener(request, timeout=config.EGRESS_IP_TIMEOUT_SECONDS) as response:  # noqa: S310
         return response.read(64).decode("ascii", "replace").strip()
 
 
@@ -292,6 +309,9 @@ class BrokerSnapshot:
     ltp_key: str | None = None
     ltp: float | None = None
     errors: dict = field(default_factory=dict)
+    # NET-1: reads that failed in transport (requests: proxy, connect,
+    # timeout) rather than with a Kite API error.
+    transport_errors: set = field(default_factory=set)
     session_error: str | None = None   # no usable session: nothing was read
 
 
@@ -314,6 +334,8 @@ def take_snapshot(kite, ltp_key: str) -> BrokerSnapshot:
             raise
         except Exception as e:
             snap.errors[name] = _describe(e)
+            if isinstance(e, requests.RequestException):
+                snap.transport_errors.add(name)
     try:
         price = ro.ltp(ltp_key)[ltp_key]["last_price"]
         if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
@@ -323,6 +345,8 @@ def take_snapshot(kite, ltp_key: str) -> BrokerSnapshot:
         raise
     except Exception as e:
         snap.errors["ltp"] = _describe(e)
+        if isinstance(e, requests.RequestException):
+            snap.transport_errors.add("ltp")
     return snap
 
 
@@ -350,6 +374,9 @@ def broker_snapshot(conn: sqlite3.Connection, account_id: int, refresh: bool = F
     except kite_client.NoActiveSessionError:
         return BrokerSnapshot(taken_at=_sql_utc(_utc_now()), ltp_key=ltp_key,
                               session_error="No usable Kite session for today: log in first.")
+    except kite_rest_proxy.KiteRestProxyError as e:
+        return BrokerSnapshot(taken_at=_sql_utc(_utc_now()), ltp_key=ltp_key,
+                              session_error=f"Kite REST proxy configuration invalid ({e}): no broker call was made.")
     snap = take_snapshot(kite, ltp_key)
     with _cache_lock:
         _cache[account_id] = (time.monotonic(), snap)
@@ -609,10 +636,60 @@ def _broker_checks(conn: sqlite3.Connection, account: sqlite3.Row, snap: BrokerS
     return out
 
 
+_SNAPSHOT_READS = ("profile", "holdings", "positions", "margins", "orders", "gtts")
+
+
+def _route_answered(snap: BrokerSnapshot) -> bool:
+    """Kite answered through the route: some read returned data, or failed
+    with a Kite API error (a reply from Kite itself), not in transport."""
+    if snap.ltp is not None or any(getattr(snap, name) is not None for name in _SNAPSHOT_READS):
+        return True
+    return any(name not in snap.transport_errors for name in snap.errors)
+
+
+def _rest_route_checks(snap: BrokerSnapshot | None, route: dict) -> list[dict]:
+    """NET-1: is the Kite REST route this terminal is configured for usable?
+    Proven by the one LIVE-0 broker snapshot (taken by the same
+    proxy-configured client every order uses), never by a port probe or an
+    external IP-echo service."""
+    detail = {"mode": route["mode"], "endpoint": route["endpoint"]}
+    if route["mode"] == kite_rest_proxy.INVALID:
+        return [_check("KITE_REST_ROUTE", "network", FAIL,
+                       f"{route['error']} Every Kite REST call is refused until it is fixed (never sent directly).",
+                       True, detail=detail)]
+    if route["mode"] == kite_rest_proxy.DIRECT:
+        return [_check("KITE_REST_ROUTE", "network", WARN,
+                       f"No REST proxy configured ({kite_rest_proxy.ENV_VAR} not set): Kite REST calls go directly "
+                       f"from this machine. Live orders work only if this machine's own outbound IP is the "
+                       f"whitelisted static IP.", False, detail=detail)]
+    via = f"proxy {route['endpoint']}"
+    if snap is None:
+        return [_check("KITE_REST_ROUTE", "network", USER_ACTION,
+                       f"Kite REST is configured through {via}. Run the broker check to prove the route reaches Kite "
+                       f"with a read-only call.", True, detail=detail)]
+    if snap.session_error:
+        return [_check("KITE_REST_ROUTE", "network", USER_ACTION,
+                       f"Kite REST is configured through {via}, but the route could not be proven: "
+                       f"{snap.session_error} (Login also goes through the proxy.)", True, detail=detail)]
+    if _route_answered(snap):
+        return [_check("KITE_REST_ROUTE", "network", PASS,
+                       f"Kite REST via {via}: read-only Kite calls answered at {snap.taken_at} UTC.", True,
+                       detail=detail)]
+    first = next(iter(sorted(snap.errors)), None)
+    reason = snap.errors[first] if first else "no reply"
+    return [_check("KITE_REST_ROUTE", "network", FAIL,
+                   f"Kite REST is configured through {via}, but the proxy route is unreachable ({reason}). Calls are "
+                   f"never retried directly: fix the tunnel/proxy, then re-run the broker check.", True,
+                   detail=detail)]
+
+
 def _static_ip_checks(conn: sqlite3.Connection, account_id: int, now: datetime) -> list[dict]:
     s = static_ip_status(conn, account_id, now)
     detail = {k: s[k] for k in ("static_ip", "confirmed_at", "egress_ip", "egress_checked_at", "egress_error")}
     detail["state"] = s["status"]
+    route = kite_rest_proxy.route_status()
+    detail["egress_route"] = route["mode"]
+    detail["egress_proxy"] = route["endpoint"]
     if s["status"] == STATIC_IP_VERIFIED:
         return [_check("STATIC_IP", "static_ip", PASS, s["message"], True, detail=detail)]
     if s["status"] == STATIC_IP_USER_CONFIRMED:
@@ -889,6 +966,7 @@ SECTION_TITLES = {
     "database": "Database",
     "security": "Security",
     "broker": "Broker",
+    "network": "Kite REST Route",
     "static_ip": "Static IP",
     "market_data": "Market Data",
     "workers": "Workers",
@@ -906,6 +984,7 @@ def evaluate(broker: bool = False, refresh: bool = False, now: datetime | None =
     """The pre-flight. Read-only; broker reads only when broker=True."""
     from backend.accounts import get_default_account
     now = now or _utc_now()
+    route = kite_rest_proxy.route_status()
     conn = db.get_connection()
     try:
         account = get_default_account(conn)
@@ -915,6 +994,7 @@ def evaluate(broker: bool = False, refresh: bool = False, now: datetime | None =
         checks += _database_checks(conn)
         checks += _security_checks()
         checks += _broker_checks(conn, account, snap)
+        checks += _rest_route_checks(snap, route)
         checks += _static_ip_checks(conn, account_id, now)
         checks += _market_checks(conn, account_id, snap, now)
         checks += _worker_checks(now)
@@ -936,6 +1016,7 @@ def evaluate(broker: bool = False, refresh: bool = False, now: datetime | None =
         "execution_mode": mode,
         "broker_checked": snap is not None,
         "broker_snapshot_at": snap.taken_at if snap is not None else None,
+        "rest_route": {"mode": route["mode"], "endpoint": route["endpoint"]},
         "checked_at": _sql_utc(now),
         "disclaimer": DISCLAIMER,
         "sections": [{"key": k, "title": t} for k, t in SECTION_TITLES.items()],

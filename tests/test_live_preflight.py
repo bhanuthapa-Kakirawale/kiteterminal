@@ -136,8 +136,8 @@ def test_ready_baseline_is_ready(ready):
     assert result["overall_status"] == "READY", result["blocking_codes"]
     assert result["disclaimer"] == "Operational readiness only. It does not assess investment merit."
     assert {s["key"] for s in result["sections"]} == {
-        "database", "security", "broker", "static_ip", "market_data", "workers", "account_safety",
-        "reconciliation", "trading_lock"}
+        "database", "security", "broker", "network", "static_ip", "market_data", "workers", "account_safety",
+        "reconciliation", "trading_lock"}  # NET-1 added "network" (Kite REST route)
     assert all(c["section"] in {s["key"] for s in result["sections"]} for c in result["checks"])
 
 
