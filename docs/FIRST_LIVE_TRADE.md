@@ -98,6 +98,12 @@ you. Every step below that changes something is yours to do deliberately.
 
 12. **Approve that ONE ticket.** Outside market hours you must tick "Send as
     AMO" explicitly; otherwise it is refused.
+    Approve it in the **same market session window and Kite login** in which
+    you created it (SEC-1 P1-D). Unlocking trading does not affect this. If
+    the 09:15 open or the 15:30 close has passed since step 9, or you logged
+    in to Kite again, the dialog offers **Re-review** instead of Approve. Check
+    the levels against the market, re-review, and go through steps 10–11
+    again before approving.
 
 13. **Observe immediately:**
     - the ticket's state and its **broker order id** (not `PAPER-…`);
@@ -145,6 +151,8 @@ The same rules apply to every case:
 | **REJECTED** by the broker (ticket FAILED) | Nothing reached the exchange. The rejection reason from Kite is in the ticket's events. The daily entry count does not include it. | Read the reason. `IP not allowed` / similar → static IP (Live Readiness → Static IP; developer console). Margin/RMS → funds. Fix the cause before creating a **new** ticket; the failed one is final. |
 | **UNKNOWN** submission (network error mid-send) | Shows **SUBMISSION UNKNOWN**. The order monitor searches Kite's order book for the ticket's tag for 15 minutes and marks it adopted, not found, or NEEDS REVIEW. Every further **live entry is refused** (Live Readiness `UNKNOWN_LIVE_ORDERS`, confirm-time `LIVE_PREREQUISITE_MISSING`) until it is resolved. | Lock trading. **Do not resubmit.** Look in Kite's order book for an order carrying the ticket's tag. Wait for the monitor's verdict; if NEEDS REVIEW, compare with Kite and act there. |
 | **PARTIAL** fill (ENTRY PARTIAL) | The protective GTT is sized to the **filled** quantity and kept in step as more fills arrive (PK-13). The rest of the order keeps working. | Decide: let it keep working, or cancel the remainder (Positions → Cancel order, or Orders & Trades). Do not place a second order for the missing shares. |
+| **Approval refused: `TICKET_REVIEW_REQUIRED` / `TICKET_REVIEW_CHANGED`** | Nothing was sent; the ticket is still awaiting approval. The ticket was reviewed before the latest 09:15 open / 15:30 close or under an earlier Kite login, or it was re-reviewed or changed after your dialog opened (SEC-1 P1-D). | Re-check the levels against the market. Press **Re-review** if offered, then approve from the freshly opened dialog. |
+| **Ticket rejected: `TICKET_EVIDENCE_MISMATCH`** | Nothing was sent. The ticket's stored details no longer match what was reviewed: something changed it outside the app. | Do not reuse it. Find out what changed the database, then create a new ticket. |
 | **Order OPEN for too long** (limit not reached) | The order stays working; the position reads ENTRY WORKING. A stale strategy signal is never re-priced. | Cancel it from Positions/Orders & Trades if the setup no longer holds. Do not "chase" by placing a new order while the first is still working. |
 | **GTT missing** (UNPROTECTED / protection failed / `GTT_MISSING`, `PROTECTION_MISSING`) | Reconciliation flags it; the position shows the protection problem. | Lock trading. Check Kite's GTT list. If there is truly no stop, place a stop-loss **in Kite** immediately (the existing guidance for "protection failed"), then mark the finding reviewed once it is covered. |
 | **Quantity mismatch** (`GTT_QUANTITY_*`, `BROKER_POSITION_SHORTFALL`) | Reconciliation records the finding; shortfall is **critical** and blocks new live entries until reviewed — re-checked at every confirmation since SEC-1 (`RECONCILIATION_CRITICAL`), not only on the Live Readiness page. Exits and Emergency Exit are never blocked; Emergency Exit names the affected positions. | Lock trading. Compare Kite holdings/positions/GTT quantities with the Positions view. Correct at the broker as needed, then mark reviewed — a **reason is required** and the review is logged (`reconciliation_reviewed`). |

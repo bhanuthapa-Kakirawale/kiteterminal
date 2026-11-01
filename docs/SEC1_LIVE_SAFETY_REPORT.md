@@ -1,7 +1,9 @@
 # SEC-1: Live-trading safety gates (P0-A, P0-B, P0-C)
 
 **Scope.** The three P0 packets of the cross-repo audit remediation plan.
-- **Not started:** P1-D (manual-ticket re-review), P1-E (acknowledged vs
+- **Done since:** P1-D (manual-ticket re-review), see
+  `docs/SEC1_P1D_REPORT.md`.
+- **Not started:** P1-E (acknowledged vs
   filled API fields), P1-F (per-launch session credential) and P2-G
   (callback `state`, loosening audit).
 - **Out of scope:** the DMB candidate inbox.

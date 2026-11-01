@@ -227,6 +227,26 @@ Go to **New Ticket**:
    it becomes a pending ticket you then confirm (same as approving a
    strategy signal).
 
+**A manual ticket must be approved while your review of it is current.**
+The approval dialog shows when you created or last reviewed it. A manual
+(or Quick Action buy) ticket can only be approved while all of these hold:
+- you are in the same market session window: the 09:15 open and the 15:30
+  close each end a window, and a ticket prepared in the evening stays
+  approvable until the next open, so it can go out as an AMO;
+- you are on the same Kite login;
+- its details are unchanged.
+
+Otherwise the card reads **needs re-review** and the dialog offers
+**Re-review** instead of Approve. Re-review re-runs the risk checks against
+your portfolio as it is now. It does not look at the market price, so check
+your levels yourself. Then approve as usual.
+
+A ticket whose details were changed outside the app is rejected. Create a
+new one. If another tab re-reviews or changes a ticket while your dialog is
+open, approving from the old dialog is refused and the dialog reopens on the
+current version. Exits, Emergency Exit and Quick Action sells are never held
+back for a review.
+
 You can edit or delete a ticket while it's still a draft. Once it's
 confirmed or executed, it can no longer be edited — rejected/cancelled/
 failed tickets can be archived but not un-executed.
@@ -398,6 +418,9 @@ READY is operational readiness only — it does not assess investment merit.
 | "Session expired" errors | You need to log in again — Kite requires a fresh login every trading day. |
 | Live orders rejected by broker | Your static IP is not whitelisted in the Kite Connect developer console. |
 | Live entry refused with `LIVE_PREREQUISITE_MISSING` | A live-trading prerequisite is missing (notional cap, ₹ daily loss limit, static-IP confirmation, or an unresolved UNKNOWN live order). Open Live Readiness: it lists which. |
+| A manual ticket shows **needs re-review**, or approving it is refused with `TICKET_REVIEW_REQUIRED` | It was created or last reviewed before the latest 09:15 open / 15:30 close, or under an earlier Kite login. Open it, check the levels against the market, press **Re-review**, then approve. |
+| Approving is refused with `TICKET_REVIEW_CHANGED` | The ticket was re-reviewed or edited (for example in another tab) after your dialog opened. The dialog reopens on the current version: look at it again and approve. |
+| A manual ticket was rejected with `TICKET_EVIDENCE_MISMATCH` | Its stored details no longer match what was reviewed: they were changed outside the app. It cannot be approved or re-reviewed; create a new ticket. |
 | A strategy signal disappeared without action | It expired — signals computed from a stale/older candle are auto-cancelled before the next scan so you never approve against stale prices. |
 | A trade shows "protection failed" | The entry order filled but the protective stop (GTT) could not be placed — place a manual stop-loss immediately in Kite or the Orders screen. |
 | A reconciliation mismatch appears | The app's records and your broker account disagree (e.g., a stop triggered outside the app). Investigate in Kite directly, then mark it reviewed once resolved. |

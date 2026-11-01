@@ -160,6 +160,8 @@ Strategy / manual ticket -> risk engine -> pending_confirmation
 
 **Scope.** Both modes: it is a property of the signal, not of money. Manual and alert-action tickets keep their existing semantics, and an old manual ticket is still approvable.
 
+> **Superseded by SEC-1 P1-D** (`docs/SEC1_P1D_REPORT.md`). A manual or Quick Action BUY entry is now approvable only while its human review is current: same NSE session window, same Kite login, unchanged content. A contradictory strategy signal (dated after today, or disagreeing with its evaluation record) is now also a permanent `STALE_SIGNAL`.
+
 **On refusal:** `STALE_SIGNAL` (409). The ticket moves from `pending_confirmation` to `rejected` with a ticket event, using the PK-4 permanent-refusal pattern, and there is no broker call. The signal is never refreshed: its levels and dates are asserted unchanged.
 
 **Weekend boundaries**, checked at the unit level for a Friday signal:
@@ -264,6 +266,7 @@ Integration S6 runs a real stop-out exit filled by `order_monitor`, then refuses
 **Binding.** The gate decides the variety once, and `execution.execute_ticket(..., entry_variety=...)` uses it. `_execute_live` no longer reads the clock.
 
 - If the market closes between the gate and `place_order`, the regular order goes out and Kite rejects it: a definite, safe outcome (`test_12h_variety_decided_by_the_gate_is_bound_to_execution`).
+  - **Changed by SEC-1 P1-D for manual / Quick Action BUY entries.** Their final gate re-checks the review window, so an NSE open (09:15) or close (15:30) between the pre-check and the broker call withdraws the claim. The ticket returns to `pending_confirmation` (`TICKET_REVIEW_REQUIRED`) and nothing is sent. Strategy entries keep the behaviour above. See `docs/SEC1_P1D_REPORT.md`.
 - It can never be silently re-routed into an AMO.
 - A live entry with no decided variety raises before any broker call (backstop).
 

@@ -136,6 +136,17 @@ draft/pending ──risk checks──► pending_confirmation ──human confir
                                                                         by order_monitor)
 ```
 
+- **Review (SEC-1 P1-D)**: a manual or Quick Action BUY entry records its
+  human review: the time, the Kite login (`sessions.id`), and a digest of its
+  identity and economic fields. These are stamped at creation and edit, and
+  `POST /api/tickets/{id}/re-review` refreshes the time and login, never the
+  digest. It is approvable only while that review is current: same NSE
+  session window (an open or close ends it), same Kite login, unchanged
+  content. The approval must echo the review token its view showed.
+  Checked in the account-safety pre-check and again at the final gate
+  (`account_safety.check_ticket_review`). Strategy entries are judged by
+  their signal candle instead. Exits never are. See
+  `docs/SEC1_P1D_REPORT.md`.
 - **Creation**: manual tickets are created via `POST /api/tickets`; strategy
   tickets are created by `strategy_engine.run_entry_scan` /
   `run_exit_scan`; the Dashboard's **Quick Action popup** (clicking a

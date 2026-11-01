@@ -309,6 +309,12 @@ with `integrity_check`). A database written by a **newer** version is refused
 with `DATABASE_SCHEMA_UNSUPPORTED` and nothing is changed: run the newer code,
 or restore the matching backup.
 
+The current schema is **v7** (SEC-1 P1-D added the ticket review columns),
+so the first start of this version leaves `kite_terminal.db.pre_schema_v7_bak`.
+Manual / Quick Action buy tickets still pending at that moment carry no
+review record and need one **Re-review** before they can be approved
+(`docs/SEC1_P1D_REPORT.md`).
+
 Maintenance (stop the app first for `vacuum`):
 
 ```

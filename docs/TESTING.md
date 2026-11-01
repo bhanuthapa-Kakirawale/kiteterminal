@@ -58,6 +58,18 @@ step, and writes `e2e_results.json` with pass/fail results.
   holiday file is loaded by default (2026-09-14 is a holiday); swap in a
   synthetic calendar with `trading_calendar.use_calendar(holidays=[...])`.
   `conftest.last_weekday` returns the last *trading* day.
+  The SEC-1 P1-D review window is judged on `account_safety.now_ist` and the
+  trading calendar (`trading_calendar.is_market_session_open`), never on
+  `market.is_market_open`: the `market_open` fixture does not move it. Pin
+  `account_safety.now_ist` (see the `clock` fixture in
+  `tests/test_manual_ticket_review.py`) to cross an open or a close.
+- **Approving a manual entry (SEC-1 P1-D).** A confirm body for a manual /
+  Quick Action BUY entry must echo the review token its view showed. Build
+  it with `conftest.approval_body(db, ticket_id, **extra)`: the displayed
+  mode plus the stored ticket's token, and no token for strategy entries or
+  exits. `test_baseline_api._insert_ticket` stamps a just-made review on an
+  approvable manual / Quick Action BUY row. A test of the review gate opts
+  out with `reviewed_at=None`.
 - **Old databases (PK-22).** Migrations run once per database. A test that
   edits the schema to imitate an old database calls
   `conftest.as_pre_pk22_database(db)` before `init_db()`, so the legacy
@@ -307,6 +319,18 @@ settings, or execution code.
       it closes correctly and produces a `closed_trades` journal entry.
 - [ ] Confirm a rejected/cancelled/failed ticket can be archived but a
       confirmed/executed ticket cannot be edited or deleted.
+- [ ] (SEC-1 P1-D) The approval dialog of a new manual ticket reads
+      "reviewed … — current". Leave a pending manual ticket across the
+      15:30 close (or log in to Kite again): its card shows **needs
+      re-review**, the dialog offers **Re-review** instead of Approve, and
+      approving is refused with nothing sent. After Re-review, the risk checks
+      have re-run and the ticket can be approved.
+- [ ] (SEC-1 P1-D) Open the approval dialog in one tab and re-review the
+      same ticket in another. Approving from the first tab is refused
+      ("changed since you looked at it") and the dialog reopens on the
+      current ticket.
+- [ ] (SEC-1 P1-D) Exits, Emergency Exit and Quick Action sells are never
+      asked for a re-review.
 
 ### 2.4 Strategy scans
 
