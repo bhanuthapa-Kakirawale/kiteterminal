@@ -309,11 +309,19 @@ WS_EVIL = EVIL.replace("http://", "ws://") + "/ws/ticks"
 @pytest.mark.parametrize("url,headers", [
     (WS_OK, {"Origin": TERMINAL_ORIGIN}),
     ("ws://localhost:8000/ws/ticks", {"Origin": "http://localhost:8000"}),
-    (WS_OK, {}),  # non-browser local client: no Origin, approved Host
 ])
 def test_ws_approved_host_and_origin_connects(env, one_tick, url, headers):
     with _bare().websocket_connect(url, headers=headers) as ws:
         assert ws.receive_json() == {"type": "tick", "n": 1}
+
+
+def test_ws_approved_host_without_origin_is_refused(env, one_tick):
+    # SEC-1: an approved Host is not enough on its own — a handshake with no
+    # Origin (a non-browser client) is refused; browsers always send one.
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with _bare().websocket_connect(WS_OK, headers={}) as ws:
+            ws.receive_json()
+    assert exc.value.code == 1008
 
 
 @pytest.mark.parametrize("headers", [{}, {"Origin": TERMINAL_ORIGIN}, {"Origin": EVIL}],

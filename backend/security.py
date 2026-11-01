@@ -22,17 +22,22 @@ the name, and the Origin check below ties a write's Origin port to the Host
 port. ``X-Forwarded-Host``, ``Forwarded`` and ``X-Forwarded-Proto`` are never
 read by these guards, so a client cannot talk its way past them.
 
-Write policy (PK-5) for every HTTP request whose method is not GET/HEAD/OPTIONS:
+Write policy (PK-5, tightened by SEC-1) for every HTTP request whose method
+is not GET/HEAD/OPTIONS:
 
 1. The ``X-Kite-Terminal: 1`` header is mandatory. It is not CORS-safelisted,
    so a foreign page cannot attach it without a preflight, and the app answers
    preflights with no ``Access-Control-Allow-*`` headers (there is no CORS
-   middleware), so that preflight fails.
+   middleware), so that preflight fails. It is a static value, so it is never
+   treated as authentication.
 2. If ``Origin`` is present it must be a terminal origin; if it is absent,
    a present ``Referer`` must be. The header never overrides a foreign origin.
-3. With neither present the request is accepted: browsers always attach
-   ``Origin`` to cross-origin non-GET requests, so a header-bearing request
-   without one comes from a non-browser local client (tests, tooling).
+3. SEC-1: with neither present the request is REJECTED. Browsers attach
+   ``Origin`` to every same- and cross-origin non-GET fetch, so the UI always
+   has one; before SEC-1 a header-bearing request without one was accepted as
+   a "non-browser local client", which let any local process write with the
+   static header alone. A non-browser client can still forge an Origin: this
+   check only stops browser-borne attacks (see docs/DEPLOYMENT.md).
 
 A *terminal origin* has the request's scheme, an allowed hostname and the
 port of the request's Host header. Requiring an allowed hostname (rather than
@@ -40,7 +45,8 @@ port of the request's Host header. Requiring an allowed hostname (rather than
 
 The ``/ws/ticks`` handshake gets the Host check and the same Origin check.
 The browser WebSocket API cannot send custom headers, so no header is
-required there, and an absent Origin (a non-browser client) is accepted.
+required there. Browsers always send Origin on a WebSocket handshake, so an
+absent Origin is refused (SEC-1).
 
 GET routes are not subject to the write policy, which is what keeps
 ``/login`` and the Kite ``/callback`` redirect (a top-level navigation from
@@ -207,7 +213,8 @@ def rejection_reason(scope) -> str | None:
     else:
         source = headers.get("origin")
     if source is None:
-        return None
+        # SEC-1: never accepted on the strength of the static header alone.
+        return "missing Origin and Referer" if scope["type"] == "http" else "missing Origin"
     if not is_terminal_origin(source, scope["scheme"], headers.get("host", "")):
         return f"foreign origin {source[:100]!r}"
     return None

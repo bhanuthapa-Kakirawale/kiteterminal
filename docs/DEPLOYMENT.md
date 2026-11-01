@@ -16,8 +16,8 @@ need real authentication, which the terminal does not have.
 |---|---|
 | Bind address | `python -m backend.server` binds `127.0.0.1` by default. A non-loopback bind (`0.0.0.0`, `::`, a LAN/VM address or a hostname) is **refused** unless `KITE_TERMINAL_ALLOW_REMOTE_BIND=1`. |
 | Host header | Every request and WebSocket must carry `Host: localhost`, `127.0.0.1` or `[::1]` (any port), or a name listed in `KITE_TERMINAL_ALLOWED_HOSTS`. Anything else gets `400 INVALID_HOST` before any route runs. This blocks DNS-rebinding pages from *reading* account data. |
-| Cross-origin writes | Every POST/PUT/DELETE needs `X-Kite-Terminal: 1` and, if it has an Origin/Referer, a terminal origin (PK-5). This check runs after the Host check. |
-| WebSocket | `/ws/ticks` needs an allowed Host and, if an Origin is present, a terminal origin. It carries no credentials in the URL. |
+| Cross-origin writes | Every POST/PUT/DELETE needs `X-Kite-Terminal: 1` **and** a terminal Origin (or, without an Origin, a terminal Referer); a write with neither is refused (PK-5, tightened by SEC-1). The `/ws/ticks` handshake needs a terminal Origin too. This check runs after the Host check. It stops browser-borne attacks only: the header is static and a non-browser local process can forge an Origin, so it is not authentication. |
+| WebSocket | `/ws/ticks` needs an allowed Host and a terminal Origin (an absent Origin is refused since SEC-1). It carries no credentials in the URL. |
 | Proxy headers | `X-Forwarded-Host` and `Forwarded` are never used. uvicorn honours `X-Forwarded-Proto`/`-For` only when `KITE_TERMINAL_TRUSTED_PROXY_IPS` names the proxy. |
 | Reload | Off. `--dev-reload` / `KITE_TERMINAL_DEV_RELOAD=1` is for development only and is refused together with a remote bind. |
 | Workers | Exactly one. Any other value of `KITE_TERMINAL_WORKERS` is refused. The app also re-checks this at startup, so `uvicorn backend.main:app --workers 2` or `--host 0.0.0.0` without the opt-in **fails to start**. |

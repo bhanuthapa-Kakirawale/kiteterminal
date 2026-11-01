@@ -4,9 +4,10 @@ Policy under test (backend/security.py):
 - every non-GET/HEAD/OPTIONS request needs ``X-Kite-Terminal: 1``;
 - a present Origin (else a present Referer) must be a terminal origin: the
   request's scheme, a loopback hostname, and the Host header's port;
-- no Origin and no Referer is accepted from a header-bearing (non-browser)
-  client, because browsers always send Origin on cross-origin writes;
-- the /ws/ticks handshake gets the same Origin check, header not required;
+- SEC-1: no Origin and no Referer is REJECTED, header or not — the static
+  header alone is never enough (browsers always send Origin on writes);
+- the /ws/ticks handshake gets the same Origin check, header not required,
+  and (SEC-1) an absent Origin is refused;
 - GET routes, including /login and the Kite /callback, are never checked.
 
 The ordinary ``env.client`` sends the header and a same-origin Origin (see
@@ -75,13 +76,21 @@ def test_inventory_covers_post_put_delete():
 
 
 @pytest.mark.parametrize("method,path", _mutating_routes())
-@pytest.mark.parametrize("attack", ["foreign_origin_no_header", "foreign_origin_with_header"])
+@pytest.mark.parametrize("attack", ["foreign_origin_no_header", "foreign_origin_with_header",
+                                    "no_origin_with_header", "empty_origin_with_header",
+                                    "null_origin_with_header"])
 def test_every_mutating_route_rejects_cross_origin(env, method, path, attack):
     # Path parameters are filled with a plausible value; the middleware
     # answers before routing, so the route never gets to 404 or run.
     url = re.sub(r"\{[^}]+\}", "1", path)
-    headers = {"Origin": FOREIGN, "Content-Type": "text/plain"}
-    if attack == "foreign_origin_with_header":
+    headers = {"Content-Type": "text/plain"}
+    if attack.startswith("foreign_origin"):
+        headers["Origin"] = FOREIGN
+    elif attack == "empty_origin_with_header":
+        headers["Origin"] = ""
+    elif attack == "null_origin_with_header":
+        headers["Origin"] = "null"
+    if attack.endswith("_with_header"):
         headers.update(APP_HEADER)
     r = _bare().request(method, url, content=b"{}", headers=headers)
     assert _is_csrf_reject(r), (method, url, r.status_code, r.text[:200])
@@ -269,11 +278,22 @@ def test_e_is_terminal_origin(origin, scheme, host, expected):
 
 # ---------------------------------------------------------------- G: non-browser clients, Referer fallback
 
-def test_g_no_origin_with_header_is_accepted(env, market_open):
-    set_mode(env.db, "dry_run")
+def test_g_no_origin_with_header_is_rejected(env, market_open):
+    # SEC-1 (inverts the PK-5 behaviour): the static header is not a
+    # credential, so a header-bearing write with no Origin and no Referer —
+    # any local process — is refused before routing, in live mode too.
+    set_mode(env.db, "live")
     tid = _pending_ticket(env)
     r = _bare().post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db), headers=APP_HEADER)
-    assert r.status_code == 200 and r.json()["data"]["status"] == "executed"
+    assert _is_csrf_reject(r)
+    assert ticket_row(env.db, tid)["status"] == "pending_confirmation"
+    assert [name for name, _ in env.kite.calls if name in BROKER_WRITES] == []
+
+
+def test_g_no_origin_mode_switch_is_rejected(env):
+    r = _bare().post("/api/execution/mode", json={"mode": "live", "confirm_real_money": True}, headers=APP_HEADER)
+    assert _is_csrf_reject(r)
+    assert displayed_mode(env.db) == {"expected_mode": "dry_run"}
 
 
 def test_g_no_origin_without_header_is_rejected(env):
@@ -329,16 +349,18 @@ def one_tick(monkeypatch):
 WS_URL = TERMINAL_ORIGIN.replace("http://", "ws://") + "/ws/ticks"
 
 
-@pytest.mark.parametrize("origin", [FOREIGN, "http://localhost:3000", "null", "http://evil.example:8000"])
+@pytest.mark.parametrize("origin", [FOREIGN, "http://localhost:3000", "null", "http://evil.example:8000", "", None])
 def test_h_websocket_foreign_origin_is_refused(env, one_tick, origin):
+    # None: no Origin at all — refused since SEC-1 (browsers always send one).
+    headers = {} if origin is None else {"Origin": origin}
     with pytest.raises(WebSocketDisconnect) as exc:
-        with _bare().websocket_connect(WS_URL, headers={"Origin": origin}) as ws:
+        with _bare().websocket_connect(WS_URL, headers=headers) as ws:
             ws.receive_json()
     assert exc.value.code == 1008
 
 
-@pytest.mark.parametrize("headers", [{"Origin": TERMINAL_ORIGIN}, {"Origin": "http://localhost:8000"}, {}],
-                         ids=["same_origin", "localhost_alias", "no_origin"])
+@pytest.mark.parametrize("headers", [{"Origin": TERMINAL_ORIGIN}, {"Origin": "http://localhost:8000"}],
+                         ids=["same_origin", "localhost_alias"])
 def test_i_websocket_terminal_origin_is_accepted(env, one_tick, headers):
     with _bare().websocket_connect(WS_URL, headers=headers) as ws:
         assert ws.receive_json() == {"type": "tick", "n": 1}
