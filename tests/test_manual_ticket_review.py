@@ -13,9 +13,13 @@ market.is_market_open (which the market_open fixture pins).
 """
 
 import json
+import re
+import shutil
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from kiteconnect.exceptions import NetworkException
@@ -699,6 +703,66 @@ def test_hardening_works_on_plain_dict_tickets():
     assert account_safety.check_stale_signal({**plain, "signal_date": "2026-09-30"}, now).permanent
     assert account_safety.check_stale_signal({**plain, "entry_evaluation": json.dumps({"signal_date": "2026-09-25"})},
                                              now).code == "STALE_SIGNAL"
+
+
+# ============================================================ frontend contract
+
+ROOT = Path(__file__).resolve().parents[1]
+APP_JS = (ROOT / "frontend" / "app.js").read_text(encoding="utf-8")
+INDEX_HTML = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
+NODE = shutil.which("node")
+
+
+def _js_function(name: str) -> str:
+    m = re.search(rf"^function {name}\(.*?^}}$", APP_JS, re.M | re.S)
+    assert m, f"function {name} not found in app.js"
+    return m.group(0)
+
+
+def test_every_approval_path_sends_the_review_token_its_view_showed():
+    confirm = re.search(r"confirmTicket: \(id, expectedMode, allowAmo = false, reviewToken = undefined\).*?"
+                        r": undefined\),\n", APP_JS, re.S)
+    assert confirm and "expected_review_token: reviewToken" in confirm.group(0)
+    calls = [m.group(0) for m in re.finditer(r"await approveTicket\([^)]*\)", APP_JS)]
+    assert sorted(calls) == sorted([
+        "await approveTicket(id, state.activeConfirmShownMode, allowAmo, state.activeConfirmShownReview)",
+        "await approveTicket(id, shownMode, false, shownReview)",      # Approvals card
+        "await approveTicket(t.id, shownMode, false, sd.shownReview)",  # Signal Detail
+    ]), calls
+    # Captured when each view is rendered or opened, never re-read at send time.
+    assert "state.activeConfirmShownReview = shownReviewFor(ticket);" in _js_function("openConfirmDialog")
+    assert "sd.shownReview = shownReviewFor(ticket);" in re.search(
+        r"async function openSignalDetail\(.*?\n}\n", APP_JS, re.S).group(0)
+    assert "sd.shownReview" not in re.search(r"function sdOnTicketsChanged\(.*?\n}\n", APP_JS, re.S).group(0)
+
+
+def test_review_refusals_are_named_and_reopen_the_dialog():
+    titles = re.search(r"const ACCOUNT_SAFETY_TITLES = \{.*?\n};", APP_JS, re.S).group(0)
+    for code in ("TICKET_REVIEW_REQUIRED", "TICKET_REVIEW_CHANGED", "TICKET_EVIDENCE_MISMATCH"):
+        assert f"{code}:" in titles
+    approve = re.search(r"async function approveTicket\(.*?\n}\n", APP_JS, re.S).group(0)
+    assert "failureCodes(e)" in approve       # every listed reason, not only failures[0]
+    assert 'reReviewTicket: (id) => fetchJsonMutate(`/api/tickets/${id}/re-review`, "POST")' in APP_JS
+    assert 'id="ticket-rereview-btn"' in INDEX_HTML and 'id="ticket-confirm-review"' in INDEX_HTML
+
+
+@pytest.mark.skipif(NODE is None, reason="Node.js is not installed")
+def test_shown_review_and_failure_codes_behave():
+    script = "\n".join([_js_function("shownReviewFor"), _js_function("failureCodes"), """
+        const out = [
+          shownReviewFor({review: {subject: true, token: "abc"}}),
+          shownReviewFor({review: {subject: true, token: null}}),
+          shownReviewFor({review: {subject: false, token: null}}),
+          shownReviewFor({}),
+          failureCodes({errorCode: "TRADING_LOCKED", failures: [{code: "TRADING_LOCKED"},
+                                                              {code: "TICKET_REVIEW_REQUIRED"}]}),
+        ];
+        process.stdout.write(JSON.stringify(out.map((v) => v === undefined ? "<undefined>" : v)));
+    """])
+    r = subprocess.run([NODE, "-"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == ["abc", "<undefined>", "<undefined>", "<undefined>",
+                                    ["TRADING_LOCKED", "TRADING_LOCKED", "TICKET_REVIEW_REQUIRED"]]
 
 
 # ============================================================ migration v7

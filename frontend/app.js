@@ -90,8 +90,16 @@ const API = {
   // PK-11: a new entry carries the execution mode the user was shown; the
   // server refuses (409) if it is missing or no longer current.
   // PK-12H: allow_amo is sent only when the user ticked "Send as AMO".
-  confirmTicket: (id, expectedMode, allowAmo = false) => fetchJsonMutate(`/api/tickets/${id}/confirm`, "POST",
-    expectedMode ? { expected_mode: expectedMode, ...(allowAmo ? { allow_amo: true } : {}) } : undefined),
+  // SEC-1 P1-D: a manual / Quick Action buy also carries the review token
+  // the approving view showed; the server refuses a missing or older one.
+  confirmTicket: (id, expectedMode, allowAmo = false, reviewToken = undefined) => fetchJsonMutate(
+    `/api/tickets/${id}/confirm`, "POST",
+    expectedMode ? {
+      expected_mode: expectedMode,
+      ...(allowAmo ? { allow_amo: true } : {}),
+      ...(reviewToken ? { expected_review_token: reviewToken } : {}),
+    } : undefined),
+  reReviewTicket: (id) => fetchJsonMutate(`/api/tickets/${id}/re-review`, "POST"),
   rejectTicket: (id, reason) => fetchJsonMutate(`/api/tickets/${id}/reject`, "POST", { reason }),
   revertRejection: (id) => fetchJsonMutate(`/api/tickets/${id}/revert-rejection`, "POST"),
   startTrailing: (id) => fetchJsonMutate(`/api/tickets/${id}/start_trailing`, "POST"),
@@ -223,6 +231,8 @@ const el = {
   ticketRiskCheckBody: document.getElementById("ticket-risk-check-body"),
   ticketRejectBtn: document.getElementById("ticket-reject-btn"),
   ticketConfirmBtn: document.getElementById("ticket-confirm-btn"),
+  ticketConfirmReview: document.getElementById("ticket-confirm-review"),
+  ticketReReviewBtn: document.getElementById("ticket-rereview-btn"),
   ticketModifyBtn: document.getElementById("ticket-modify-btn"),
 
   liveModeConfirmDialog: document.getElementById("live-mode-confirm-dialog"),
@@ -3152,6 +3162,23 @@ function shownModeFor(t) {
   return t && t.closes_ticket_id == null ? ticketExecMode(t) : undefined;
 }
 
+// SEC-1 P1-D: the review token THIS view showed — captured when the view is
+// rendered, never re-read at send time, so a view left open across a
+// Re-review (or an edit) in another tab cannot approve what it did not show.
+// Strategy entries and exits carry none.
+function shownReviewFor(t) {
+  return t && t.review && t.review.subject ? (t.review.token || undefined) : undefined;
+}
+
+function reviewNoteText(t) {
+  const r = t.review;
+  const created = `Created ${fmtDateTime(t.created_at)}`;
+  if (r.current) return `${created} · reviewed ${fmtDateTime(r.reviewed_at)} — current.`;
+  if (r.code === "TICKET_EVIDENCE_MISMATCH") return `${created} — ${r.reason}. It cannot be approved; create a new ticket.`;
+  return `${created} — needs a re-review before approval: ${r.reason}. Re-review re-runs the risk checks against `
+    + "your current portfolio; check the levels against the market first.";
+}
+
 const MODE_BINDING_ERRORS = ["EXECUTION_MODE_CHANGED", "EXECUTION_MODE_REQUIRED"];
 
 async function resyncExecutionMode() {
@@ -3234,6 +3261,7 @@ function openConfirmDialog(ticket) {
   activeConfirmTicketId = ticket.id;
   state.activeConfirmTicket = ticket;
   state.activeConfirmShownMode = shownModeFor(ticket);  // what the exec note below shows
+  state.activeConfirmShownReview = shownReviewFor(ticket);  // P1-D: the review this dialog shows
   const rejectedMode = ticket.status === "risk_rejected";
   el.ticketConfirmDialog.classList.toggle("risk-rejected-mode", rejectedMode);
   el.ticketConfirmTitle.textContent = rejectedMode
@@ -3248,8 +3276,17 @@ function openConfirmDialog(ticket) {
   el.ticketConfirmAmo.hidden = rejectedMode || !needsAmoConsent(ticket);
   el.ticketConfirmAmoCheckbox.checked = false;
   renderRiskCheckSection(ticket.risk_check_results);
+  // SEC-1 P1-D: a manual / Quick Action buy whose review is no longer current
+  // offers Re-review instead of Approve (the server would refuse it anyway).
+  const review = !rejectedMode && ticket.review && ticket.review.subject ? ticket.review : null;
+  const needsReReview = !!review && !review.current && review.code !== "TICKET_EVIDENCE_MISMATCH";
+  el.ticketConfirmReview.hidden = !review;
+  el.ticketConfirmReview.className = `review-note${review && !review.current ? " stale" : ""}`;
+  el.ticketConfirmReview.textContent = review ? reviewNoteText(ticket) : "";
   el.ticketRejectBtn.hidden = rejectedMode;
-  el.ticketConfirmBtn.hidden = rejectedMode;
+  el.ticketConfirmBtn.hidden = rejectedMode || (!!review && !review.current);
+  el.ticketReReviewBtn.hidden = !needsReReview;
+  el.ticketReReviewBtn.disabled = false;
   el.ticketModifyBtn.hidden = !rejectedMode;
   el.ticketArchiveBtn.hidden = !rejectedMode;
   el.ticketConfirmDialog.showModal();
@@ -3270,12 +3307,23 @@ const ACCOUNT_SAFETY_TITLES = {
   AMO_CONFIRMATION_REQUIRED: "Market closed — AMO needs your explicit consent",
   AMO_DISABLED: "Market closed — AMO disabled",
   ACCOUNT_SAFETY_UNAVAILABLE: "Account safety could not be checked",
+  // SEC-1 P1-D
+  TICKET_REVIEW_REQUIRED: "This ticket needs a re-review",
+  TICKET_REVIEW_CHANGED: "This ticket changed since you looked at it",
+  TICKET_EVIDENCE_MISMATCH: "Ticket details were changed outside the app",
 };
 
+// The codes of every reason the server gave, not only the first: a review
+// refusal may be listed after, say, TRADING_LOCKED.
+function failureCodes(e) {
+  return [e.errorCode, ...(e.failures || []).map((f) => f.code)];
+}
+
 // allowAmo is true only when the user ticked "Send as AMO" in the dialog.
-async function approveTicket(id, expectedMode, allowAmo = false) {
+// reviewToken is the P1-D review token the approving view showed.
+async function approveTicket(id, expectedMode, allowAmo = false, reviewToken = undefined) {
   try {
-    reportExecution(await API.confirmTicket(id, expectedMode, allowAmo));
+    reportExecution(await API.confirmTicket(id, expectedMode, allowAmo, reviewToken));
   } catch (e) {
     if (e instanceof ApiError && MODE_BINDING_ERRORS.includes(e.errorCode)) {
       // PK-11: the mode shown is not the server's mode. Nothing was
@@ -3289,7 +3337,12 @@ async function approveTicket(id, expectedMode, allowAmo = false) {
       // the user can tick "Send as AMO" themselves.
       const reasons = (e.failures || [{ code: e.errorCode, message: e.message }]).map((f) => f.message).join("\n");
       toast(reasons, { type: "warning", title: `${ACCOUNT_SAFETY_TITLES[e.errorCode]} — nothing was sent`, timeout: 0 });
-      if (e.errorCode === "AMO_CONFIRMATION_REQUIRED" && !allowAmo) {
+      // P1-D: a stale review reopens the dialog in its Re-review state; a
+      // changed one reopens it on the current ticket. Never retried.
+      const codes = failureCodes(e);
+      const reopen = (codes.includes("AMO_CONFIRMATION_REQUIRED") && !allowAmo)
+        || codes.includes("TICKET_REVIEW_REQUIRED") || codes.includes("TICKET_REVIEW_CHANGED");
+      if (reopen) {
         try {
           openConfirmDialog(await API.getTicket(id));
         } catch (ignored) { /* the toast already explains */ }
@@ -3365,10 +3418,40 @@ el.ticketConfirmBtn.addEventListener("click", async () => {
   const id = activeConfirmTicketId;
   el.ticketConfirmDialog.close();
   try {
-    await approveTicket(id, state.activeConfirmShownMode, allowAmo);
+    await approveTicket(id, state.activeConfirmShownMode, allowAmo, state.activeConfirmShownReview);
   } finally {
     el.ticketConfirmBtn.disabled = false;
   }
+});
+
+// SEC-1 P1-D: the explicit re-review of a manual / Quick Action buy whose
+// review is no longer current. Nothing is sent to the broker; the dialog
+// reopens on the re-reviewed ticket, and approving it is a separate click.
+el.ticketReReviewBtn.addEventListener("click", async () => {
+  if (activeConfirmTicketId == null || el.ticketReReviewBtn.disabled) return;
+  const id = activeConfirmTicketId;
+  el.ticketReReviewBtn.disabled = true;
+  try {
+    const t = await API.reReviewTicket(id);
+    if (t.status === "pending_confirmation") {
+      toast("Re-reviewed: risk checks re-run against your current portfolio. Check the levels, then approve.",
+        { type: "success" });
+    } else {
+      toast("Re-reviewed — but it is now blocked by risk checks.", { type: "warning" });
+    }
+    if (el.ticketConfirmDialog.open) el.ticketConfirmDialog.close();
+    openConfirmDialog(t);
+  } catch (e) {
+    // Tampered details reject the ticket; a state conflict means it moved on
+    // (approved or rejected elsewhere). Either way this dialog is stale.
+    const gone = e instanceof ApiError && ["TICKET_EVIDENCE_MISMATCH", "CONFLICT_INVALID_STATE"].includes(e.errorCode);
+    if (gone) el.ticketConfirmDialog.close();
+    toast(e.message, { type: "error", timeout: 0,
+      title: gone ? "Re-review refused" : "Re-review failed — the ticket is unchanged" });
+  } finally {
+    el.ticketReReviewBtn.disabled = false;
+  }
+  await refreshTicketViews();
 });
 
 el.ticketModifyBtn.addEventListener("click", async () => {
@@ -3564,11 +3647,16 @@ el.ticketDetailRevertBtn.addEventListener("click", async () => {
   if (state.activeDetailTicketId == null) return;
   try {
     const reverted = await API.revertRejection(state.activeDetailTicketId);
+    // P1-D: reverting is not a review — a manual ticket from an earlier
+    // session window or Kite login still needs a Re-review before approval.
+    const needsReReview = reverted.review?.subject && !reverted.review.current;
     toast(
       reverted.status === "risk_rejected"
         ? "Reverted — but it's currently blocked by risk checks again."
-        : "Reverted — back in the Signal Queue for review.",
-      { type: reverted.status === "risk_rejected" ? "warning" : "success" },
+        : needsReReview
+          ? `Reverted — it still needs a re-review before approval (${reverted.review.reason}).`
+          : "Reverted — back in the queue, awaiting approval.",
+      { type: reverted.status === "risk_rejected" || needsReReview ? "warning" : "success" },
     );
   } catch (e) {
     toast(e.message, { type: "error" });
@@ -4514,6 +4602,7 @@ function approvalCardHtml(t, kind) {
         <div class="ac-title">
           ${sideHtml(t.transaction_type)}<span class="ac-symbol">${esc(t.symbol)}</span>${origin}
           ${t.signal_date ? `<span class="badge-muted">signal ${esc(fmtDate(t.signal_date))}</span>` : ""}
+          ${t.status === "pending_confirmation" && t.review?.subject && !t.review.current ? `<span class="chip warn" title="${esc(t.review.reason || "")}">needs re-review</span>` : ""}
         </div>
         <div class="ac-actions">${actions}</div>
       </div>
@@ -4595,13 +4684,15 @@ el.viewApprovals.addEventListener("click", async (event) => {
   } else if (action === "details") {
     openConfirmDialog(ticket);
   } else if (action === "approve") {
-    if (needsAmoConsent(ticket)) {
+    if (needsAmoConsent(ticket) || (ticket.review?.subject && !ticket.review.current)) {
       // PK-12H: the only place to consent to an AMO is the dialog's checkbox.
+      // P1-D: the only place to re-review a stale manual ticket is the dialog.
       openConfirmDialog(ticket);
       return;
     }
     const live = ticketExecMode(ticket) === "live";
     const shownMode = shownModeFor(ticket);  // the mode the dialog below shows
+    const shownReview = shownReviewFor(ticket);  // P1-D: the review this card shows
     const ok = await confirmAction({
       title: live ? `Place a real ${ticket.transaction_type} order?` : "Approve this trade (dry run)?",
       html: approvalConfirmHtml(ticket),
@@ -4610,7 +4701,7 @@ el.viewApprovals.addEventListener("click", async (event) => {
     });
     if (!ok) return;
     card.classList.add("busy");
-    await approveTicket(id, shownMode);
+    await approveTicket(id, shownMode, false, shownReview);
   } else if (action === "reject") {
     card.classList.add("busy");
     await rejectTicketById(id, "Rejected from Approvals");
@@ -4670,6 +4761,7 @@ const SD_MARKER_COLOURS = {
 
 const sd = {
   ticket: null,
+  shownReview: undefined,   // P1-D: the review token captured when the view opened
   data: null,
   chart: null,
   priceSeries: null,
@@ -4731,6 +4823,9 @@ function sdPendingQueue() {
 
 async function openSignalDetail(ticket) {
   sd.ticket = ticket;
+  // P1-D: captured when the view opens; sdOnTicketsChanged swaps sd.ticket
+  // for a fresher copy, which must not silently upgrade what was shown.
+  sd.shownReview = shownReviewFor(ticket);
   sd.queue = sdPendingQueue();
   sd.hidden = new Set();
   sd.disposed = false;
@@ -5524,8 +5619,9 @@ el.sdEvidenceInner.addEventListener("click", (event) => {
 el.sdApprove.addEventListener("click", async () => {
   const t = sd.ticket;
   if (!t) return;
-  if (needsAmoConsent(t)) {
+  if (needsAmoConsent(t) || (t.review?.subject && !t.review.current)) {
     // PK-12H: AMO consent is only ever given in the ticket dialog.
+    // P1-D: so is the re-review of a stale manual ticket.
     closeSignalDetail();
     openConfirmDialog(t);
     return;
@@ -5541,7 +5637,7 @@ el.sdApprove.addEventListener("click", async () => {
   if (!ok) return;
   el.sdApprove.disabled = true;
   try {
-    await approveTicket(t.id, shownMode);
+    await approveTicket(t.id, shownMode, false, sd.shownReview);
   } finally {
     el.sdApprove.disabled = false;
   }

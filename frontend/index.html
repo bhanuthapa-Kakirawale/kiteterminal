@@ -1388,6 +1388,8 @@
     <h2 id="ticket-confirm-title">Confirm Trade Ticket</h2>
     <div id="ticket-confirm-body" class="ticket-confirm-body"></div>
     <div id="ticket-confirm-exec-note" class="exec-note" hidden></div>
+    <!-- SEC-1 P1-D: a manual / Quick Action buy is approvable only while its review is current. -->
+    <div id="ticket-confirm-review" class="review-note" hidden></div>
     <!-- PK-12H: an after-hours live entry is an AMO only with explicit consent. -->
     <label id="ticket-confirm-amo" class="amo-consent" hidden>
       <input type="checkbox" id="ticket-confirm-amo-checkbox" />
@@ -1397,6 +1399,7 @@
     <div class="dialog-actions">
       <button id="ticket-reject-btn" class="btn btn-outline-danger" autofocus>Reject</button>
       <button id="ticket-confirm-btn" class="btn btn-success">Approve &amp; Execute</button>
+      <button id="ticket-rereview-btn" class="btn btn-primary" hidden>Re-review</button>
       <button id="ticket-modify-btn" class="btn btn-primary" hidden>Modify Ticket</button>
       <button id="ticket-archive-btn" class="btn btn-danger" hidden>Archive</button>
     </div>
