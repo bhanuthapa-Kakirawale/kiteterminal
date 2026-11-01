@@ -430,7 +430,7 @@ def test_19_reviewed_orphan_stays_silent_until_it_changes(env):
     orphan = _single_gtt(env, symbol="INFY", quantity=5, stop=1400.0)
     _reconcile(times=2)
     [row] = _unresolved(env)
-    r = env.client.post(f"/api/reconciliation/{row['id']}/mark-reviewed")
+    r = env.client.post(f"/api/reconciliation/{row['id']}/mark-reviewed", json={"reason": "checked in Kite"})
     assert r.status_code == 200 and r.json()["data"]["resolved"] is True
     _reconcile(times=3)
     assert _unresolved(env) == [] and len(_findings(env)) == 1
@@ -444,7 +444,7 @@ def test_19b_orphan_becomes_a_new_finding_when_the_app_opens_that_symbol(env):
     orphan = _single_gtt(env, quantity=40)
     _reconcile(times=2)
     [row] = _unresolved(env)
-    env.client.post(f"/api/reconciliation/{row['id']}/mark-reviewed")
+    env.client.post(f"/api/reconciliation/{row['id']}/mark-reviewed", json={"reason": "checked in Kite"})
     _position(env)  # the app now holds TCS with its own GTT: the old one is a second GTT
     _reconcile(times=2)
     [again] = _unresolved(env)
@@ -455,7 +455,7 @@ def test_19c_forward_finding_review_keeps_existing_behaviour(env):
     _position(env, quantity=25, gtt_quantity=40)
     _reconcile()
     [row] = _unresolved(env)
-    env.client.post(f"/api/reconciliation/{row['id']}/mark-reviewed")
+    env.client.post(f"/api/reconciliation/{row['id']}/mark-reviewed", json={"reason": "checked in Kite"})
     _reconcile()
     [again] = _unresolved(env)  # a live position's wrong protection reappears while it lasts
     assert again["issue_code"] == "GTT_QUANTITY_TOO_HIGH" and again["id"] != row["id"]
@@ -553,6 +553,8 @@ def test_migration_is_idempotent(env):
             "position_state", "suggested_action"} <= cols
 
 
-def test_status_before_any_cycle(env):
+def test_status_before_any_cycle(env, monkeypatch):
+    from conftest import clear_healthy_live_state
+    clear_healthy_live_state(monkeypatch)  # a fresh process (env seeds a reconciled one, SEC-1)
     r = env.client.get("/api/reconciliation/status")
     assert r.status_code == 200 and r.json()["data"]["gtt_book"] == "not_run"

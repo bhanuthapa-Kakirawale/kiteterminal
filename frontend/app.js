@@ -162,7 +162,7 @@ const API = {
 
   // Phase 8: reconciliation
   listMismatches: (resolved) => fetchJson(`/api/reconciliation/mismatches?resolved=${resolved ? "true" : "false"}`),
-  markMismatchReviewed: (id) => fetchJsonMutate(`/api/reconciliation/${id}/mark-reviewed`, "POST"),
+  markMismatchReviewed: (id, reason) => fetchJsonMutate(`/api/reconciliation/${id}/mark-reviewed`, "POST", { reason }),
   reconciliationStatus: () => fetchJson("/api/reconciliation/status"),
 
   // Phase 8: strategy versioning
@@ -2690,6 +2690,13 @@ el.emergencyExitConfirmBtn.addEventListener("click", async () => {
       toast(others.map((r) => `${r.symbol} [${r.status}]: ${r.message || r.status}`).join(" · "),
         { type: "error", title: `${others.length} position(s) NOT exited by this click — check Kite`, timeout: 0 });
     }
+    // SEC-1: an unresolved critical reconciliation finding never blocks an
+    // exit, but the affected positions are named.
+    const warned = results.filter((r) => r.warning);
+    if (warned.length) {
+      toast(warned.map((r) => r.warning).join(" · "),
+        { type: "warning", title: `${warned.length} position(s) with an unresolved critical finding`, timeout: 0 });
+    }
   } catch (e) {
     el.emergencyExitError.textContent = e.message;
   }
@@ -2774,26 +2781,40 @@ async function loadReconciliationMismatches() {
   }
 }
 
-el.reconciliationGtt.addEventListener("click", async (event) => {
-  const btn = event.target.closest('button[data-action="mark-reviewed"]');
-  if (!btn) return;
+// SEC-1: a critical finding blocks live new entries until it is marked
+// reviewed, so the review is a logged act with a mandatory reason.
+async function markMismatchReviewedWithReason(id) {
+  const ok = await confirmAction({
+    title: "Mark this finding reviewed?",
+    html: `<p>Only after you have checked the position and its GTT in Kite. Reviewing a critical finding
+           re-allows live entries. The review and its reason are logged.</p>
+           <label class="field">What did you check?<input id="recon-review-reason" type="text" maxlength="500" /></label>`,
+    okLabel: "Mark reviewed",
+  });
+  if (!ok) return;
+  const reason = (document.getElementById("recon-review-reason")?.value || "").trim();
+  if (!reason) {
+    toast("A reason is required — nothing was marked reviewed.", { type: "error" });
+    return;
+  }
   try {
-    await API.markMismatchReviewed(btn.dataset.id);
+    await API.markMismatchReviewed(id, reason);
     await loadReconciliationMismatches();
   } catch (e) {
     toast(e.message, { type: "error" });
   }
+}
+
+el.reconciliationGtt.addEventListener("click", async (event) => {
+  const btn = event.target.closest('button[data-action="mark-reviewed"]');
+  if (!btn) return;
+  await markMismatchReviewedWithReason(btn.dataset.id);
 });
 
 el.reconciliationList.addEventListener("click", async (event) => {
   const btn = event.target.closest('button[data-action="mark-reviewed"]');
   if (!btn) return;
-  try {
-    await API.markMismatchReviewed(btn.dataset.id);
-    await loadReconciliationMismatches();
-  } catch (e) {
-    toast(e.message, { type: "error" });
-  }
+  await markMismatchReviewedWithReason(btn.dataset.id);
 });
 
 function renderTrailingIndicator() {

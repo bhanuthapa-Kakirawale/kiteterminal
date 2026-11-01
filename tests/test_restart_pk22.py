@@ -216,7 +216,10 @@ def test_9_trading_lock_survives_a_restart(env, market_open):
     assert _rows(env, "SELECT trading_locked, trading_lock_reason FROM account_safety_state")[0] == \
         {"trading_locked": 1, "trading_lock_reason": "end of day"}
     tid, r = _entry(env)
-    assert r.status_code == 409 and "TRADING_LOCKED" in r.text
+    # SEC-1: right after a restart nothing has been reconciled yet, so the
+    # live-state gate refuses too (503); the lock must still be among the
+    # reasons — exactly like the breaker in test_8.
+    assert r.status_code in (409, 503) and "TRADING_LOCKED" in r.text
     assert len(env.kite.calls_to("place_order")) == 0
 
 

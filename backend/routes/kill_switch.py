@@ -124,11 +124,40 @@ def emergency_exit_confirm(req: EmergencyExitConfirmRequest, kite: KiteConnect =
                 conn.rollback()
                 results.append(_isolated_failure(conn, account, pos, attempt.get("ticket_id"), e))
 
+        _attach_critical_finding_warnings(conn, results)
         summary = {status: sum(r["status"] == status for r in results) for status in _SUMMARY_STATUSES}
         _log_summary_event(conn, account, _summary_detail(positions, results, summary))
         return {"data": {"count": len(positions), "results": results, "summary": summary}}
     finally:
         conn.close()
+
+
+def _attach_critical_finding_warnings(conn, results: list) -> None:
+    """SEC-1: an unresolved critical reconciliation finding blocks live NEW
+    entries, but it never blocks an exit. Emergency Exit only adds a warning
+    to the affected positions' results (for example: the broker holds fewer
+    shares than the app expects, or a GTT is still armed), AFTER every exit
+    has been attempted. A failure here never changes an outcome."""
+    try:
+        critical = sorted(lifecycle.CRITICAL_ISSUES)
+        rows = conn.execute(
+            f"SELECT COALESCE(r.symbol, t.symbol) AS symbol, r.id, r.issue_code FROM reconciliation_log r "
+            f"LEFT JOIN trade_tickets t ON t.id = r.ticket_id WHERE r.resolved = 0 "
+            f"AND (r.issue_code IS NULL OR r.issue_code IN ({','.join('?' * len(critical))}))", critical,
+        ).fetchall()
+    except Exception:
+        logger.exception("Emergency Exit could not read reconciliation findings for its warnings")
+        return
+    by_symbol: dict = {}
+    for row in rows:
+        if row["symbol"]:
+            by_symbol.setdefault(row["symbol"], []).append(f"#{row['id']} {row['issue_code'] or 'NEEDS_REVIEW'}")
+    for result in results:
+        findings = by_symbol.get(result.get("symbol"))
+        if findings:
+            result["warning"] = (f"Unresolved critical reconciliation finding(s) for {result['symbol']}: "
+                                 f"{', '.join(findings)}. The exit was still attempted; check this position and "
+                                 f"its GTT in Kite.")
 
 
 # Every per-position outcome, in the order the system event lists them.

@@ -472,7 +472,7 @@ def test_reconciliation_list_and_review(env):
     conn.close()
     items = env.client.get("/api/reconciliation/mismatches").json()["data"]
     assert len(items) == 1
-    env.client.post(f"/api/reconciliation/{items[0]['id']}/mark-reviewed")
+    env.client.post(f"/api/reconciliation/{items[0]['id']}/mark-reviewed", json={"reason": "checked in Kite"})
     assert env.client.get("/api/reconciliation/mismatches").json()["data"] == []
 
 

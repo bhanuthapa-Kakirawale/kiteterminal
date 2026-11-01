@@ -766,42 +766,59 @@ def _account_safety_checks(conn: sqlite3.Connection, account_id: int) -> list[di
     return out
 
 
-def _worker_checks(now: datetime) -> list[dict]:
-    from backend import ticker, worker_health, workers
-    out = []
+# SEC-1: a timestamp this far ahead of the wall clock is not "fresh" — the
+# clock or the recorded state is inconsistent, so it fails closed.
+CLOCK_SKEW_TOLERANCE_SECONDS = 120
+
+_WORKER_LABELS = {"order_monitor": "Order monitor", "trailing": "Trailing / GTT monitor",
+                  "reconciliation": "Reconciliation"}
+
+
+def _evaluate_worker(snapshot: dict, name: str, blocking: bool, code: str, label: str, now: datetime) -> dict:
+    from backend import workers
+    entry = snapshot.get(name) or {"task_state": "not_started", "last_ok_at": None, "failing": False,
+                                   "consecutive_failures": 0, "last_error": None}
+    loop_name = "order_monitor" if name == "order_monitor_paper" else name
+    alive = workers.supervisor.is_running(loop_name)
+    threshold = config.WORKER_STALE_AFTER_SECONDS[name]
+    last_ok = _parse_utc(entry.get("last_ok_at"))
+    bad = FAIL if blocking else WARN
+    if not alive:
+        return _check(code, "workers", bad, f"{label} is {entry['task_state'].replace('_', ' ')}: it is not "
+                                            f"running in this process.", blocking, "#diagnostics")
+    if last_ok is None:
+        return _check(code, "workers", bad, f"{label} is running but has not completed a cycle yet.",
+                      blocking, "#diagnostics")
+    age = (now - last_ok).total_seconds()
+    if age < -CLOCK_SKEW_TOLERANCE_SECONDS:
+        return _check(code, "workers", bad, f"{label} reports a last successful cycle in the future "
+                                            f"({entry.get('last_ok_at')} UTC): its health cannot be trusted.",
+                      blocking, "#diagnostics")
+    if age > threshold:
+        return _check(code, "workers", bad, f"{label} is stalled: last successful cycle {int(age)} s ago "
+                                            f"(limit {threshold} s).", blocking, "#diagnostics")
+    if entry.get("failing"):
+        return _check(code, "workers", bad, f"{label} is failing: {entry['consecutive_failures']} consecutive "
+                                            f"failed cycles; last error: {entry.get('last_error')}.",
+                      blocking, "#diagnostics")
+    return _check(code, "workers", PASS, f"{label} healthy: last successful cycle {max(int(age), 0)} s ago.",
+                  blocking)
+
+
+def _critical_worker_checks(now: datetime) -> list[dict]:
+    """The order monitor, trailing/GTT monitor and reconciliation loops:
+    blocking for live, and shared with the confirm-time gate (SEC-1)."""
+    from backend import worker_health
     snapshot = worker_health.snapshot()
-    labels = {"order_monitor": "Order monitor", "trailing": "Trailing / GTT monitor", "reconciliation": "Reconciliation"}
+    return [_evaluate_worker(snapshot, name, True, f"WORKER_{name.upper()}", _WORKER_LABELS[name], now)
+            for name in CRITICAL_LIVE_WORKERS]
 
-    def evaluate_worker(name: str, blocking: bool, code: str, label: str) -> None:
-        entry = snapshot.get(name) or {"task_state": "not_started", "last_ok_at": None, "failing": False,
-                                       "consecutive_failures": 0, "last_error": None}
-        loop_name = "order_monitor" if name == "order_monitor_paper" else name
-        alive = workers.supervisor.is_running(loop_name)
-        threshold = config.WORKER_STALE_AFTER_SECONDS[name]
-        last_ok = _parse_utc(entry.get("last_ok_at"))
-        bad = FAIL if blocking else WARN
-        if not alive:
-            out.append(_check(code, "workers", bad, f"{label} is {entry['task_state'].replace('_', ' ')}: it is not "
-                                                    f"running in this process.", blocking, "#diagnostics"))
-        elif last_ok is None:
-            out.append(_check(code, "workers", bad, f"{label} is running but has not completed a cycle yet.",
-                              blocking, "#diagnostics"))
-        elif (now - last_ok).total_seconds() > threshold:
-            age = int((now - last_ok).total_seconds())
-            out.append(_check(code, "workers", bad, f"{label} is stalled: last successful cycle {age} s ago "
-                                                    f"(limit {threshold} s).", blocking, "#diagnostics"))
-        elif entry.get("failing"):
-            out.append(_check(code, "workers", bad, f"{label} is failing: {entry['consecutive_failures']} consecutive "
-                                                    f"failed cycles; last error: {entry.get('last_error')}.",
-                              blocking, "#diagnostics"))
-        else:
-            age = int((now - last_ok).total_seconds())
-            out.append(_check(code, "workers", PASS, f"{label} healthy: last successful cycle {age} s ago.",
-                              blocking))
 
-    for name in CRITICAL_LIVE_WORKERS:
-        evaluate_worker(name, True, f"WORKER_{name.upper()}", labels[name])
-    evaluate_worker("order_monitor_paper", False, "WORKER_PAPER", "Paper exchange (dry run)")
+def _worker_checks(now: datetime) -> list[dict]:
+    from backend import ticker, worker_health
+    out = _critical_worker_checks(now)
+    out.append(_evaluate_worker(worker_health.snapshot(), "order_monitor_paper", False, "WORKER_PAPER",
+                                "Paper exchange (dry run)", now))
     if ticker.ticker_manager.is_connected():
         out.append(_check("TICKER_CONNECTED", "market_data", PASS, "Live tick stream connected.", False))
     else:
@@ -811,29 +828,42 @@ def _worker_checks(now: datetime) -> list[dict]:
     return out
 
 
-def _reconciliation_checks(conn: sqlite3.Connection, account_id: int, now: datetime) -> list[dict]:
-    from backend import lifecycle, reconciliation
-    out = []
+def _reconciliation_cycle_check(now: datetime) -> dict:
+    """Did the last reconciliation cycle of THIS process compare the app with
+    Kite completely, and recently? SEC-1: a cycle whose checks raised and were
+    rolled back (failed_checks), or whose timestamp lies in the future, is not
+    proof that nothing is wrong."""
+    from backend import reconciliation
     cycle = reconciliation.cycle_status()
     checked = _parse_utc(cycle.get("checked_at"))
     threshold = config.WORKER_STALE_AFTER_SECONDS["reconciliation"]
     if checked is None:
-        out.append(_check("RECON_LAST_CYCLE", "reconciliation", FAIL,
-                          "Reconciliation has not compared the app with Kite in this process yet.", True,
-                          "#diagnostics"))
-    elif cycle.get("gtt_book") != "ok" or cycle.get("holdings") == "unavailable":
-        out.append(_check("RECON_LAST_CYCLE", "reconciliation", FAIL,
-                          f"The last reconciliation could not read Kite (GTT book: {cycle.get('gtt_book')}, holdings: "
-                          f"{cycle.get('holdings')}).", True, "#diagnostics"))
-    elif (now - checked).total_seconds() > threshold:
-        out.append(_check("RECON_LAST_CYCLE", "reconciliation", FAIL,
-                          f"The last reconciliation with Kite is {int((now - checked).total_seconds())} s old "
-                          f"(limit {threshold} s).", True, "#diagnostics"))
-    else:
-        out.append(_check("RECON_LAST_CYCLE", "reconciliation", PASS,
-                          f"Reconciled with Kite at {cycle['checked_at']} UTC ({cycle.get('active_gtts') or 0} active "
-                          f"GTT(s)).", True))
+        return _check("RECON_LAST_CYCLE", "reconciliation", FAIL,
+                      "Reconciliation has not compared the app with Kite in this process yet.", True, "#diagnostics")
+    age = (now - checked).total_seconds()
+    if age < -CLOCK_SKEW_TOLERANCE_SECONDS:
+        return _check("RECON_LAST_CYCLE", "reconciliation", FAIL,
+                      f"The last reconciliation is stamped in the future ({cycle['checked_at']} UTC): the clock or "
+                      f"the recorded state is inconsistent.", True, "#diagnostics")
+    if cycle.get("gtt_book") != "ok" or cycle.get("holdings") == "unavailable":
+        return _check("RECON_LAST_CYCLE", "reconciliation", FAIL,
+                      f"The last reconciliation could not read Kite (GTT book: {cycle.get('gtt_book')}, holdings: "
+                      f"{cycle.get('holdings')}).", True, "#diagnostics")
+    if cycle.get("failed_checks"):
+        return _check("RECON_LAST_CYCLE", "reconciliation", FAIL,
+                      f"The last reconciliation did not complete: check(s) {', '.join(cycle['failed_checks'])} failed "
+                      f"and were rolled back.", True, "#diagnostics")
+    if age > threshold:
+        return _check("RECON_LAST_CYCLE", "reconciliation", FAIL,
+                      f"The last reconciliation with Kite is {int(age)} s old (limit {threshold} s).", True,
+                      "#diagnostics")
+    return _check("RECON_LAST_CYCLE", "reconciliation", PASS,
+                  f"Reconciled with Kite at {cycle['checked_at']} UTC ({cycle.get('active_gtts') or 0} active "
+                  f"GTT(s)).", True)
 
+
+def _critical_findings_check(conn: sqlite3.Connection) -> dict:
+    from backend import lifecycle
     critical = sorted(lifecycle.CRITICAL_ISSUES)
     marks = ",".join("?" * len(critical))
     rows = conn.execute(
@@ -842,12 +872,34 @@ def _reconciliation_checks(conn: sqlite3.Connection, account_id: int, now: datet
     ).fetchall()
     if rows:
         listed = ", ".join(f"#{r['id']} {r['issue_code'] or 'NEEDS_REVIEW'} {r['symbol'] or ''}".strip() for r in rows[:5])
-        out.append(_check("RECON_CRITICAL_UNRESOLVED", "reconciliation", FAIL,
-                          f"{len(rows)} unresolved critical reconciliation finding(s): {listed}. Inspect Kite, resolve, "
-                          f"then mark them reviewed.", True, "#positions"))
-    else:
-        out.append(_check("RECON_CRITICAL_UNRESOLVED", "reconciliation", PASS,
-                          "No unresolved critical reconciliation finding.", True))
+        return _check("RECON_CRITICAL_UNRESOLVED", "reconciliation", FAIL,
+                      f"{len(rows)} unresolved critical reconciliation finding(s): {listed}. Inspect Kite, resolve, "
+                      f"then mark them reviewed.", True, "#positions")
+    return _check("RECON_CRITICAL_UNRESOLVED", "reconciliation", PASS,
+                  "No unresolved critical reconciliation finding.", True)
+
+
+def _isolation_check(conn: sqlite3.Connection, account_id: int) -> dict:
+    mixed = conn.execute(
+        "SELECT COUNT(*) AS n FROM trade_tickets WHERE account_id = ? AND ("
+        " (mode = 'live' AND (kite_order_id LIKE 'PAPER-%' OR kite_gtt_id LIKE 'PAPER-%'))"
+        " OR (mode = 'dry_run' AND ((kite_order_id IS NOT NULL AND kite_order_id NOT LIKE 'PAPER-%')"
+        "      OR (kite_gtt_id IS NOT NULL AND CAST(kite_gtt_id AS TEXT) NOT LIKE 'PAPER-%'))))",
+        (account_id,),
+    ).fetchone()["n"]
+    if mixed:
+        return _check("PAPER_LIVE_ISOLATION", "reconciliation", FAIL,
+                      f"{mixed} ticket(s) mix paper and live broker ids: paper/live isolation is broken.", True,
+                      "#diagnostics")
+    return _check("PAPER_LIVE_ISOLATION", "reconciliation", PASS,
+                  "Paper and live orders are isolated (no ticket carries the other mode's broker ids).", True)
+
+
+def _reconciliation_checks(conn: sqlite3.Connection, account_id: int, now: datetime) -> list[dict]:
+    from backend import lifecycle
+    out = [_reconciliation_cycle_check(now), _critical_findings_check(conn)]
+    critical = sorted(lifecycle.CRITICAL_ISSUES)
+    marks = ",".join("?" * len(critical))
     other = conn.execute(
         f"SELECT COUNT(*) AS n FROM reconciliation_log WHERE resolved = 0 AND issue_code IS NOT NULL "
         f"AND issue_code NOT IN ({marks})", critical,
@@ -868,20 +920,7 @@ def _reconciliation_checks(conn: sqlite3.Connection, account_id: int, now: datet
         out.append(_check("UNKNOWN_LIVE_ORDERS", "reconciliation", PASS,
                           "No live order with an unknown or unreviewed broker outcome.", True))
 
-    mixed = conn.execute(
-        "SELECT COUNT(*) AS n FROM trade_tickets WHERE account_id = ? AND ("
-        " (mode = 'live' AND (kite_order_id LIKE 'PAPER-%' OR kite_gtt_id LIKE 'PAPER-%'))"
-        " OR (mode = 'dry_run' AND ((kite_order_id IS NOT NULL AND kite_order_id NOT LIKE 'PAPER-%')"
-        "      OR (kite_gtt_id IS NOT NULL AND CAST(kite_gtt_id AS TEXT) NOT LIKE 'PAPER-%'))))",
-        (account_id,),
-    ).fetchone()["n"]
-    if mixed:
-        out.append(_check("PAPER_LIVE_ISOLATION", "reconciliation", FAIL,
-                          f"{mixed} ticket(s) mix paper and live broker ids: paper/live isolation is broken.", True,
-                          "#diagnostics"))
-    else:
-        out.append(_check("PAPER_LIVE_ISOLATION", "reconciliation", PASS,
-                          "Paper and live orders are isolated (no ticket carries the other mode's broker ids).", True))
+    out.append(_isolation_check(conn, account_id))
     return out
 
 
@@ -900,6 +939,19 @@ def _broker_order_checks(conn: sqlite3.Connection, account_id: int, snap: Broker
                    f"{len(working)} working broker order(s), all placed by this terminal.", False)]
 
 
+def _calendar_check(now: datetime) -> tuple[dict, dict]:
+    calendar = trading_calendar.calendar_status(now)
+    year = trading_calendar.as_ist(now).year
+    if calendar["uncovered_years"] or year not in calendar["covered_years"]:
+        return _check("CALENDAR_YEAR", "market_data", FAIL,
+                      f"NSE holiday calendar does not cover {calendar['uncovered_years'] or [year]}: session "
+                      f"dates (stale-signal rule, AMO timing) cannot be trusted. Update "
+                      f"backend/calendar_data/nse_equity_holidays.json.", True, "#diagnostics"), calendar
+    return _check("CALENDAR_YEAR", "market_data", PASS,
+                  f"NSE holiday calendar covers {year}; latest completed session "
+                  f"{calendar['latest_completed_session']}.", True), calendar
+
+
 def _market_checks(conn: sqlite3.Connection, account_id: int, snap: BrokerSnapshot | None, now: datetime) -> list[dict]:
     from backend import automation, ohlc_integrity
     out = []
@@ -914,17 +966,8 @@ def _market_checks(conn: sqlite3.Connection, account_id: int, snap: BrokerSnapsh
         out.append(_check("MARKET_DATA_LTP", "market_data", PASS,
                           f"Kite price read OK ({snap.ltp_key} at {snap.taken_at} UTC).", True))
 
-    calendar = trading_calendar.calendar_status(now)
-    year = trading_calendar.as_ist(now).year
-    if calendar["uncovered_years"] or year not in calendar["covered_years"]:
-        out.append(_check("CALENDAR_YEAR", "market_data", FAIL,
-                          f"NSE holiday calendar does not cover {calendar['uncovered_years'] or [year]}: session "
-                          f"dates (stale-signal rule, AMO timing) cannot be trusted. Update "
-                          f"backend/calendar_data/nse_equity_holidays.json.", True, "#diagnostics"))
-    else:
-        out.append(_check("CALENDAR_YEAR", "market_data", PASS,
-                          f"NSE holiday calendar covers {year}; latest completed session "
-                          f"{calendar['latest_completed_session']}.", True))
+    calendar_check, calendar = _calendar_check(now)
+    out.append(calendar_check)
 
     session = calendar["latest_completed_session"]
     fresh = automation.data_freshness(account_id, session)
@@ -978,6 +1021,38 @@ SECTION_TITLES = {
 
 def is_blocking_failure(check: dict) -> bool:
     return check["blocking"] and check["status"] in (FAIL, USER_ACTION)
+
+
+# --------------------------------------------------------------------------
+# SEC-1: the confirm-time subset (shared with account_safety)
+# --------------------------------------------------------------------------
+
+# The state the terminal's own view of the broker depends on. Stale, missing
+# or inconsistent means it cannot be trusted right now (fail closed, 503).
+CONFIRM_TIME_UNVERIFIED_CODES = frozenset({
+    "RECON_LAST_CYCLE", "WORKER_ORDER_MONITOR", "WORKER_TRAILING", "WORKER_RECONCILIATION", "CALENDAR_YEAR",
+})
+# Known-bad state that a human must resolve first (409).
+CONFIRM_TIME_CRITICAL_CODES = frozenset({"RECON_CRITICAL_UNRESOLVED", "PAPER_LIVE_ISOLATION"})
+
+
+def confirm_time_blockers(conn: sqlite3.Connection, account_id: int, trading_now: datetime | None = None,
+                          now: datetime | None = None) -> list[dict]:
+    """The blocking failures among the checks a live NEW entry must pass at
+    confirmation (account_safety.check_live_critical_state). They are built
+    by the same functions the Live Readiness page uses, so the two cannot
+    disagree.
+
+    Strictly local: no broker call and no database write. Freshness is judged
+    on the wall clock (`now`, UTC), because worker and reconciliation
+    timestamps are wall-clock. The calendar is judged on the trading clock
+    (`trading_now`). Unresolved UNKNOWN submissions are not repeated here:
+    the LIVE-0 prerequisite check already refuses them."""
+    now = now or _utc_now()
+    checks = [_reconciliation_cycle_check(now), _critical_findings_check(conn), _isolation_check(conn, account_id)]
+    checks += _critical_worker_checks(now)
+    checks.append(_calendar_check(trading_now or now)[0])
+    return [c for c in checks if is_blocking_failure(c)]
 
 
 def evaluate(broker: bool = False, refresh: bool = False, now: datetime | None = None) -> dict:

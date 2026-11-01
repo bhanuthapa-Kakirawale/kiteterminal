@@ -81,6 +81,13 @@ class BreakerResetRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 
+class ReconciliationReviewRequest(BaseModel):
+    # SEC-1: marking a finding reviewed can unblock live entries (a critical
+    # finding blocks them at confirmation), so it is a logged human act and
+    # the reason is mandatory.
+    reason: str = Field(min_length=1, max_length=500)
+
+
 class StaticIpConfirmRequest(BaseModel):
     # LIVE-0: the user's statement that `ip` is the static IP whitelisted in
     # the Kite developer console. `confirm` must be true: never implied.

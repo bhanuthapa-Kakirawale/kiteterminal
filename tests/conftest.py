@@ -103,6 +103,42 @@ def clear_live_prerequisites(db) -> None:
         conn.close()
 
 
+# SEC-1: a live NEW entry also needs the live state it rests on, re-checked
+# at confirmation (account_safety.check_live_critical_state): a fresh and
+# complete reconciliation cycle and healthy order-monitor / trailing /
+# reconciliation loops. Tests never run the startup hooks, so nothing would
+# be running. Every test therefore starts from a healthy, just-reconciled
+# process state (process memory, restored by monkeypatch), exactly like
+# seed_live_prerequisites above. The SEC-1 gate tests
+# (test_live_critical_gate.py) clear it to test the gate itself.
+CRITICAL_WORKERS_SEEDED = ("order_monitor", "order_monitor_paper", "trailing", "reconciliation")
+
+
+def _utc_sql_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def seed_healthy_live_state(monkeypatch) -> None:
+    from backend import reconciliation, worker_health, workers
+    monkeypatch.setattr(workers.supervisor, "is_running", lambda name: True)
+    monkeypatch.setattr(worker_health, "_workers", {})
+    for name in CRITICAL_WORKERS_SEEDED:
+        with worker_health.cycle(name):
+            pass
+    monkeypatch.setattr(reconciliation, "last_cycle", {
+        "checked_at": _utc_sql_now(), "gtt_book": "ok", "gtt_error": None, "holdings": "ok",
+        "holdings_error": None, "active_gtts": 0, "new_findings": 0, "failed_checks": [],
+    })
+
+
+def clear_healthy_live_state(monkeypatch) -> None:
+    """A fresh process: nothing reconciled, no worker running."""
+    from backend import reconciliation, worker_health, workers
+    monkeypatch.setattr(workers.supervisor, "is_running", lambda name: False)
+    monkeypatch.setattr(worker_health, "_workers", {})
+    monkeypatch.setattr(reconciliation, "last_cycle", {})
+
+
 def add_watch(db, symbol: str, instrument_token: int) -> None:
     conn = db.get_connection()
     try:
@@ -162,6 +198,7 @@ def env(tmp_path, monkeypatch):
     # FakeKite GTT ids and ticket ids restart in every test.
     from backend import reconciliation
     reconciliation.reset_cycle_memory()
+    seed_healthy_live_state(monkeypatch)  # SEC-1, after the reset above
     # PK-20: the paper broker's one-shot test hooks are process memory too.
     from backend import paper_broker
     paper_broker.reset_test_hooks()
@@ -240,4 +277,5 @@ def ticket_row(db, ticket_id: int) -> dict:
 
 __all__ = ["FakeKite", "make_candles", "seed_ohlc", "add_watch", "account_id", "set_mode", "displayed_mode", "ticket_row",
            "as_pre_pk22_database", "seed_live_prerequisites", "clear_live_prerequisites", "TEST_STATIC_IP",
+           "seed_healthy_live_state", "clear_healthy_live_state",
            "last_weekday", "IST", "TERMINAL_ORIGIN", "TERMINAL_HEADERS", "terminal_client"]

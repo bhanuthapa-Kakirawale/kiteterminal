@@ -291,7 +291,7 @@ def test_16_reconciliation_issue_sets_review_required(env):
     assert issue["code"] == "BROKER_POSITION_SHORTFALL" and issue["label"] == "Broker quantity shortfall"
     assert issue["severity"] == "critical" and "VIEW_RECONCILIATION" in lc["allowed_actions"]
 
-    env.client.post(f"/api/reconciliation/{issue['id']}/mark-reviewed")
+    env.client.post(f"/api/reconciliation/{issue['id']}/mark-reviewed", json={"reason": "checked in Kite"})
     assert _lc(env, buy_id)["review_required"] is False  # a reviewed finding is no longer attached
 
 

@@ -1845,6 +1845,50 @@ def _m005_live_readiness(conn: sqlite3.Connection) -> None:
     _execute_script(conn, _LIVE_READINESS_TABLE)
 
 
+_SEC1_EVENT_TYPES = (
+    _ACCOUNT_SAFETY_EVENT_TYPES
+    + ", 'reconciliation_reviewed', 'live_switch_refused', 'mode_reset_on_session_change'"
+)
+
+
+def _m006_sec1_live_safety(conn: sqlite3.Connection) -> None:
+    # SEC-1: the audit trail of the new live-safety acts is account-level:
+    #   - a reconciliation finding marked reviewed (with its reason), which
+    #     can unblock live entries;
+    #   - a refused switch to live;
+    #   - the reset to dry run when the broker session changes.
+    # system_events.event_type is a CHECK allow-list, so the table is rebuilt
+    # (same pattern as _ensure_account_safety_event_types). The migration
+    # runner has already turned foreign keys off and opened the transaction.
+    #
+    # execution_settings.live_armed_session_id is the broker session
+    # (sessions.id) whose readiness check armed LIVE mode. A live new entry
+    # is accepted only while that session is still the active one. Plain
+    # ALTER TABLE: NULL means "not armed".
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='system_events'").fetchone()
+    if row is not None and "'reconciliation_reviewed'" not in row["sql"]:
+        conn.execute(
+            f"""
+            CREATE TABLE system_events_new (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id  INTEGER NOT NULL REFERENCES accounts(id),
+                event_type  TEXT NOT NULL CHECK (event_type IN ({_SEC1_EVENT_TYPES})),
+                detail      TEXT,
+                triggered_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO system_events_new (id, account_id, event_type, detail, triggered_at) "
+            "SELECT id, account_id, event_type, detail, triggered_at FROM system_events"
+        )
+        conn.execute("DROP TABLE system_events")
+        conn.execute("ALTER TABLE system_events_new RENAME TO system_events")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_system_events_account ON system_events(account_id)")
+    if not _column_exists(conn, "execution_settings", "live_armed_session_id"):
+        conn.execute("ALTER TABLE execution_settings ADD COLUMN live_armed_session_id INTEGER")
+
+
 # (version, name, function) — append only; never renumber or rename a
 # released migration: the name is checked against every database's history.
 MIGRATIONS: list[tuple[int, str, object]] = [
@@ -1853,6 +1897,7 @@ MIGRATIONS: list[tuple[int, str, object]] = [
     (3, "pk22_query_indexes", _m003_query_indexes),
     (4, "pk22_ohlc_history_integrity", _m004_ohlc_history_integrity),
     (5, "live0_live_readiness", _m005_live_readiness),
+    (6, "sec1_live_safety", _m006_sec1_live_safety),
 ]
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
 

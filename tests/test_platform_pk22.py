@@ -102,7 +102,7 @@ def test_brand_new_database_migrates_to_the_current_version(env):
     from backend import db
     history = _rows(env, "SELECT version, migration_name FROM schema_version ORDER BY version")
     assert [(h["version"], h["migration_name"]) for h in history] == [(v, n) for v, n, _ in db.MIGRATIONS]
-    assert history[-1]["version"] == db.LATEST_SCHEMA_VERSION == 5   # LIVE-0 added v5
+    assert history[-1]["version"] == db.LATEST_SCHEMA_VERSION == 6   # LIVE-0 added v5, SEC-1 v6
     conn = env.db.get_connection()
     try:
         status = db.schema_status(conn)
@@ -130,7 +130,7 @@ def test_migration_history_is_recorded_once(env):
     for _ in range(3):
         env.db.init_db()
     rows = _rows(env, "SELECT version, COUNT(*) AS n FROM schema_version GROUP BY version")
-    assert [(r["version"], r["n"]) for r in rows] == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
+    assert [(r["version"], r["n"]) for r in rows] == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
 
 
 @pytest.mark.parametrize("tamper", ["newer_version", "renamed_migration", "gap"])
@@ -183,9 +183,9 @@ def test_interrupted_migration_rolls_back_and_resumes(env, monkeypatch):
 
     monkeypatch.setattr(db, "MIGRATIONS", real_migrations)  # the next start resumes from v3
     db.init_db()
-    assert db.last_init["applied_migrations"] == [4, 5]
+    assert db.last_init["applied_migrations"] == [4, 5, 6]
     assert [r["version"] for r in _rows(env, "SELECT version FROM schema_version ORDER BY version")] == \
-        [1, 2, 3, 4, 5]
+        [1, 2, 3, 4, 5, 6]
     assert "ohlc_history_status" in {r["name"] for r in _rows(env, "SELECT name FROM sqlite_master")}
 
 
@@ -918,6 +918,8 @@ def test_supervisor_never_duplicates_and_stops_everything():
 
 def test_app_startup_twice_starts_one_set_of_workers_and_shutdown_stops_them(env, monkeypatch):
     from backend import main, server, workers
+    # The real supervisor, not the SEC-1 "everything is running" seed.
+    monkeypatch.setattr(workers.supervisor, "is_running", type(workers.supervisor).is_running.__get__(workers.supervisor))
     started = []
 
     def make(name):
@@ -1028,7 +1030,7 @@ def test_connections_wait_for_a_busy_writer_instead_of_failing(env):
 def test_maintenance_cli_reports_checks_and_backs_up(env, capsys):
     from backend import db_maintenance
     assert db_maintenance.main(["status", "--db", str(_db_file(env))]) == 0
-    assert "schema:    v5 of v5" in capsys.readouterr().out
+    assert "schema:    v6 of v6" in capsys.readouterr().out
     assert db_maintenance.main(["integrity", "--db", str(_db_file(env))]) == 0
     assert "integrity_check: ok" in capsys.readouterr().out
     assert db_maintenance.main(["backup", "--db", str(_db_file(env))]) == 0
@@ -1056,6 +1058,8 @@ def test_health_is_always_up(env):
 
 def test_readiness_reports_each_blocker_and_does_not_need_an_open_market(env, monkeypatch):
     from backend import account_safety, diagnostics
+    from conftest import clear_healthy_live_state
+    clear_healthy_live_state(monkeypatch)  # a fresh process: no worker runs (env seeds healthy ones, SEC-1)
     r = env.client.get("/api/ready")
     assert r.status_code == 503
     codes = {b["code"] for b in r.json()["data"]["blockers"]}
@@ -1099,7 +1103,7 @@ def test_diagnostics_report_is_complete_and_leaks_no_secret(env, monkeypatch):
     for secret in (*SENTINELS, "test_api_key", "fake-access-token"):
         assert secret not in text, secret
     data = r.json()["data"]
-    assert data["schema"]["current_version"] == 5 and data["database_integrity"]["ok"] is True
+    assert data["schema"]["current_version"] == 6 and data["database_integrity"]["ok"] is True
     assert data["broker_session"]["state"] == "VALID" and data["broker_session"]["verified_with_broker"] is False
     assert {"order_monitor", "trailing", "reconciliation"} <= set(data["workers"])
     assert data["market"]["session_state"] in ("OPEN", "CLOSED", "PRE_OPEN", "HOLIDAY", "WEEKEND")

@@ -19,6 +19,10 @@ Controls (one small function each):
   12H  market hours / AMO      decide_variety            live
   L0   live prerequisites      check_live_prerequisites  live (LIVE-0: notional + ₹ loss set,
                                                           static IP confirmed, no UNKNOWN order)
+  S1   live critical state     check_live_critical_state live (SEC-1: reconciliation fresh and
+                                                          complete, no critical finding, critical
+                                                          workers healthy, paper/live isolated,
+                                                          calendar covered; both orchestrators)
 
 Two orchestrators run them, in a fixed order:
 
@@ -67,6 +71,8 @@ AMO_CONFIRMATION_REQUIRED = "AMO_CONFIRMATION_REQUIRED"
 AMO_DISABLED = "AMO_DISABLED"
 ACCOUNT_SAFETY_UNAVAILABLE = "ACCOUNT_SAFETY_UNAVAILABLE"
 LIVE_PREREQUISITE_MISSING = "LIVE_PREREQUISITE_MISSING"
+LIVE_STATE_UNVERIFIED = "LIVE_STATE_UNVERIFIED"
+RECONCILIATION_CRITICAL = "RECONCILIATION_CRITICAL"
 
 VARIETY_REGULAR = "regular"
 VARIETY_AMO = "amo"
@@ -455,6 +461,44 @@ def check_live_prerequisites(conn: sqlite3.Connection, account_id: int, settings
                          + ". See Live Readiness. Nothing was executed; exits are still allowed.")
 
 
+def check_live_critical_state(conn: sqlite3.Connection, account_id: int, now: datetime) -> list[SafetyFailure]:
+    """SEC-1: the live state a NEW entry's safety rests on, re-evaluated at
+    confirmation and not just when the Live Readiness page is displayed:
+    - the last reconciliation compared the app with Kite completely and
+      recently;
+    - no critical reconciliation finding is unresolved (a broker position
+      shortfall, an orphaned or duplicate GTT, a possible double sell);
+    - the order monitor, trailing and reconciliation loops are healthy;
+    - paper and live ids are isolated;
+    - the NSE calendar covers today.
+
+    Local only, no broker call. Anything stale, missing or inconsistent
+    fails closed (503). A known-bad finding is 409 and never permanent: the
+    ticket stays approvable once the finding is resolved and reviewed.
+    Exits never come here."""
+    from backend import live_preflight
+    try:
+        blockers = live_preflight.confirm_time_blockers(conn, account_id, trading_now=now)
+    except Exception as e:
+        return [SafetyFailure(LIVE_STATE_UNVERIFIED,
+                              f"The live trading state could not be evaluated ({type(e).__name__}: {e}) — no new "
+                              f"live entry is sent. Exits are still allowed.", http_status=503)]
+    failures = []
+    critical = [b for b in blockers if b["code"] in live_preflight.CONFIRM_TIME_CRITICAL_CODES]
+    unverified = [b for b in blockers if b["code"] not in live_preflight.CONFIRM_TIME_CRITICAL_CODES]
+    if critical:
+        failures.append(SafetyFailure(RECONCILIATION_CRITICAL,
+                                      "Live entry refused — " + " ".join(b["message"] for b in critical)
+                                      + " Nothing was executed; exits are still allowed."))
+    if unverified:
+        failures.append(SafetyFailure(LIVE_STATE_UNVERIFIED,
+                                      "Live entry refused — the terminal's view of the broker cannot be trusted "
+                                      "right now: " + " ".join(b["message"] for b in unverified)
+                                      + " Nothing was executed; exits are still allowed. See Live Readiness.",
+                                      http_status=503))
+    return failures
+
+
 def check_stale_signal(ticket: sqlite3.Row, now: datetime) -> SafetyFailure | None:
     """PK-12E: a STRATEGY entry is valid only while its signal candle is the
     latest completed session (the rule expire_stale_signals applies at the
@@ -541,6 +585,8 @@ def precheck(conn: sqlite3.Connection, account_id: int, ticket: sqlite3.Row, mod
     live = mode == "live"
     if live:
         decision.add(check_live_prerequisites(conn, account_id, settings, now))
+        for failure in check_live_critical_state(conn, account_id, now):
+            decision.add(failure)
         decision.add(check_daily_loss(conn, account_id, settings, now))
         decision.add(check_daily_entry_limit(conn, account_id, settings, ticket["id"], now))
         decision.add(check_notional(ticket, settings))
@@ -573,6 +619,10 @@ def final_gate(conn: sqlite3.Connection, account_id: int, ticket: sqlite3.Row, k
     settings = risk_engine.get_settings(conn, account_id)
     decision.add(check_breaker(state))
     decision.add(check_daily_loss(conn, account_id, settings, now, portfolio_value))
+    # SEC-1: re-evaluated here as well: reconciliation can raise a critical
+    # finding, or a worker can stall, between the pre-check and this point.
+    for failure in check_live_critical_state(conn, account_id, now):
+        decision.add(failure)
     if not decision.passed:
         return decision  # no broker call after a hard failure
     try:
