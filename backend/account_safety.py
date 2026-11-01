@@ -24,16 +24,30 @@ Controls (one small function each):
                                                           complete, no critical finding, critical
                                                           workers healthy, paper/live isolated,
                                                           calendar covered; both orchestrators)
+  R    manual ticket review    check_ticket_review       both modes (SEC-1 P1-D: a manual /
+                                                          Quick-Action BUY entry was reviewed in
+                                                          the current NSE session window and Kite
+                                                          session, over exactly the content now
+                                                          stored; both orchestrators)
 
 Two orchestrators run them, in a fixed order:
 
   precheck()   before the atomic claim — DB and request only, never a broker
-               call; a refusal writes nothing to the ticket (except a stale
-               signal, which is rejected for good).
+               call; a refusal writes nothing to the ticket, except a
+               permanent failure (a stale or contradictory strategy signal,
+               tampered ticket evidence), which rejects the ticket for good.
   final_gate() after the claim and risk revalidation, immediately before
                the broker call — re-checks what can change meanwhile (lock,
-               breaker, loss) and makes the one broker call (LTP) needed for
-               the price checks, only if nothing failed before it.
+               review window/session/evidence, breaker, loss) and makes the
+               one broker call (LTP) needed for the price checks, only if
+               nothing failed before it.
+
+The order variety (12H, regular vs AMO) is decided once in precheck and
+bound to the execution. Since P1-D, a manual / Quick-Action BUY entry whose
+review window changes between precheck and the final gate (an NSE open at
+09:15 or close at 15:30 in between) is refused there and returned to
+'pending_confirmation' — so such an entry can no longer be sent with a
+variety decided on the other side of the boundary.
 
 The daily entry limit is enforced atomically by the claim itself
 (daily_entry_claim_condition): a live claim is the reservation of a slot.
@@ -46,6 +60,8 @@ the execution-enabled trading account (accounts.get_trading_account); the
 global execution mode (execution_settings) is the only unscoped input.
 """
 
+import hashlib
+import json
 import logging
 import math
 import sqlite3
@@ -75,6 +91,10 @@ LIVE_PREREQUISITE_MISSING = "LIVE_PREREQUISITE_MISSING"
 LIVE_STATE_UNVERIFIED = "LIVE_STATE_UNVERIFIED"
 LIVE_NOT_ARMED_FOR_SESSION = "LIVE_NOT_ARMED_FOR_SESSION"
 RECONCILIATION_CRITICAL = "RECONCILIATION_CRITICAL"
+TICKET_REVIEW_REQUIRED = "TICKET_REVIEW_REQUIRED"
+TICKET_REVIEW_CHANGED = "TICKET_REVIEW_CHANGED"
+TICKET_EVIDENCE_MISMATCH = "TICKET_EVIDENCE_MISMATCH"
+TICKET_REVIEW_NOT_APPLICABLE = "TICKET_REVIEW_NOT_APPLICABLE"
 
 VARIETY_REGULAR = "regular"
 VARIETY_AMO = "amo"
@@ -520,11 +540,28 @@ def check_live_critical_state(conn: sqlite3.Connection, account_id: int, now: da
     return failures
 
 
+def _evaluation_signal_date(ticket) -> str | None:
+    """The signal date the strategy's own evaluation record states, or None
+    when there is no readable record (older rows, plain-dict tickets, or a
+    malformed record: unreadable evidence alone never rejects a ticket)."""
+    if "entry_evaluation" not in ticket.keys():
+        return None
+    from backend import signal_chart
+    evaluation = signal_chart.parse_evaluation(ticket["entry_evaluation"])
+    if not evaluation or not evaluation.get("signal_date"):
+        return None
+    return str(evaluation["signal_date"])[:10]
+
+
 def check_stale_signal(ticket: sqlite3.Row, now: datetime) -> SafetyFailure | None:
     """PK-12E: a STRATEGY entry is valid only while its signal candle is the
     latest completed session (the rule expire_stale_signals applies at the
-    next scan). Manual and alert-action entries keep their existing semantics.
-    Weekends are handled; NSE holidays are not (PK-22)."""
+    next scan). NSE holidays come from the trading calendar (PK-22).
+
+    P1-D: contradictory evidence fails closed too — a signal dated after
+    today, or a signal_date that differs from the date its own evaluation
+    record states, cannot be shown to be the signal that was evaluated.
+    Manual and alert-action entries are judged by check_ticket_review."""
     if ticket["source"] != "strategy":
         return None
     raw = ticket["signal_date"] or (ticket["created_at"] or "")[:10]
@@ -534,12 +571,220 @@ def check_stale_signal(ticket: sqlite3.Row, now: datetime) -> SafetyFailure | No
     except ValueError:
         return SafetyFailure(STALE_SIGNAL, f"Strategy signal date {raw!r} cannot be read — the signal cannot be "
                                            f"shown to be current. Nothing was executed.", permanent=True)
+    today = market.as_ist(now).date()
+    if signal_day > today:
+        return SafetyFailure(STALE_SIGNAL,
+                             f"Contradictory signal: dated {signal_day.isoformat()}, after today "
+                             f"({today.isoformat()}) — it cannot be shown to come from a completed candle. Nothing "
+                             f"was executed; the ticket is rejected.", permanent=True)
+    evaluated = _evaluation_signal_date(ticket)
+    if ticket["signal_date"] and evaluated is not None and evaluated != str(ticket["signal_date"])[:10]:
+        return SafetyFailure(STALE_SIGNAL,
+                             f"Contradictory signal: the ticket says {str(ticket['signal_date'])[:10]} but its "
+                             f"evaluation record says {evaluated} — the levels cannot be tied to the evaluation that "
+                             f"produced them. Nothing was executed; the ticket is rejected.", permanent=True)
     if signal_day >= session:
         return None
     return SafetyFailure(STALE_SIGNAL,
                          f"Stale signal: computed from the {signal_day.isoformat()} candle, but the {session.isoformat()} "
                          f"session has completed since — its price levels are no longer current. Nothing was "
                          f"executed; the ticket is rejected (it is not refreshed automatically).", permanent=True)
+
+
+# --------------------------------------------------------------------------
+# P1-D: manual / Quick-Action BUY ticket review
+# --------------------------------------------------------------------------
+#
+# A strategy signal is judged by its candle (check_stale_signal). A manual or
+# Quick-Action BUY entry has no candle: its levels are a human's judgement at
+# the moment of review. It may therefore be sent only while that review is
+# current:
+#   - in the same NSE session window (review_window: no 09:15 open or 15:30
+#     close since), on the trading calendar's clock;
+#   - under the same Kite login (sessions.id) — a new login or a logout ends
+#     every outstanding review, in both modes;
+#   - over exactly the content stored now (review_digest, stamped at creation
+#     or edit; a mismatch is tamper evidence and rejects the ticket for good).
+# A confirmation also echoes the review token the approver's view showed
+# (review_token), so a dialog left open across a Re-review or an edit in
+# another tab cannot approve something it did not show. Exits are never
+# subjects: the gate may only refuse adding risk.
+
+REVIEW_SUBJECT_SOURCES = ("manual", "alert_action")
+# Same tolerance SEC-1 allows a reconciliation timestamp (RECON_LAST_CYCLE).
+REVIEW_FUTURE_TOLERANCE = timedelta(seconds=120)
+
+# The ticket's identity and every field that decides what is sent. id and
+# account_id make two otherwise identical tickets hash differently.
+_DIGEST_INT_FIELDS = ("id", "account_id", "closes_ticket_id", "instrument_token", "quantity", "trailing_enabled",
+                      "use_gtt")
+_DIGEST_FLOAT_FIELDS = ("entry_price", "stop_loss", "target_1", "target_2", "trailing_distance")
+_DIGEST_TEXT_FIELDS = ("source", "symbol", "exchange", "transaction_type", "entry_order_type", "trailing_trigger",
+                       "product_type")
+
+
+def is_review_subject(ticket) -> bool:
+    """A risk-adding manual or Quick-Action BUY entry. Strategy entries are
+    judged by their signal; closing sells are never gated."""
+    return ticket["source"] in REVIEW_SUBJECT_SOURCES and not execution.is_closing_sell(ticket)
+
+
+def review_window(at: datetime) -> tuple[str, str]:
+    """The NSE session window `at` falls in: ('OPEN', day) during a regular
+    session, else ('CLOSED', the session an order would wait for). A review
+    stays current only inside one window. Read from the trading calendar
+    directly — never market.is_market_open, which tests pin to 'open'."""
+    at = trading_calendar.as_ist(at)
+    if trading_calendar.is_market_session_open(at):
+        return "OPEN", at.date().isoformat()
+    return "CLOSED", trading_calendar.next_session_date(at).isoformat()
+
+
+def _describe_window(window: tuple[str, str]) -> str:
+    kind, day = window
+    return f"the {day} session" if kind == "OPEN" else f"the market-closed period before the {day} session"
+
+
+def ticket_review_digest(ticket) -> str:
+    """sha256 of the ticket's canonical identity + economic content. Always
+    computed from a STORED row (sqlite stores the request's bools as ints,
+    and the instrument token comes from the cache), so creation and
+    confirmation hash identical values."""
+    def cast(value, kind):
+        return None if value is None else kind(value)
+    payload = {name: cast(ticket[name], int) for name in _DIGEST_INT_FIELDS}
+    payload.update({name: cast(ticket[name], float) for name in _DIGEST_FLOAT_FIELDS})
+    payload.update({name: ticket[name] for name in _DIGEST_TEXT_FIELDS})
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def review_token(ticket) -> str | None:
+    """What an approval echoes: changes with every review (time, session) and
+    with the content, so a view that showed an earlier review cannot approve
+    a later one. None when the ticket carries no complete review stamp."""
+    if not is_review_subject(ticket) or ticket["review_digest"] is None or ticket["reviewed_at"] is None:
+        return None
+    raw = f"{ticket['id']}|{ticket['review_digest']}|{ticket['reviewed_at']}|{ticket['reviewed_session_id']}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def review_stamp(conn: sqlite3.Connection, account_id: int, now: datetime | None = None) -> dict:
+    """The review time and session to write for a review happening now."""
+    from backend import live_arming
+    return {"reviewed_at": _to_utc_sql(now or now_ist()),
+            "reviewed_session_id": live_arming.active_session_id(conn, account_id)}
+
+
+def _parse_utc_sql(text) -> datetime | None:
+    try:
+        return datetime.strptime(str(text), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class ReviewProblem:
+    code: str
+    reason: str
+    permanent: bool = False
+
+
+def evidence_problem(ticket) -> ReviewProblem | None:
+    """The stored content no longer matches the content that was reviewed."""
+    if ticket["review_digest"] is not None and ticket["review_digest"] != ticket_review_digest(ticket):
+        return ReviewProblem(TICKET_EVIDENCE_MISMATCH,
+                             "the ticket's stored order details no longer match the details that were reviewed "
+                             "(changed outside the app's edit path)", permanent=True)
+    return None
+
+
+def review_problem(conn: sqlite3.Connection, account_id: int, ticket, now: datetime,
+                   session_id: int | None = None, session_known: bool = False) -> ReviewProblem | None:
+    """Why this subject's review is not current right now, or None. Shared
+    by the confirmation gate and the ticket payload, so the UI shows exactly
+    what the gate will decide. May raise (the gate fails closed on that).
+    session_id/session_known let a list pass one active-session lookup."""
+    evidence = evidence_problem(ticket)
+    if evidence is not None:
+        return evidence
+    if ticket["review_digest"] is None:
+        return ReviewProblem(TICKET_REVIEW_REQUIRED, "this ticket has no review record (created before reviews "
+                                                     "were recorded)")
+    reviewed = _parse_utc_sql(ticket["reviewed_at"])
+    if reviewed is None:
+        return ReviewProblem(TICKET_REVIEW_REQUIRED, f"its review time {ticket['reviewed_at']!r} cannot be read")
+    now_utc = market.as_ist(now).astimezone(timezone.utc)
+    if reviewed > now_utc + REVIEW_FUTURE_TOLERANCE:
+        return ReviewProblem(TICKET_REVIEW_REQUIRED, f"its review time {ticket['reviewed_at']} UTC is in the future")
+    if not session_known:
+        from backend import live_arming
+        session_id = live_arming.active_session_id(conn, account_id)
+    if session_id is None:
+        return ReviewProblem(TICKET_REVIEW_REQUIRED, "there is no active Kite session")
+    if ticket["reviewed_session_id"] != session_id:
+        return ReviewProblem(TICKET_REVIEW_REQUIRED, "it was reviewed under an earlier Kite login")
+    then, current = review_window(reviewed), review_window(now)
+    if then != current:
+        return ReviewProblem(TICKET_REVIEW_REQUIRED,
+                             f"it was reviewed during {_describe_window(then)}; it is now {_describe_window(current)}")
+    return None
+
+
+def review_status(conn: sqlite3.Connection, account_id: int, ticket, now: datetime | None = None,
+                  session_id: int | None = None, session_known: bool = False) -> dict:
+    """The ticket payload's `review` object. Display only — the gate decides
+    again at confirmation."""
+    if not is_review_subject(ticket):
+        return {"subject": False, "current": None, "code": None, "reason": None, "reviewed_at": None, "token": None}
+    try:
+        problem = review_problem(conn, account_id, ticket, now or now_ist(), session_id, session_known)
+    except Exception as e:
+        logger.exception("Could not evaluate the review of ticket %s", ticket["id"])
+        problem = ReviewProblem(ACCOUNT_SAFETY_UNAVAILABLE, f"the review could not be evaluated ({type(e).__name__})")
+    return {
+        "subject": True,
+        "current": problem is None,
+        "code": problem.code if problem else None,
+        "reason": problem.reason if problem else None,
+        "reviewed_at": ticket["reviewed_at"],
+        "token": review_token(ticket),
+    }
+
+
+def check_ticket_review(conn: sqlite3.Connection, account_id: int, ticket, now: datetime,
+                        expected_token: str | None = None, check_token: bool = True) -> list[SafetyFailure]:
+    """P1-D gate for a manual / Quick-Action BUY entry (both modes). Local,
+    no broker call. A review that is no longer current is refused
+    (TICKET_REVIEW_REQUIRED, the ticket stays approvable after a Re-review);
+    tampered content rejects it for good (TICKET_EVIDENCE_MISMATCH); a view
+    that showed a different review is refused (TICKET_REVIEW_CHANGED,
+    nothing changes). check_token=False at the final gate: the claimed row
+    cannot change after the claim. Fails closed (503) if it cannot be
+    evaluated."""
+    if not is_review_subject(ticket):
+        return []
+    try:
+        problem = review_problem(conn, account_id, ticket, now)
+    except Exception as e:
+        return [SafetyFailure(ACCOUNT_SAFETY_UNAVAILABLE,
+                              f"Ticket {ticket['id']}: its review could not be evaluated ({type(e).__name__}: {e}) "
+                              f"— no new entry is sent.", http_status=503)]
+    if problem is not None and problem.code == TICKET_EVIDENCE_MISMATCH:
+        return [SafetyFailure(TICKET_EVIDENCE_MISMATCH,
+                              f"Ticket {ticket['id']}: {problem.reason}. Nothing was executed; the ticket is "
+                              f"rejected — create a new ticket.", permanent=True)]
+    if problem is not None:
+        return [SafetyFailure(TICKET_REVIEW_REQUIRED,
+                              f"Ticket {ticket['id']} must be re-reviewed before approval: {problem.reason}. Its "
+                              f"levels were set for a market that has moved on — use Re-review to re-check it "
+                              f"against the current portfolio, then approve. Nothing was executed.")]
+    if check_token and (expected_token is None or expected_token != review_token(ticket)):
+        return [SafetyFailure(TICKET_REVIEW_CHANGED,
+                              f"Ticket {ticket['id']} changed or was re-reviewed since this view showed it"
+                              + ("" if expected_token else " (the approval did not say which review it showed)")
+                              + ". Refresh and review it again before approving. Nothing was executed.")]
+    return []
 
 
 def decide_variety(now: datetime, allow_amo: bool) -> tuple[str | None, SafetyFailure | None]:
@@ -595,9 +840,11 @@ def check_price_sanity(ticket: sqlite3.Row, ltp: float, settings: sqlite3.Row) -
 # --------------------------------------------------------------------------
 
 def precheck(conn: sqlite3.Connection, account_id: int, ticket: sqlite3.Row, mode: str, allow_amo: bool,
-             now: datetime | None = None) -> SafetyDecision:
+             now: datetime | None = None, expected_review_token: str | None = None) -> SafetyDecision:
     """Before the atomic claim. DB and request only — never a broker call.
-    Returns every failure it finds, in the documented order."""
+    Returns every failure it finds, in the documented order. One `now` is
+    used throughout, so the review window and the order variety are judged
+    at the same instant."""
     now = now or now_ist()
     state = get_state(conn, account_id)
     settings = risk_engine.get_settings(conn, account_id)
@@ -613,6 +860,8 @@ def precheck(conn: sqlite3.Connection, account_id: int, ticket: sqlite3.Row, mod
         decision.add(check_daily_entry_limit(conn, account_id, settings, ticket["id"], now))
         decision.add(check_notional(ticket, settings))
     decision.add(check_stale_signal(ticket, now))
+    for failure in check_ticket_review(conn, account_id, ticket, now, expected_review_token):
+        decision.add(failure)
     if live:
         decision.add(check_breaker(state))
     # PK-20: a dry-run entry is a paper ORDER, subject to the same session
@@ -631,11 +880,18 @@ def final_gate(conn: sqlite3.Connection, account_id: int, ticket: sqlite3.Row, k
     """After the claim and risk revalidation, immediately before the broker
     call. Re-checks what may have changed meanwhile, then — only if nothing
     failed — makes the single LTP call for the price checks. An LTP that
-    cannot be obtained fails closed."""
+    cannot be obtained fails closed.
+
+    `ticket` is the row re-read after the claim. P1-D's review is re-checked
+    on it in both modes — the window, the Kite session and the evidence can
+    change during revalidation; the content cannot (a claimed ticket is not
+    editable), so the approver's token is not compared again."""
     now = now or now_ist()
     state = get_state(conn, account_id)
     decision = SafetyDecision()
     decision.add(check_trading_lock(state))
+    for failure in check_ticket_review(conn, account_id, ticket, now, check_token=False):
+        decision.add(failure)
     if ticket["mode"] != "live":
         return decision
     settings = risk_engine.get_settings(conn, account_id)

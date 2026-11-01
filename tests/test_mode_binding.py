@@ -29,7 +29,11 @@ def _entry(env) -> int:
 def _confirm(client, ticket_id, expected_mode="__omit__"):
     if expected_mode == "__omit__":
         return client.post(f"/api/tickets/{ticket_id}/confirm")
-    return client.post(f"/api/tickets/{ticket_id}/confirm", json={"expected_mode": expected_mode})
+    # P1-D: the view also echoes the review token it showed — read, like the
+    # UI does, from the ticket payload. These tests are about the mode only.
+    token = client.get(f"/api/tickets/{ticket_id}").json()["data"]["review"]["token"]
+    return client.post(f"/api/tickets/{ticket_id}/confirm",
+                       json={"expected_mode": expected_mode, "expected_review_token": token})
 
 
 def _mode_broadcasts(env):

@@ -12,7 +12,7 @@ import json
 import pytest
 import requests
 
-from conftest import account_id, displayed_mode, set_mode, ticket_row
+from conftest import approval_body, account_id, displayed_mode, set_mode, ticket_row
 from test_baseline_api import _insert_ticket, _manual_ticket
 from test_live_safety import _closed_trades_for, _monitor, _rows, market_open  # noqa: F401 — market_open: fixture
 from test_partial_fills import (
@@ -93,7 +93,7 @@ def test_4_unknown_entry_is_submission_unknown_never_generic(env, market_open):
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
     env.kite.raise_on_next("place_order", requests.ReadTimeout("Read timed out."))
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
     assert r.json()["data"]["submission_state"] == "unknown"
 
     data = _ticket(env, t["id"])

@@ -9,7 +9,7 @@ from datetime import date, timedelta
 import pytest
 from kiteconnect.exceptions import InputException, OrderException
 
-from conftest import displayed_mode, account_id, add_watch, last_weekday, make_candles, seed_ohlc, set_mode, ticket_row
+from conftest import approval_body, displayed_mode, account_id, add_watch, last_weekday, make_candles, seed_ohlc, set_mode, ticket_row
 
 
 def _manual_ticket(**overrides):
@@ -38,10 +38,33 @@ def _insert_ticket(db, **fields) -> int:
     try:
         cur = conn.execute(f"INSERT INTO trade_tickets ({cols}) VALUES ({', '.join('?' * len(base))})",
                            tuple(base.values()))
+        if not any(name in fields for name in _REVIEW_FIELDS):
+            _stamp_current_review(conn, cur.lastrowid)
         conn.commit()
         return cur.lastrowid
     finally:
         conn.close()
+
+
+# SEC-1 P1-D: a row seeded straight into the database is, by default, a
+# ticket the user has just reviewed — exactly what POST /api/tickets stamps
+# (now, the active Kite session, the digest of the stored row), the same way
+# conftest seeds a healthy live state. Only manual / Quick-Action BUY entries
+# that can still be approved are stamped. Tests of the review gate itself
+# pass any review field explicitly (e.g. reviewed_at=None) to opt out.
+_REVIEW_FIELDS = ("reviewed_at", "reviewed_session_id", "review_digest")
+_REVIEWABLE_STATUSES = ("draft", "pending_confirmation", "rejected", "risk_rejected")
+
+
+def _stamp_current_review(conn, ticket_id: int) -> None:
+    from backend import account_safety
+    row = conn.execute("SELECT * FROM trade_tickets WHERE id = ?", (ticket_id,)).fetchone()
+    if row["status"] not in _REVIEWABLE_STATUSES or not account_safety.is_review_subject(row):
+        return
+    columns = account_safety.review_stamp(conn, row["account_id"])
+    columns["review_digest"] = account_safety.ticket_review_digest(row)
+    conn.execute("UPDATE trade_tickets SET reviewed_at = ?, reviewed_session_id = ?, review_digest = ? WHERE id = ?",
+                 (columns["reviewed_at"], columns["reviewed_session_id"], columns["review_digest"], ticket_id))
 
 
 # ---------------------------------------------------------------- session / portfolio
@@ -158,7 +181,7 @@ def test_edit_only_allowed_for_draft(env):
 def test_confirm_dry_run_places_nothing(env, market_open):
     set_mode(env.db, "dry_run")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id'])).json()["data"]
     assert r["status"] == "executed" and r["mode"] == "dry_run"
     assert env.kite.calls_to("place_order") == [] and env.kite.calls_to("place_gtt") == []
 
@@ -166,7 +189,7 @@ def test_confirm_dry_run_places_nothing(env, market_open):
 def test_confirm_live_places_order_and_oco_gtt(env, market_open):
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id'])).json()["data"]
     assert r["status"] == "executed" and r["kite_order_id"] and r["kite_gtt_id"]
     order = env.kite.calls_to("place_order")[0]
     assert order["transaction_type"] == "BUY" and order["quantity"] == 5 and order["order_type"] == "LIMIT"
@@ -180,7 +203,7 @@ def test_confirm_live_trailing_uses_single_gtt(env, market_open):
     set_mode(env.db, "live")
     body = _manual_ticket(trailing_enabled=True, trailing_trigger="after_target_1", trailing_distance=50.0)
     t = env.client.post("/api/tickets", json=body).json()["data"]
-    env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
     gtt = env.kite.calls_to("place_gtt")[0]
     assert gtt["trigger_type"] == "single" and gtt["trigger_values"] == [2900.0]
 
@@ -189,7 +212,7 @@ def test_confirm_live_order_rejected(env, market_open):
     set_mode(env.db, "live")
     env.kite.fail_next["place_order"] = OrderException("Insufficient funds")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id'])).json()["data"]
     assert r["status"] == "failed" and r["success"] is False
     assert "Insufficient funds" in r["execution_message"]
 
@@ -198,7 +221,7 @@ def test_confirm_live_protection_failed(env, market_open):
     set_mode(env.db, "live")
     env.kite.fail_next["place_gtt"] = InputException("bad trigger")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id'])).json()["data"]
     assert r["status"] == "executed" and r["kite_gtt_id"] is None
     assert "UNPROTECTED" in r["execution_message"]
 
@@ -273,7 +296,7 @@ def test_execution_mode_switch(env):
 def test_order_and_gtt_books_and_cancel(env, market_open):
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    done = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    done = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id'])).json()["data"]
     orders = env.client.get("/api/orders").json()["data"]
     assert orders[0]["linked_ticket_id"] == t["id"]
     gtts = env.client.get("/api/gtts").json()["data"]

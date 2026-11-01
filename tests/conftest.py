@@ -300,6 +300,26 @@ def displayed_mode(db) -> dict:
         conn.close()
 
 
+def approval_body(db, ticket_id: int, **extra) -> dict:
+    """The confirm body a freshly loaded view sends (PK-11 + SEC-1 P1-D): the
+    execution mode it shows and, for a manual / Quick-Action BUY entry, the
+    review token it shows (account_safety.review_token of the stored row).
+    Strategy entries and exits carry no token. Tests of a STALE view pass
+    their own expected_mode / expected_review_token in `extra`."""
+    from backend import account_safety
+    body = displayed_mode(db)
+    conn = db.get_connection()
+    try:
+        row = conn.execute("SELECT * FROM trade_tickets WHERE id = ?", (ticket_id,)).fetchone()
+    finally:
+        conn.close()
+    token = account_safety.review_token(row) if row is not None else None
+    if token is not None:
+        body["expected_review_token"] = token
+    body.update(extra)
+    return body
+
+
 def ticket_row(db, ticket_id: int) -> dict:
     conn = db.get_connection()
     try:
@@ -308,7 +328,8 @@ def ticket_row(db, ticket_id: int) -> dict:
         conn.close()
 
 
-__all__ = ["FakeKite", "make_candles", "seed_ohlc", "add_watch", "account_id", "set_mode", "displayed_mode", "ticket_row",
+__all__ = ["FakeKite", "make_candles", "seed_ohlc", "add_watch", "account_id", "set_mode", "displayed_mode",
+           "approval_body", "ticket_row",
            "as_pre_pk22_database", "seed_live_prerequisites", "clear_live_prerequisites", "TEST_STATIC_IP",
            "seed_healthy_live_state", "clear_healthy_live_state", "make_live_ready",
            "last_weekday", "IST", "TERMINAL_ORIGIN", "TERMINAL_HEADERS", "terminal_client"]

@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from conftest import account_id, clear_healthy_live_state, displayed_mode, set_mode, ticket_row
+from conftest import approval_body, account_id, clear_healthy_live_state, displayed_mode, set_mode, ticket_row
 from test_baseline_api import _insert_ticket, _manual_ticket
 from test_emergency_exit_isolation import _by_symbol, _emergency_exit, _positions, _sold
 from test_live_safety import _live_position, _pending_exit, _rows, _sells, market_open  # noqa: F401 (fixture)
@@ -55,7 +55,7 @@ def _pending_entry(env) -> int:
 
 def _confirm(env, tid):
     before = len(env.kite.calls)
-    r = env.client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid))
     return r, [name for name, _ in env.kite.calls[before:]]
 
 
@@ -322,7 +322,7 @@ def test_alert_action_sell_confirms_in_every_degraded_state(env, market_open, mo
     assert r.status_code == 201, r.text
     tid = r.json()["data"]["id"]
     _degrade_everything(env, monkeypatch)
-    r = env.client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid))
     assert r.status_code == 200, r.text
     assert [s["tradingsymbol"] for s in _sells(env)] == ["RELIANCE"]
 

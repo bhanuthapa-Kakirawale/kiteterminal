@@ -1889,6 +1889,30 @@ def _m006_sec1_live_safety(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE execution_settings ADD COLUMN live_armed_session_id INTEGER")
 
 
+# SEC-1 P1-D: the human review a risk-adding manual / Quick-Action BUY entry
+# rests on (backend/account_safety.py, check_ticket_review).
+#   reviewed_at          UTC text of the last review (creation, edit or an
+#                        explicit Re-review), on the account-safety clock;
+#   reviewed_session_id  the sessions.id (Kite login) it happened under;
+#   review_digest        sha256 of the ticket's economic fields at its
+#                        creation or edit: a later out-of-band change is
+#                        tamper evidence, never re-stamped by a Re-review.
+# Plain ALTER TABLEs, each guarded (re-running the migration over a schema
+# that already has the column must not fail). Existing rows stay NULL, which
+# means "not reviewed": an old pending manual ticket needs a Re-review.
+_P1D_REVIEW_COLUMNS = (
+    ("reviewed_at", "TEXT"),
+    ("reviewed_session_id", "INTEGER"),
+    ("review_digest", "TEXT"),
+)
+
+
+def _m007_p1d_ticket_review(conn: sqlite3.Connection) -> None:
+    for name, sql_type in _P1D_REVIEW_COLUMNS:
+        if not _column_exists(conn, "trade_tickets", name):
+            conn.execute(f"ALTER TABLE trade_tickets ADD COLUMN {name} {sql_type}")
+
+
 # (version, name, function) — append only; never renumber or rename a
 # released migration: the name is checked against every database's history.
 MIGRATIONS: list[tuple[int, str, object]] = [
@@ -1898,6 +1922,7 @@ MIGRATIONS: list[tuple[int, str, object]] = [
     (4, "pk22_ohlc_history_integrity", _m004_ohlc_history_integrity),
     (5, "live0_live_readiness", _m005_live_readiness),
     (6, "sec1_live_safety", _m006_sec1_live_safety),
+    (7, "p1d_ticket_review", _m007_p1d_ticket_review),
 ]
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
 

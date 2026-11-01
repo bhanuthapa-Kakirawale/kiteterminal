@@ -15,6 +15,7 @@ import pytest
 from kiteconnect.exceptions import TokenException
 
 from conftest import (
+    approval_body,
     IST, TEST_STATIC_IP, account_id, add_watch, clear_live_prerequisites, displayed_mode, make_candles, seed_ohlc,
     set_mode, ticket_row,
 )
@@ -122,7 +123,7 @@ def _live_entry(env, **overrides) -> int:
 
 
 def _confirm(env, tid, **body):
-    return env.client.post(f"/api/tickets/{tid}/confirm", json={**displayed_mode(env.db), **body})
+    return env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid, **body))
 
 
 def _broker_mutations(env):
@@ -840,23 +841,23 @@ def test_the_tick_socket_still_delivers_events_before_ticks(env, monkeypatch):
 
 def test_migration_v5_creates_the_live_readiness_table_idempotently(env):
     from backend import db
-    assert db.LATEST_SCHEMA_VERSION == 6   # SEC-1 added v6
+    assert db.LATEST_SCHEMA_VERSION == 7   # SEC-1 added v6, P1-D v7
     names = {r["name"] for r in _rows(env, "SELECT name FROM sqlite_master WHERE type='table'")}
     assert "live_readiness" in names
     env.db.init_db()
     env.db.init_db()
-    assert env.db.last_init == {"applied_migrations": [], "startup_row_changes": 0, "schema_version": 6}
+    assert env.db.last_init == {"applied_migrations": [], "startup_row_changes": 0, "schema_version": 7}
 
 
 def test_maintenance_migrate_applies_the_pending_migration(env, capsys):
     from backend import db_maintenance
     _exec(env, "DROP TABLE live_readiness")
-    _exec(env, "DELETE FROM schema_version WHERE version >= 5")   # v5, and SEC-1's v6 on top of it
+    _exec(env, "DELETE FROM schema_version WHERE version >= 5")   # v5, and SEC-1's v6 + P1-D's v7 on top
     assert db_maintenance.main(["migrate", "--db", str(env.db.DB_PATH)]) == 0
     out = capsys.readouterr().out
-    assert "v4 -> v6" in out and "applied migrations:  [5, 6]" in out
+    assert "v4 -> v7" in out and "applied migrations:  [5, 6, 7]" in out
     assert "live_readiness" in {r["name"] for r in _rows(env, "SELECT name FROM sqlite_master")}
-    assert list(env.tmp_path.glob("test.db.pre_schema_v6_bak*"))            # the verified automatic backup
+    assert list(env.tmp_path.glob("test.db.pre_schema_v7_bak*"))            # the verified automatic backup
     assert db_maintenance.main(["migrate", "--db", str(env.db.DB_PATH)]) == 0
     assert "applied migrations:  none" in capsys.readouterr().out
 
@@ -865,7 +866,7 @@ def test_maintenance_migrate_refuses_without_the_encryption_key(env, monkeypatch
     from backend import crypto, db_maintenance
     monkeypatch.delenv("KITE_TERMINAL_ENCRYPTION_KEY")
     monkeypatch.setattr(crypto, "ENV_PATH", env.tmp_path / "missing.env")
-    _exec(env, "DELETE FROM schema_version WHERE version = 6")
+    _exec(env, f"DELETE FROM schema_version WHERE version = {env.db.LATEST_SCHEMA_VERSION}")
     before = _db_digest(env)
     assert db_maintenance.main(["migrate", "--db", str(env.db.DB_PATH)]) == 2
     assert "refusing to migrate" in capsys.readouterr().err

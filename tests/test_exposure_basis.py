@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from kiteconnect.exceptions import NetworkException
 
-from conftest import account_id, displayed_mode, set_mode, ticket_row
+from conftest import approval_body, account_id, displayed_mode, set_mode, ticket_row
 from test_baseline_api import _insert_ticket
 from test_emergency_exit_isolation import _emergency_exit, _position
 from test_live_safety import _set_risk, _unknown_ticket, market_open, unsafe_client  # noqa: F401 — fixtures
@@ -305,7 +305,7 @@ def test_positions_failure_at_confirmation_sends_nothing(env, unsafe_client, mar
     t = _ticket(env, "TCS", 5)
     set_mode(env.db, "live")
     env.kite.raise_on_next("positions", NetworkException("Gateway timed out"))
-    r = unsafe_client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    r = unsafe_client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
     assert r.status_code == 503 and r.json()["detail"]["error_code"] == "RISK_REVALIDATION_UNAVAILABLE"
     assert env.kite.calls_to("place_order") == []
     assert ticket_row(env.db, t["id"])["status"] == "rejected"

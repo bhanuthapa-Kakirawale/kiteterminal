@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 from kiteconnect.exceptions import InputException
 
-from conftest import account_id, as_pre_pk22_database, displayed_mode, set_mode, ticket_row
+from conftest import approval_body, account_id, as_pre_pk22_database, displayed_mode, set_mode, ticket_row
 from test_baseline_api import _insert_ticket, _manual_ticket
 from test_live_safety import (  # noqa: F401 — market_open is a fixture
     _closed_trades_for, _monitor, _precondition, _protective_oco_gtt, _rows, _sells, _urgent_updates, market_open,
@@ -103,7 +103,7 @@ def _place_entry(env, quantity=100, trailing=False) -> tuple[int, str, int]:
         body.update(trailing_enabled=True, trailing_trigger="after_target_1", trailing_distance=5.0)
     t = env.client.post("/api/tickets", json=body).json()["data"]
     _precondition(t["status"] == "pending_confirmation", f"ticket not approvable: {t['status']} {t}")
-    done = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    done = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id'])).json()["data"]
     _precondition(done["status"] == "executed" and done["kite_gtt_id"], f"entry not placed: {done}")
     _precondition(_legs(env, done["kite_gtt_id"]) == {quantity}, "GTT should be placed for the order")
     return t["id"], done["kite_order_id"], done["kite_gtt_id"]
@@ -473,7 +473,7 @@ def test_dry_run_entry_fills_only_through_the_paper_broker(env, market_open):
     # price, and only then is the position its filled quantity.
     set_mode(env.db, "dry_run")
     t = env.client.post("/api/tickets", json=_manual_ticket(entry_order_type="MARKET")).json()["data"]
-    done = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    done = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id'])).json()["data"]
     assert (done["status"], done["filled_quantity"], done["entry_fill_status"]) == ("executed", 0, "pending")
 
     from backend import order_monitor

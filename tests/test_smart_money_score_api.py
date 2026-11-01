@@ -17,7 +17,7 @@ from backend import ohlc_integrity, signal_chart, smart_money_score as sms, volu
 from backend.backtest import BacktestConfig, SymbolFrame, simulate
 from backend.strategies import STRATEGIES
 
-from conftest import displayed_mode, last_weekday, make_candles, seed_ohlc
+from conftest import approval_body, displayed_mode, last_weekday, make_candles, seed_ohlc
 from test_backtest_realism import GOLDEN_SIGNALS, _golden_series
 from test_signal_detail import TCS_TOKEN, _breakout_candles, _scan_one
 from test_volume_intelligence_api import BSE_TCS_TOKEN, _db_digest, _set_status, _spiked_candles
@@ -341,7 +341,7 @@ def test_30_scan_ranking_risk_and_approval_never_call_the_score(env, monkeypatch
     assert "smart_money" not in json.dumps(evaluation) and "smart_money" not in json.dumps(ticket)
     env.client.get(f"/api/tickets/{ticket['id']}")
     env.client.get("/api/tickets")
-    env.client.post(f"/api/tickets/{ticket['id']}/confirm", json=displayed_mode(env.db))
+    env.client.post(f"/api/tickets/{ticket['id']}/confirm", json=approval_body(env.db, ticket['id']))
     assert calls == []                                   # listing and approval
     env.client.get(f"/api/tickets/{ticket['id']}/chart")
     assert calls == [ticket["signal_date"]]              # only the evidence panel scores (tripwire works)

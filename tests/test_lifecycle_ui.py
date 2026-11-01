@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import set_mode
+from conftest import approval_body, set_mode
 from test_baseline_api import _insert_ticket
 from test_live_safety import _monitor, market_open  # noqa: F401 — market_open: fixture
 from test_partial_fills import _fill, _held_position, _place_entry, _place_exit, _reconcile
@@ -108,7 +108,7 @@ def test_unknown_warning_says_do_not_resubmit(env, market_open):
     from conftest import displayed_mode
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
     env.kite.raise_on_next("place_order", requests.ReadTimeout("Read timed out."))
-    env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
     p = _position(env, t["id"])
     badge, buttons, row = _render(["lifecycleBadge", p], ["actionButtons", p], ["activeRowCells", p, None])
     assert "DO NOT RESUBMIT" in badge and "lc-sev-critical" in badge and "⛔" in badge

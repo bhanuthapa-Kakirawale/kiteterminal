@@ -68,6 +68,11 @@ class TicketConfirmRequest(BaseModel):
     # Order when the market is closed. Absent/false outside market hours is
     # refused (AMO_CONFIRMATION_REQUIRED); never inferred from the clock.
     allow_amo: bool = False
+    # SEC-1 P1-D: the review token (the ticket payload's review.token) the
+    # approver's view showed. Required for a manual / Quick-Action BUY entry
+    # (TICKET_REVIEW_CHANGED when missing or different); strategy entries and
+    # exits ignore it.
+    expected_review_token: str | None = Field(default=None, max_length=64)
 
 
 class TradingLockRequest(BaseModel):

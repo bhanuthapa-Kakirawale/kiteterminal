@@ -145,8 +145,10 @@ def test_query_count_does_not_grow_with_positions(env, monkeypatch, path):
         _held_position(env, 5, closed_at="2026-09-10 05:00:00", kite_gtt_id=None)
     many = _count_selects(env, monkeypatch, path)
     assert many == one, (one, many)
-    # PK-19's four, plus PK-20's one batched read of the paper order book.
-    assert one <= 5
+    # PK-19's four, plus PK-20's one batched read of the paper order book,
+    # plus (ticket list only) P1-D's one active-session read for every row's
+    # review state — constant, never per row (asserted just above).
+    assert one <= (6 if path == "/api/tickets" else 5)
 
 
 def test_reconciliation_issues_are_attached_structurally(env):

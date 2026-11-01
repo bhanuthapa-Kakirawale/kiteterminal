@@ -8,7 +8,7 @@ from kiteconnect import KiteConnect
 from kiteconnect.exceptions import KiteException
 
 from backend import (
-    account_safety, execution, instruments, kite_chart, lifecycle, paper_broker, position_quantity,
+    account_safety, execution, instruments, kite_chart, lifecycle, live_arming, paper_broker, position_quantity,
     reconciliation,
     risk_engine,
     signal_chart,
@@ -116,13 +116,34 @@ def _serialize(ticket: sqlite3.Row) -> dict:
     return data
 
 
-def _with_lifecycle(conn: sqlite3.Connection, ticket: sqlite3.Row, ctx: lifecycle.Context | None = None) -> dict:
-    """A ticket payload with its PK-13 quantities and PK-19 position
-    lifecycle, from one lifecycle context (built here when not given)."""
+def _review_payload(conn: sqlite3.Connection, ticket: sqlite3.Row, session: tuple | None = None) -> dict:
+    """P1-D: the ticket's review state (account_safety.review_status) — what
+    the approval views show and the token an approval echoes. `session` is a
+    one-element tuple holding the active sessions.id when the caller already
+    looked it up (one lookup for a whole list)."""
+    if session is None:
+        return account_safety.review_status(conn, ticket["account_id"], ticket)
+    return account_safety.review_status(conn, ticket["account_id"], ticket, session_id=session[0], session_known=True)
+
+
+def _serialize_reviewed(conn: sqlite3.Connection, ticket: sqlite3.Row) -> dict:
+    """_serialize plus the review state, for every response a view can open
+    the approval dialog from (create, Quick-Action buy, edit, re-review)."""
+    data = _serialize(ticket)
+    data["review"] = _review_payload(conn, ticket)
+    return data
+
+
+def _with_lifecycle(conn: sqlite3.Connection, ticket: sqlite3.Row, ctx: lifecycle.Context | None = None,
+                    session: tuple | None = None) -> dict:
+    """A ticket payload with its PK-13 quantities, PK-19 position lifecycle
+    (from one lifecycle context, built here when not given) and P1-D review
+    state."""
     ctx = ctx or lifecycle.build_context(conn, ticket["account_id"])
     data = _serialize(ticket)
     data.update(_quantity_fields(ticket, ctx))
     data["lifecycle"] = lifecycle.for_ticket(ticket, ctx)
+    data["review"] = _review_payload(conn, ticket, session)
     return data
 
 
@@ -228,6 +249,9 @@ def _create_ticket_internal(
             ),
         )
         ticket_id = cursor.lastrowid
+        # P1-D: creating the ticket is its first review — stamped from the
+        # stored row, in the same transaction as the insert.
+        _stamp_review(conn, ticket_id, account["id"], with_digest=True)
         _log_event(conn, ticket_id, "created", f"Ticket created (source={source})")
         conn.commit()
 
@@ -235,9 +259,27 @@ def _create_ticket_internal(
         _notify("created", ticket_id=ticket_id)
 
         ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
-        return _serialize(ticket)
+        return _serialize_reviewed(conn, ticket)
     finally:
         conn.close()
+
+
+def _stamp_review(conn: sqlite3.Connection, ticket_id: int, account_id: int, with_digest: bool) -> None:
+    """P1-D: records a review of a manual / Quick-Action BUY entry happening
+    now — the account-safety clock and the active Kite session — and, at
+    creation or edit only, the digest of the content as STORED (re-read on
+    this connection, so bools/ints and the cached instrument token hash
+    exactly as confirmation will read them). Caller commits. Never used for
+    strategy entries or exits."""
+    row = _get_ticket_or_404(conn, ticket_id, account_id)
+    if not account_safety.is_review_subject(row):
+        return
+    columns = account_safety.review_stamp(conn, account_id)
+    if with_digest:
+        columns["review_digest"] = account_safety.ticket_review_digest(row)
+    assignments = ", ".join(f"{name} = ?" for name in columns)
+    conn.execute(f"UPDATE trade_tickets SET {assignments} WHERE id = ? AND account_id = ?",
+                 (*columns.values(), ticket_id, account_id))
 
 
 @router.post("/api/tickets", status_code=201)
@@ -353,7 +395,7 @@ def create_alert_action_sell(req: AlertActionSellRequest, kite: KiteConnect = De
         _notify("created", ticket_id=ticket_id)
 
         ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
-        return {"data": _serialize(ticket)}
+        return {"data": _serialize_reviewed(conn, ticket)}
     finally:
         conn.close()
 
@@ -400,9 +442,11 @@ def list_tickets(
         # quantity query).
         ctx = lifecycle.build_context(conn, account["id"])
         in_flight = _exits_in_flight(ctx)
+        # P1-D: one active-session lookup for every row's review state.
+        session = (live_arming.active_session_id(conn, account["id"]),)
         data = []
         for r in rows:
-            item = _with_lifecycle(conn, r, ctx)
+            item = _with_lifecycle(conn, r, ctx, session)
             item["exit_in_flight_ticket_id"] = in_flight.get(r["id"])
             data.append(item)
         return {"data": data}
@@ -510,7 +554,7 @@ def reject_ticket(ticket_id: int, req: TicketRejectRequest, kite: KiteConnect = 
         conn.commit()
         _notify("rejected", ticket_id=ticket_id)
         ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
-        return {"data": _serialize(ticket)}
+        return {"data": _serialize_reviewed(conn, ticket)}
     finally:
         conn.close()
 
@@ -543,7 +587,100 @@ def revert_rejection(ticket_id: int, kite: KiteConnect = Depends(require_trading
         _notify("reverted", ticket_id=ticket_id)
 
         ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
-        return {"data": _serialize(ticket)}
+        return {"data": _serialize_reviewed(conn, ticket)}
+    finally:
+        conn.close()
+
+
+@router.post("/api/tickets/{ticket_id}/re-review")
+def re_review_ticket(ticket_id: int, kite: KiteConnect = Depends(require_trading_account)):
+    """SEC-1 P1-D: the explicit human re-review of a manual / Quick-Action
+    BUY entry whose review is no longer current (an NSE open/close or a new
+    Kite login since). Re-runs every risk check against the broker's
+    portfolio as it is now, then records the review — this time, this Kite
+    session — on the ticket, which stays 'pending_confirmation' (or becomes
+    'risk_rejected' if a check now fails). Nothing is sent to the broker.
+
+    The content is never re-stamped: the stored review digest is kept, and
+    a ticket whose content no longer matches it is rejected instead
+    (TICKET_EVIDENCE_MISMATCH) — a re-review must not bless tampered
+    content. Only a row created before reviews were recorded gets its
+    first digest here, from the content the user is re-reviewing. If the
+    checks cannot run, nothing changes (503). Allowed while trading is
+    locked: preparing a ticket under the lock is the documented flow."""
+    account = get_trading_account()
+    conn = get_connection()
+    try:
+        ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
+        if not account_safety.is_review_subject(ticket):
+            raise HTTPException(409, {
+                "error_code": account_safety.TICKET_REVIEW_NOT_APPLICABLE,
+                "message": f"Ticket {ticket_id} is not a manual or Quick Action buy entry: strategy signals are "
+                           f"judged by their candle and exits are never held back for review.",
+            })
+        if ticket["status"] not in _CONFIRMABLE_STATUSES:
+            _raise_invalid_state(conn, ticket_id, account["id"], "re-review")
+        evidence = account_safety.evidence_problem(ticket)
+        if evidence is not None:
+            if _transition(conn, ticket_id, account["id"], _CONFIRMABLE_STATUSES, "rejected"):
+                _log_event(conn, ticket_id, "rejected",
+                           f"Refused at re-review ({evidence.code}): {evidence.reason}. No order was sent.")
+                conn.commit()
+                _notify("rejected", ticket_id=ticket_id)
+            else:
+                conn.rollback()
+                _raise_invalid_state(conn, ticket_id, account["id"], "re-review")
+            raise HTTPException(409, {
+                "error_code": evidence.code,
+                "message": f"Ticket {ticket_id}: {evidence.reason}. It cannot be re-reviewed and has been "
+                           f"rejected — create a new ticket.",
+            })
+
+        try:
+            ctx = risk_engine.build_portfolio_context(kite)
+            report = risk_engine.run_checks(conn, account, ticket, kite, ctx=ctx)
+        except Exception as e:
+            # The checks were never evaluated: nothing is recorded, the
+            # ticket keeps its (not current) review.
+            conn.rollback()
+            reason = e.message if isinstance(e, risk_engine.RiskCheckUnavailableError) else f"{type(e).__name__}: {e}"
+            raise HTTPException(503, {
+                "error_code": "RISK_REVALIDATION_UNAVAILABLE",
+                "message": f"Risk could not be re-checked ({reason}); the ticket was not re-reviewed and is "
+                           f"unchanged. Try again once the broker is reachable.",
+            })
+
+        results = json.dumps(report.as_list())
+        # Compare-and-set on the state read above: a confirmation, reject or
+        # another re-review that got there first is never overwritten.
+        unchanged = ("review_digest IS ?", (ticket["review_digest"],))
+        if report.passed:
+            columns = account_safety.review_stamp(conn, account["id"])
+            if ticket["review_digest"] is None:
+                columns["review_digest"] = account_safety.ticket_review_digest(ticket)
+            if not _transition(conn, ticket_id, account["id"], _CONFIRMABLE_STATUSES, "pending_confirmation",
+                               extra_condition=unchanged, risk_check_results=results, **columns):
+                conn.rollback()
+                _raise_invalid_state(conn, ticket_id, account["id"], "re-review")
+            window = account_safety.review_window(account_safety.now_ist())
+            _log_event(conn, ticket_id, "modified",
+                       f"Re-reviewed by the user under Kite session #{columns['reviewed_session_id']} "
+                       f"({window[0].lower()} window, {window[1]}); risk checks re-run against the current "
+                       f"portfolio: all {len(report.checks)} passed.")
+        else:
+            if not _transition(conn, ticket_id, account["id"], _CONFIRMABLE_STATUSES, "risk_rejected",
+                               extra_condition=unchanged, risk_check_results=results):
+                conn.rollback()
+                _raise_invalid_state(conn, ticket_id, account["id"], "re-review")
+            _log_event(conn, ticket_id, "risk_rejected",
+                       "Re-review: " + "; ".join(c.message for c in report.checks if not c.passed))
+        conn.commit()
+        _notify("re_reviewed", ticket_id=ticket_id)
+
+        data = _serialize_reviewed(conn, _get_ticket_or_404(conn, ticket_id, account["id"]))
+        data["re_review"] = {"passed": report.passed,
+                             "failed_checks": [c.rule for c in report.checks if not c.passed]}
+        return {"data": data}
     finally:
         conn.close()
 
@@ -759,13 +896,15 @@ def _raise_account_safety(failures: list) -> None:
 
 
 def _account_safety_precheck(conn: sqlite3.Connection, account: sqlite3.Row, ticket: sqlite3.Row, mode: str,
-                             allow_amo: bool) -> str | None:
+                             allow_amo: bool, expected_review_token: str | None = None) -> str | None:
     """PK-12, before the claim: DB/request-only account checks for a NEW
     entry. A refusal leaves the ticket approvable ('pending_confirmation') —
-    nothing is claimed, nothing sent — except a stale strategy signal, which
-    can never become valid again and is rejected. Returns the order variety a
+    nothing is claimed, nothing sent — except a permanent failure (a stale or
+    contradictory strategy signal, P1-D tampered ticket evidence), which can
+    never become valid again and is rejected. Returns the order variety a
     live entry will be sent as."""
-    decision = account_safety.precheck(conn, account["id"], ticket, mode, allow_amo)
+    decision = account_safety.precheck(conn, account["id"], ticket, mode, allow_amo,
+                                       expected_review_token=expected_review_token)
     if decision.passed:
         return decision.variety
     account_safety.log_refusal(conn, account["id"], ticket, mode, "before claim", decision.failures)
@@ -867,7 +1006,8 @@ def _refuse_unsupported_at_confirm(conn: sqlite3.Connection, ticket: sqlite3.Row
 
 
 def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, kite: KiteConnect, ticket_id: int,
-                               expected_mode: str | None = None, allow_amo: bool = False) -> dict:
+                               expected_mode: str | None = None, allow_amo: bool = False,
+                               expected_review_token: str | None = None) -> dict:
     """Shared confirm-and-execute body: transitions a pending_confirmation
     ticket to 'confirmed', calls the execution engine, updates status from the
     result, and records a closed_trades row for exit tickets. Used by both
@@ -877,6 +1017,8 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
     the mode the user was shown; it binds a new entry (PK-11) and is ignored
     for an exit. allow_amo is the approver's explicit consent to send a live
     new entry as an AMO while the market is closed (PK-12H).
+    expected_review_token is the review the approver's view showed (P1-D):
+    required for a manual / Quick-Action BUY entry, ignored otherwise.
 
     A NEW entry (not a closing sell) also passes the PK-12 account safety
     gate: a pre-claim check, the daily entry limit inside the claim, and a
@@ -906,7 +1048,7 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
         entry_limit = _exit_claim_condition()
     if new_entry:
         # PK-12: refused before the claim — nothing written, nothing sent.
-        variety = _account_safety_precheck(conn, account, ticket, mode, allow_amo)
+        variety = _account_safety_precheck(conn, account, ticket, mode, allow_amo, expected_review_token)
         if mode == "live":
             entry_limit = account_safety.daily_entry_claim_condition(
                 risk_engine.get_settings(conn, account["id"]), account["id"], ticket_id, account_safety.now_ist())
@@ -1084,7 +1226,8 @@ def confirm_ticket(ticket_id: int, req: TicketConfirmRequest | None = None,
     try:
         data = confirm_and_execute_ticket(conn, account, kite, ticket_id,
                                           expected_mode=req.expected_mode if req is not None else None,
-                                          allow_amo=req.allow_amo if req is not None else False)
+                                          allow_amo=req.allow_amo if req is not None else False,
+                                          expected_review_token=req.expected_review_token if req is not None else None)
         return {"data": data}
     finally:
         conn.close()
@@ -1151,7 +1294,7 @@ def start_trailing(ticket_id: int, kite: KiteConnect = Depends(require_trading_a
         _log_event(conn, ticket_id, "trailing_adjusted", "Trailing manually activated by user")
         conn.commit()
         ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
-        return {"data": _serialize(ticket)}
+        return {"data": _serialize_reviewed(conn, ticket)}
     finally:
         conn.close()
 
@@ -1245,6 +1388,9 @@ def edit_ticket(ticket_id: int, req: TicketEditRequest, kite: KiteConnect = Depe
             # into a draft (PK-4).
             conn.rollback()
             _raise_invalid_state(conn, ticket_id, account["id"], "edit")
+        # P1-D: an edit is a new review of new content — re-stamped from the
+        # row as now stored, in the same transaction.
+        _stamp_review(conn, ticket_id, account["id"], with_digest=True)
         _log_event(conn, ticket_id, "modified", diff)
         conn.commit()
 
@@ -1252,7 +1398,7 @@ def edit_ticket(ticket_id: int, req: TicketEditRequest, kite: KiteConnect = Depe
         _notify("modified", ticket_id=ticket_id)
 
         ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
-        return {"data": _serialize(ticket)}
+        return {"data": _serialize_reviewed(conn, ticket)}
     finally:
         conn.close()
 

@@ -13,7 +13,7 @@ import pytest
 import requests
 from kiteconnect.exceptions import NetworkException
 
-from conftest import displayed_mode, account_id, set_mode, ticket_row
+from conftest import approval_body, displayed_mode, account_id, set_mode, ticket_row
 from test_live_safety import (  # noqa: F401 — market_open / market_closed / unsafe_client are fixtures
     _assert_unknown_response, _closed_trades_for, _details, _event_types, _live_position, _monitor, _pending_exit,
     _precondition, _rows, _sells, _urgent_updates, market_closed, market_open, unsafe_client,
@@ -470,7 +470,7 @@ def test_alert_action_sell_without_position_completes_without_closing_anything(e
         "symbol": "TCS", "quantity": 4, "entry_order_type": "MARKET", "entry_price": 3000.0,
         "rationale": "reduce", "alert_type": "breach_concentration",
     }).json()["data"]
-    done = env.client.post(f"/api/tickets/{created['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    done = env.client.post(f"/api/tickets/{created['id']}/confirm", json=approval_body(env.db, created['id'])).json()["data"]
     _fill(env, done["kite_order_id"], filled=4, price=3010.0)
 
     _monitor(env)

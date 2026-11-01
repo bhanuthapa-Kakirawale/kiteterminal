@@ -15,7 +15,7 @@ tests/test_platform_pk22.py (supervisor and app-startup tests).
 import pytest
 import requests
 
-from conftest import account_id, set_mode, ticket_row
+from conftest import approval_body, account_id, set_mode, ticket_row
 
 BROKER_WRITES = ("place_order", "place_gtt", "modify_gtt", "delete_gtt", "cancel_order")
 PRICE, STOP, TARGET = 1500.0, 1450.0, 1600.0
@@ -73,7 +73,7 @@ def _entry(env, quantity=10, order_type="LIMIT", mode="live", symbol="INFY"):
     r = env.client.post("/api/tickets", json=body)
     assert r.status_code in (200, 201), r.text
     tid = r.json()["data"]["id"]
-    r = env.client.post(f"/api/tickets/{tid}/confirm", json={"expected_mode": mode})
+    r = env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid, expected_mode=mode))
     return tid, r
 
 

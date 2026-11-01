@@ -23,7 +23,7 @@ from fastapi import HTTPException
 from kiteconnect.exceptions import TokenException
 
 from backend import kite_client, kite_rest_proxy
-from conftest import TEST_STATIC_IP, displayed_mode, set_mode, ticket_row
+from conftest import approval_body, TEST_STATIC_IP, displayed_mode, set_mode, ticket_row
 from test_baseline_api import _manual_ticket
 from test_live_preflight import _check, _evaluate, ready  # noqa: F401 — fixture
 
@@ -449,7 +449,7 @@ def test_18_proxy_timeout_on_place_order_reaches_unknown_handling(env, proxy_env
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
     env.kite.raise_on_next("place_order", exc)
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
     assert r.status_code == 200, r.text
     data = r.json()["data"]
     assert data["success"] is False and "UNKNOWN" in data["execution_message"]
@@ -461,9 +461,9 @@ def test_19_proxy_failure_after_acceptance_cannot_cause_a_duplicate_order(env, p
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
     env.kite.accept_then_raise("place_order", requests.exceptions.ReadTimeout("read timed out via proxy"))
-    first = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    first = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
     assert "UNKNOWN" in first.json()["data"]["execution_message"]
-    again = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    again = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
     assert again.status_code == 409
     assert len(env.kite.calls_to("place_order")) == 1
     assert ticket_row(env.db, t["id"])["submission_state"] == "unknown"
@@ -483,7 +483,7 @@ def test_19c_proxy_failure_during_risk_revalidation_sends_no_order(env, proxy_en
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
     env.kite.raise_on_next("holdings", exc)
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
     assert r.status_code == 503 and r.json()["detail"]["error_code"] == "RISK_REVALIDATION_UNAVAILABLE"
     assert "risk_revalidation" in recorded
     assert env.kite.calls_to("place_order") == [] and env.kite.calls_to("place_gtt") == []
@@ -639,7 +639,7 @@ def test_23c_outbound_ip_check_without_proxy_is_unchanged(ready, monkeypatch):
 def test_24_dry_run_works_with_a_proxy_and_never_mutates_the_broker(env, proxy_env, market_open):
     set_mode(env.db, "dry_run")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
     assert r.status_code == 200, r.text
     row = ticket_row(env.db, t["id"])
     assert row["mode"] == "dry_run" and str(row["kite_order_id"]).startswith("PAPER-")

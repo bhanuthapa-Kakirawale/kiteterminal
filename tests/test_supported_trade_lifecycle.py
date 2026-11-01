@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from conftest import account_id, displayed_mode, set_mode, ticket_row
+from conftest import approval_body, account_id, displayed_mode, set_mode, ticket_row
 from fake_kite import FakeKite
 from test_baseline_api import _insert_ticket, _manual_ticket
 from test_live_safety import _live_position, _pending_exit
@@ -89,7 +89,7 @@ def test_manual_buy_cnc_is_accepted_and_executes(live):
     assert r.status_code == 201, r.text
     t = r.json()["data"]
     assert (t["status"], t["transaction_type"], t["product_type"]) == ("pending_confirmation", "BUY", "CNC")
-    r = live.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(live.db))
+    r = live.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(live.db, t['id']))
     assert r.status_code == 200 and r.json()["data"]["status"] == "executed", r.text
     [order] = live.kite.calls_to("place_order")
     assert (order["transaction_type"], order["product"]) == ("BUY", "CNC")
@@ -185,7 +185,7 @@ def test_quick_action_sell_of_held_shares_still_allowed(live):
     t = r.json()["data"]
     assert (t["source"], t["transaction_type"], t["closes_ticket_id"], t["status"]) == \
         ("alert_action", "SELL", None, "pending_confirmation")
-    r = live.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(live.db))
+    r = live.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(live.db, t['id']))
     assert r.status_code == 200 and r.json()["data"]["status"] == "executed", r.text
     [order] = live.kite.calls_to("place_order")
     assert (order["transaction_type"], order["quantity"]) == ("SELL", 4)
@@ -238,7 +238,7 @@ def test_misconfigured_strategy_entry_is_risk_rejected_without_broker_work(env, 
 def test_historical_unsupported_pending_ticket_cannot_execute(env, market_open, mode, transaction_type, product_type):
     set_mode(env.db, mode)
     tid = _historical(env, transaction_type, product_type)
-    r = env.client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid))
     assert r.status_code == 409 and _code(r) == CODE, r.text
     row = ticket_row(env.db, tid)
     # Rejected (it can never become valid), kept, never claimed or sent.
@@ -248,12 +248,12 @@ def test_historical_unsupported_pending_ticket_cannot_execute(env, market_open, 
     [event] = _events(env, tid)
     assert event["event_type"] == "rejected" and CODE in event["detail"]
     assert _orders(env) == []
-    assert env.client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db)).status_code == 409
+    assert env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid)).status_code == 409
 
 
 def test_reverting_a_rejected_unsupported_ticket_lands_in_risk_rejected(env):
     tid = _historical(env, "SELL", "MIS")
-    assert env.client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db)).status_code == 409
+    assert env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid)).status_code == 409
     r = env.client.post(f"/api/tickets/{tid}/revert-rejection")
     assert r.status_code == 200, r.text
     t = r.json()["data"]

@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from conftest import add_watch, displayed_mode, set_mode, ticket_row
+from conftest import approval_body, add_watch, displayed_mode, set_mode, ticket_row
 from test_baseline_api import _insert_ticket
 from test_emergency_exit_isolation import _emergency_exit, _position
 from test_live_safety import _set_risk, _unknown_ticket, market_open  # noqa: F401 — market_open is a fixture
@@ -225,7 +225,7 @@ def test_7b_unknown_sector_fails_closed_at_confirmation(env, market_open, monkey
     _unmap(monkeypatch, "INFY")                                    # the mapping is gone before approval
     set_mode(env.db, "live")
 
-    r = env.client.post(f"/api/tickets/{ticket['id']}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{ticket['id']}/confirm", json=approval_body(env.db, ticket['id']))
 
     assert r.status_code == 409, r.text
     detail = r.json()["detail"]

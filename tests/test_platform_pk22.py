@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from conftest import (
+    approval_body,
     IST, FakeKite, account_id, as_pre_pk22_database, make_candles, seed_ohlc, set_mode, ticket_row,
 )
 
@@ -101,7 +102,7 @@ def test_brand_new_database_migrates_to_the_current_version(env):
     from backend import db
     history = _rows(env, "SELECT version, migration_name FROM schema_version ORDER BY version")
     assert [(h["version"], h["migration_name"]) for h in history] == [(v, n) for v, n, _ in db.MIGRATIONS]
-    assert history[-1]["version"] == db.LATEST_SCHEMA_VERSION == 6   # LIVE-0 added v5, SEC-1 v6
+    assert history[-1]["version"] == db.LATEST_SCHEMA_VERSION == 7   # LIVE-0 added v5, SEC-1 v6, P1-D v7
     conn = env.db.get_connection()
     try:
         status = db.schema_status(conn)
@@ -129,7 +130,7 @@ def test_migration_history_is_recorded_once(env):
     for _ in range(3):
         env.db.init_db()
     rows = _rows(env, "SELECT version, COUNT(*) AS n FROM schema_version GROUP BY version")
-    assert [(r["version"], r["n"]) for r in rows] == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
+    assert [(r["version"], r["n"]) for r in rows] == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1)]
 
 
 @pytest.mark.parametrize("tamper", ["newer_version", "renamed_migration", "gap"])
@@ -182,9 +183,9 @@ def test_interrupted_migration_rolls_back_and_resumes(env, monkeypatch):
 
     monkeypatch.setattr(db, "MIGRATIONS", real_migrations)  # the next start resumes from v3
     db.init_db()
-    assert db.last_init["applied_migrations"] == [4, 5, 6]
+    assert db.last_init["applied_migrations"] == [4, 5, 6, 7]
     assert [r["version"] for r in _rows(env, "SELECT version FROM schema_version ORDER BY version")] == \
-        [1, 2, 3, 4, 5, 6]
+        [1, 2, 3, 4, 5, 6, 7]
     assert "ohlc_history_status" in {r["name"] for r in _rows(env, "SELECT name FROM sqlite_master")}
 
 
@@ -499,6 +500,10 @@ def test_a_synthetic_pre_pk22_database_migrates_keeping_every_row(tmp_path, monk
         assert (settings["mode"], settings["live_armed_session_id"]) == ("live", None)  # v6: never armed by a migration
         sql = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'system_events'").fetchone()[0]
         assert "'reconciliation_reviewed'" in sql and "'live_switch_refused'" in sql
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(trade_tickets)")}
+        assert {"reviewed_at", "reviewed_session_id", "review_digest"} <= columns         # v7
+        assert conn.execute("SELECT COUNT(*) FROM trade_tickets WHERE reviewed_at IS NOT NULL OR "
+                            "reviewed_session_id IS NOT NULL OR review_digest IS NOT NULL").fetchone()[0] == 0
         assert crypto.decrypt(conn.execute("SELECT access_token_enc FROM accounts").fetchone()[0]) == \
             "synthetic-access-token"
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -860,7 +865,7 @@ def test_confirm_flow_is_traceable_by_one_correlation_id(env, market_open, caplo
             "rationale": "PK-22 trace"}
     tid = env.client.post("/api/tickets", json=body).json()["data"]["id"]
     caplog.set_level(logging.INFO)
-    r = env.client.post(f"/api/tickets/{tid}/confirm", json={"expected_mode": "live"})
+    r = env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid, expected_mode="live"))
     assert r.status_code == 200, r.text
     cid = r.headers["x-request-id"]
     events = {rec.kt_event: rec for rec in caplog.records if hasattr(rec, "kt_event")}
@@ -1189,7 +1194,7 @@ def test_connections_wait_for_a_busy_writer_instead_of_failing(env):
 def test_maintenance_cli_reports_checks_and_backs_up(env, capsys):
     from backend import db_maintenance
     assert db_maintenance.main(["status", "--db", str(_db_file(env))]) == 0
-    assert "schema:    v6 of v6" in capsys.readouterr().out
+    assert "schema:    v7 of v7" in capsys.readouterr().out
     assert db_maintenance.main(["integrity", "--db", str(_db_file(env))]) == 0
     assert "integrity_check: ok" in capsys.readouterr().out
     assert db_maintenance.main(["backup", "--db", str(_db_file(env))]) == 0
@@ -1262,7 +1267,7 @@ def test_diagnostics_report_is_complete_and_leaks_no_secret(env, monkeypatch):
     for secret in (*SENTINELS, "test_api_key", "fake-access-token"):
         assert secret not in text, secret
     data = r.json()["data"]
-    assert data["schema"]["current_version"] == 6 and data["database_integrity"]["ok"] is True
+    assert data["schema"]["current_version"] == 7 and data["database_integrity"]["ok"] is True
     assert data["broker_session"]["state"] == "VALID" and data["broker_session"]["verified_with_broker"] is False
     assert {"order_monitor", "trailing", "reconciliation"} <= set(data["workers"])
     assert data["market"]["session_state"] in ("OPEN", "CLOSED", "PRE_OPEN", "HOLIDAY", "WEEKEND")

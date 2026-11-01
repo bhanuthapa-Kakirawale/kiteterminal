@@ -18,7 +18,7 @@ import pytest
 import requests
 from kiteconnect.exceptions import GeneralException, InputException
 
-from conftest import IST, account_id, set_mode, ticket_row
+from conftest import approval_body, IST, account_id, set_mode, ticket_row
 from fake_kite import FakeKite
 from test_baseline_api import _insert_ticket, _manual_ticket
 from test_live_safety import _broker_calls, _closed_trades_for, _rows, market_open  # noqa: F401 — fixture
@@ -71,7 +71,7 @@ def _approve(env, quantity=40, order_type="MARKET", price=PRICE, allow_amo=False
     body.update(overrides)
     t = env.client.post("/api/tickets", json=body).json()["data"]
     assert t["status"] == "pending_confirmation", t
-    payload = {"expected_mode": "dry_run", **({"allow_amo": True} if allow_amo else {})}
+    payload = approval_body(env.db, t["id"], expected_mode="dry_run", **({"allow_amo": True} if allow_amo else {}))
     r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=payload)
     assert r.status_code == 200, r.text
     return t["id"], r.json()["data"]
@@ -679,7 +679,7 @@ def test_trading_lock_still_blocks_a_dry_run_approval(env, market_open):
     t = env.client.post("/api/tickets", json=_manual_ticket(symbol=SYMBOL, quantity=40, entry_price=PRICE,
                                                              stop_loss=STOP, target_1=TARGET)).json()["data"]
     assert env.client.post("/api/account-safety/trading-lock", json={"locked": True, "reason": "drill"}).status_code == 200
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json={"expected_mode": "dry_run"})
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id'], expected_mode="dry_run"))
     assert r.status_code == 409 and r.json()["detail"]["error_code"] == "TRADING_LOCKED"
     assert _paper_orders(env) == []
 
@@ -745,9 +745,9 @@ def test_amo_paper_order_waits_for_the_next_session(env, monkeypatch):
                           stop_loss=STOP, target_1=TARGET)
     tid = env.client.post("/api/tickets", json=body).json()["data"]["id"]
 
-    r = env.client.post(f"/api/tickets/{tid}/confirm", json={"expected_mode": "dry_run"})
+    r = env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid, expected_mode="dry_run"))
     assert r.status_code == 409 and r.json()["detail"]["error_code"] == "AMO_CONFIRMATION_REQUIRED"
-    r = env.client.post(f"/api/tickets/{tid}/confirm", json={"expected_mode": "dry_run", "allow_amo": True})
+    r = env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid, expected_mode="dry_run", allow_amo=True))
     assert r.status_code == 200 and r.json()["data"]["order_variety"] == "amo"
     order = _order(env, ticket_row(env.db, tid)["kite_order_id"])
     assert (order["status"], order["variety"], order["session_date"]) == ("AMO REQ RECEIVED", "amo", "2026-09-30")
@@ -807,7 +807,7 @@ def test_accepted_but_response_lost_is_recovered_by_tag_never_resubmitted(env, m
     body = _manual_ticket(symbol=SYMBOL, quantity=40, entry_price=PRICE, entry_order_type="MARKET",
                           stop_loss=STOP, target_1=TARGET)
     tid = env.client.post("/api/tickets", json=body).json()["data"]["id"]
-    r = env.client.post(f"/api/tickets/{tid}/confirm", json={"expected_mode": "dry_run"})
+    r = env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid, expected_mode="dry_run"))
     assert r.status_code == 200 and "UNKNOWN" in r.json()["data"]["execution_message"]
     row = ticket_row(env.db, tid)
     assert (row["status"], row["submission_state"], row["kite_order_id"]) == ("confirmed", "unknown", None)

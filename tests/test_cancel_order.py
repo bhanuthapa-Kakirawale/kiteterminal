@@ -11,7 +11,7 @@ import pytest
 import requests
 from kiteconnect.exceptions import NetworkException, OrderException, TokenException
 
-from conftest import set_mode, ticket_row
+from conftest import approval_body, set_mode, ticket_row
 from test_baseline_api import _manual_ticket
 from test_exit_lifecycle import _exiting_position, _fill, _open_positions, _still_open_and_protected
 from test_live_safety import (  # noqa: F401 — market_open / unsafe_client are fixtures
@@ -25,7 +25,7 @@ def _open_entry(env) -> tuple[int, str, int]:
     set_mode(env.db, "live")
     env.kite.auto_fill = False
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    done = env.client.post(f"/api/tickets/{t['id']}/confirm", json={"expected_mode": "live"}).json()["data"]
+    done = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id'], expected_mode="live")).json()["data"]
     _precondition(done["status"] == "executed" and done["entry_fill_status"] == "pending",
                   f"entry not left OPEN at the broker: {done}")
     _precondition(env.kite.order_book[done["kite_order_id"]]["status"] == "OPEN", "entry order should be OPEN")

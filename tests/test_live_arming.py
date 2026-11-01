@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 from kiteconnect.exceptions import TokenException
 
-from conftest import account_id, clear_live_prerequisites, displayed_mode, make_live_ready, set_mode, ticket_row
+from conftest import approval_body, account_id, clear_live_prerequisites, displayed_mode, make_live_ready, set_mode, ticket_row
 from test_baseline_api import _insert_ticket, _manual_ticket
 from test_live_safety import _live_position, _pending_exit, _rows, _sells, market_open  # noqa: F401 (fixture)
 
@@ -228,7 +228,7 @@ def test_entry_armed_for_an_earlier_session_is_refused_before_any_broker_call(en
     _exec(env, "INSERT INTO sessions (access_token, user_id, user_name, login_time, account_id, is_active) "
                "VALUES ('', 'DT0001', 'Demo Trader', datetime('now'), ?, 1)", account_id(env.db))
     before = len(env.kite.calls)
-    r = env.client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid))
     assert r.status_code == 409 and r.json()["detail"]["error_code"] == "LIVE_NOT_ARMED_FOR_SESSION", r.text
     assert ticket_row(env.db, tid)["status"] == "pending_confirmation"
     assert [n for n, _ in env.kite.calls[before:] if n in ("place_order", "place_gtt", "ltp")] == []

@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 
 from backend import trading_calendar as tc
-from conftest import IST, account_id, set_mode, ticket_row
+from conftest import approval_body, IST, account_id, set_mode, ticket_row
 
 FRI = date(2026, 9, 11)
 HOLIDAY_MON = date(2026, 9, 14)   # Ganesh Chaturthi (NSE/CMTR/71775)
@@ -166,7 +166,7 @@ def test_paper_amo_placed_before_a_holiday_waits_for_tuesday(env, monkeypatch):
     tid = env.client.post("/api/tickets", json=body).json()["data"]["id"]
     real_is_market_open = market.is_market_open
     monkeypatch.setattr(market, "is_market_open", lambda at=None: False)
-    r = env.client.post(f"/api/tickets/{tid}/confirm", json={"expected_mode": "dry_run", "allow_amo": True})
+    r = env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid, expected_mode="dry_run", allow_amo=True))
     assert r.status_code == 200, r.text
     order_id = ticket_row(env.db, tid)["kite_order_id"]
     conn = env.db.get_connection()

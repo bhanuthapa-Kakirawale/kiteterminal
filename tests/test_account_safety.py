@@ -13,7 +13,7 @@ import pytest
 import requests
 from kiteconnect.exceptions import InputException, NetworkException, OrderException
 
-from conftest import IST, account_id, displayed_mode, set_mode, ticket_row
+from conftest import approval_body, IST, account_id, displayed_mode, set_mode, ticket_row
 from test_baseline_api import _insert_ticket, _manual_ticket
 from test_live_safety import _live_position, _pending_exit
 
@@ -51,7 +51,14 @@ def _entry(env, **overrides) -> int:
 
 
 def _confirm(env, tid, **body):
-    return env.client.post(f"/api/tickets/{tid}/confirm", json={**displayed_mode(env.db), **body})
+    return env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid, **body))
+
+
+def _re_review(env, tid):
+    """SEC-1 P1-D: the user's explicit Re-review of a manual entry."""
+    r = env.client.post(f"/api/tickets/{tid}/re-review")
+    assert r.status_code == 200 and r.json()["data"]["review"]["current"] is True, r.text
+    return r.json()["data"]
 
 
 def _code(r):
@@ -393,6 +400,7 @@ def test_12c_next_ist_day_resets_the_count(live, monkeypatch):
     tomorrow = account_safety.now_ist() + timedelta(days=1)
     monkeypatch.setattr(account_safety, "now_ist", lambda: tomorrow)
     assert _entries_today(live) == 0
+    _re_review(live, blocked)   # P1-D: yesterday's review of a manual ticket is not current today
     r = _confirm(live, blocked)
     assert r.status_code == 200 and r.json()["data"]["status"] == "executed"
 
@@ -571,10 +579,29 @@ def test_12e_missing_signal_date_falls_back_to_creation_date(live):
     assert _code(_confirm(live, tid)) == "STALE_SIGNAL"
 
 
-def test_12e_manual_ticket_semantics_are_preserved(live):
-    # A manual ticket has no signal candle: however old, it is not a stale signal.
+def test_12e_a_manual_ticket_is_never_judged_as_a_strategy_signal(live):
+    # A manual ticket has no signal candle: however old its creation date, the
+    # stale-signal rule never applies to it. Since P1-D its currency is its
+    # REVIEW (check_ticket_review) — this one was just reviewed (the seeding
+    # helper's default stamp), so it executes.
     tid = _insert_ticket(live.db, status="pending_confirmation", mode=None, risk_check_results="[]",
                          created_at="2026-01-05 10:30:00")
+    r = _confirm(live, tid)
+    assert r.status_code == 200 and r.json()["data"]["status"] == "executed"
+
+
+def test_12e_an_old_unreviewed_manual_ticket_needs_a_re_review_first(live):
+    # P1-D: the same old manual ticket with no review record is no longer
+    # approvable as it stands — refused, untouched, no broker call — until the
+    # user re-reviews it.
+    tid = _insert_ticket(live.db, status="pending_confirmation", mode=None, risk_check_results="[]",
+                         created_at="2026-01-05 10:30:00", reviewed_at=None)
+    mark = len(live.kite.calls)
+    r = _confirm(live, tid)
+    assert r.status_code == 409 and _code(r) == "TICKET_REVIEW_REQUIRED"
+    assert _calls_since(live, mark) == []
+    _assert_untouched_pending(live, tid)
+    _re_review(live, tid)
     r = _confirm(live, tid)
     assert r.status_code == 200 and r.json()["data"]["status"] == "executed"
 
@@ -684,6 +711,7 @@ def test_12f_next_trading_day_resets(live, monkeypatch):
     assert _code(_confirm(live, tid)) == "DAILY_LOSS_LIMIT"
     tomorrow = account_safety.now_ist() + timedelta(days=1)
     monkeypatch.setattr(account_safety, "now_ist", lambda: tomorrow)
+    _re_review(live, tid)   # P1-D: yesterday's review of a manual ticket is not current today
     r = _confirm(live, tid)
     assert r.status_code == 200 and r.json()["data"]["status"] == "executed"
 
@@ -806,7 +834,7 @@ def test_12g_unknown_order_outcomes_trip_the_breaker(live, unsafe_client, monkey
     for _ in range(3):
         tid = _entry(live)
         live.kite.raise_on_next("place_order", requests.ConnectionError("Connection aborted."))
-        r = unsafe_client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(live.db))
+        r = unsafe_client.post(f"/api/tickets/{tid}/confirm", json=approval_body(live.db, tid))
         assert r.json()["data"]["submission_state"] == "unknown"
     assert _status(live)["breaker_open"] is True
     r = _confirm(live, _entry(live))
@@ -905,7 +933,7 @@ def test_12g_bookkeeping_failure_never_changes_an_order_outcome(live, unsafe_cli
     monkeypatch.setattr(account_safety, "get_connection", broken)
     if outcome == "unknown":
         live.kite.raise_on_next("place_order", requests.ConnectionError("Connection aborted."))
-    r = unsafe_client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(live.db))
+    r = unsafe_client.post(f"/api/tickets/{tid}/confirm", json=approval_body(live.db, tid))
     assert r.status_code == 200, r.text
     row = ticket_row(live.db, tid)
     if outcome == "accepted":
@@ -962,7 +990,7 @@ def test_12h_stale_tab_cannot_silently_become_amo(closed):
     # The tab still showed the market open (no AMO checkbox, allow_amo false)
     # when the user clicked; the server's clock decides.
     tid = _entry(closed)
-    r = closed.client.post(f"/api/tickets/{tid}/confirm", json={"expected_mode": "live", "allow_amo": False})
+    r = closed.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(closed.db, tid, expected_mode="live", allow_amo=False))
     assert _code(r) == "AMO_CONFIRMATION_REQUIRED"
     assert closed.kite.calls_to("place_order") == []
 

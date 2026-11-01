@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 import pytest
 
-from conftest import displayed_mode, account_id, add_watch, last_weekday, make_candles, seed_ohlc, set_mode, ticket_row
+from conftest import approval_body, displayed_mode, account_id, add_watch, last_weekday, make_candles, seed_ohlc, set_mode, ticket_row
 from test_baseline_api import _breakout_candles, _insert_ticket, _manual_ticket
 
 
@@ -75,7 +75,7 @@ def test_live_entry_off_grid_prices_are_snapped_and_sent_as_amo(env, market_clos
     t = env.client.post("/api/tickets", json=body).json()["data"]
     # PK-12H: an after-hours live entry is an AMO only with explicit consent.
     r = env.client.post(f"/api/tickets/{t['id']}/confirm",
-                        json={**displayed_mode(env.db), "allow_amo": True}).json()["data"]
+                        json=approval_body(env.db, t['id'], allow_amo=True)).json()["data"]
     assert r["status"] == "executed" and r["order_variety"] == "amo" and r["entry_fill_status"] == "pending"
     assert "AMO" in r["execution_message"]
     order = env.kite.calls_to("place_order")[0]
@@ -89,7 +89,7 @@ def test_live_entry_off_grid_prices_are_snapped_and_sent_as_amo(env, market_clos
 def test_live_entry_is_regular_while_market_open(env, market_open):
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
     assert env.kite.calls_to("place_order")[0]["variety"] == "regular"
 
 
@@ -100,7 +100,7 @@ def test_dry_run_is_filled_by_the_paper_broker_at_the_observed_price(env, monkey
     monkeypatch.setattr(config, "PAPER_SLIPPAGE_BPS", 0.0)
     set_mode(env.db, "dry_run")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id'])).json()["data"]
     assert r["entry_fill_status"] == "pending" and r["filled_price"] is None
     env.kite.ltp_map["NSE:TCS"] = 2995.0   # the observed price, at or below the 3000 limit
     order_monitor.check_paper_orders(env.kite)
@@ -110,7 +110,7 @@ def test_dry_run_is_filled_by_the_paper_broker_at_the_observed_price(env, monkey
 
 def test_confirm_broadcasts_tickets_changed(env, market_open):
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
     reasons = [m.get("reason") for m in env.broadcasts if m["type"] == "tickets_changed"]
     assert "created" in reasons and "executed" in reasons
 
@@ -121,7 +121,7 @@ def _confirm_live_entry(env, auto_fill: bool) -> dict:
     set_mode(env.db, "live")
     env.kite.auto_fill = auto_fill
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    return env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    return env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id'])).json()["data"]
 
 
 def test_order_monitor_records_entry_fill(env, market_open):

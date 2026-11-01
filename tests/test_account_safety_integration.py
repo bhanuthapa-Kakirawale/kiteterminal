@@ -13,7 +13,7 @@ import pytest
 import requests
 from kiteconnect.exceptions import NetworkException
 
-from conftest import TERMINAL_ORIGIN, displayed_mode, set_mode, terminal_client, ticket_row
+from conftest import approval_body, TERMINAL_ORIGIN, displayed_mode, set_mode, terminal_client, ticket_row
 from test_account_safety import (  # noqa: F401 — live is a fixture
     _assert_untouched_pending, _closed_trade, _code, _codes, _confirm, _entry, _ignore_live0_unknown_gate, _lock,
     _record_failures, _risk, _session, _status, _sys_events, live,
@@ -44,7 +44,7 @@ def _race_entries(env, monkeypatch, tickets_to_confirm):
     monkeypatch.setattr(account_safety, "precheck", synchronised)
 
     def confirm(tid):
-        return _call(tickets.confirm_ticket, tid, req=TicketConfirmRequest(**displayed_mode(env.db)), kite=env.kite)
+        return _call(tickets.confirm_ticket, tid, req=TicketConfirmRequest(**approval_body(env.db, tid)), kite=env.kite)
 
     with ThreadPoolExecutor(max_workers=len(tickets_to_confirm)) as pool:
         results = [f.result(timeout=30) for f in [pool.submit(confirm, t) for t in tickets_to_confirm]]
@@ -212,7 +212,7 @@ def test_s7_mixed_broker_errors_trip_the_circuit_breaker(live, unsafe_client):
     assert _code(_confirm(live, t2)) == "ACCOUNT_SAFETY_UNAVAILABLE"
     t3 = _entry(live)
     live.kite.raise_on_next("place_order", requests.ConnectionError("aborted"))      # UNKNOWN submission
-    assert unsafe_client.post(f"/api/tickets/{t3}/confirm", json=displayed_mode(live.db)).status_code == 200
+    assert unsafe_client.post(f"/api/tickets/{t3}/confirm", json=approval_body(live.db, t3)).status_code == 200
     s = _status(live)
     assert s["breaker_open"] is True and len(_sys_events(live, "broker_breaker_tripped")) == 1
     t4 = _entry(live)
@@ -274,7 +274,7 @@ def test_s10_emergency_exit_remains_possible_while_every_entry_control_is_blocki
 def test_s11_unknown_recovery_continues_while_the_breaker_is_open(live, unsafe_client):
     tid = _entry(live)
     live.kite.accept_then_raise("place_order", requests.ReadTimeout("Read timed out."))
-    assert unsafe_client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(live.db)).status_code == 200
+    assert unsafe_client.post(f"/api/tickets/{tid}/confirm", json=approval_body(live.db, tid)).status_code == 200
     _record_failures(live, 3)
     _precondition(_status(live)["breaker_open"], "the breaker should be open")
     _run_background_cycles(live)
@@ -300,7 +300,7 @@ def test_mode_binding_is_checked_before_the_account_gate(live):
     # PK-11 first: a stale tab is told the mode changed, not about PK-12.
     _lock(live)
     tid = _entry(live)
-    r = live.client.post(f"/api/tickets/{tid}/confirm", json={"expected_mode": "dry_run"})
+    r = live.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(live.db, tid, expected_mode="dry_run"))
     assert r.status_code == 409 and _code(r) == "EXECUTION_MODE_CHANGED"
     assert _sys_events(live, "account_safety_refusal") == []
 

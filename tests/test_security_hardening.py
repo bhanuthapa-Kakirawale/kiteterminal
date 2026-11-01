@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from backend import kite_client as _kite_client_module
-from conftest import TERMINAL_ORIGIN, displayed_mode, set_mode, ticket_row
+from conftest import approval_body, TERMINAL_ORIGIN, displayed_mode, set_mode, ticket_row
 from test_baseline_api import _manual_ticket
 
 # Captured at import, before the env fixture replaces it with the FakeKite factory.
@@ -135,7 +135,7 @@ def test_hostile_host_confirm_places_nothing(env, monkeypatch):
     monkeypatch.setattr(market, "is_market_open", lambda at=None: True)
     set_mode(env.db, "live")
     tid = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]["id"]
-    r = _bare(EVIL).post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db),
+    r = _bare(EVIL).post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid),
                          headers={**APP_HEADER, "Origin": TERMINAL_ORIGIN})
     assert _is_host_reject(r)
     assert env.kite.calls_to("place_order") == []

@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import TERMINAL_ORIGIN, set_mode, ticket_row
+from conftest import TERMINAL_ORIGIN, approval_body, set_mode, ticket_row
 from test_baseline_api import _manual_ticket
 from test_exit_lifecycle import _exiting_position, _fill, _still_open_and_protected
 from test_live_safety import (  # noqa: F401 — market_open is a fixture
@@ -119,8 +119,11 @@ def _race_two_confirms(env, monkeypatch, modes):
         return real()
     monkeypatch.setattr(execution, "get_execution_mode", synchronised)
 
+    token = approval_body(env.db, t["id"])["expected_review_token"]   # P1-D: the review both views showed
+
     def confirm(mode):
-        return _call(tickets.confirm_ticket, t["id"], req=TicketConfirmRequest(expected_mode=mode), kite=env.kite)
+        return _call(tickets.confirm_ticket, t["id"],
+                     req=TicketConfirmRequest(expected_mode=mode, expected_review_token=token), kite=env.kite)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = [f.result(timeout=30) for f in [pool.submit(confirm, m) for m in modes]]
@@ -163,7 +166,7 @@ def test_valid_expected_mode_never_bypasses_the_csrf_guard(env, market_open, hea
     before = ticket_row(env.db, t["id"])
 
     r = TestClient(app, base_url=TERMINAL_ORIGIN).post(
-        f"/api/tickets/{t['id']}/confirm", json={"expected_mode": "live"}, headers=headers)
+        f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t["id"]), headers=headers)
 
     assert r.status_code == 403
     assert ticket_row(env.db, t["id"]) == before

@@ -29,6 +29,7 @@ from fastapi.testclient import TestClient
 from kiteconnect.exceptions import NetworkException
 
 from conftest import (
+    approval_body,
     displayed_mode, TERMINAL_ORIGIN, account_id, as_pre_pk22_database, set_mode, terminal_client, ticket_row,
 )
 from test_baseline_api import _insert_ticket, _manual_ticket
@@ -95,11 +96,12 @@ def _event_types(env, ticket_id):
         env, "SELECT event_type FROM ticket_events WHERE ticket_id = ? ORDER BY id", ticket_id)]
 
 
-def _displayed(env):
-    """The confirm body of a freshly loaded tab (PK-11), for tests that call
-    the confirm route function directly rather than over HTTP."""
+def _displayed(env, ticket_id):
+    """The confirm body of a freshly loaded tab (PK-11, P1-D review token),
+    for tests that call the confirm route function directly rather than over
+    HTTP."""
     from backend.models import TicketConfirmRequest
-    return TicketConfirmRequest(**displayed_mode(env.db))
+    return TicketConfirmRequest(**approval_body(env.db, ticket_id))
 
 
 def _call(fn, *args, **kwargs):
@@ -156,7 +158,7 @@ def _open_live_entry(env, **ticket_overrides) -> dict:
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket(**ticket_overrides)).json()["data"]
     _precondition(t["status"] == "pending_confirmation", f"ticket not approvable: {t['status']}")
-    done = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    done = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id'])).json()["data"]
     _precondition(done["status"] == "executed" and done["kite_gtt_id"], f"live entry not placed: {done}")
     order_monitor.check_pending_orders(env.kite)
     row = ticket_row(env.db, t["id"])
@@ -206,9 +208,9 @@ def test_p0_1_second_confirm_while_first_in_flight_is_rejected(env, market_open)
     env.kite.on_call("place_order", hold_inside_place_order)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
-            first = pool.submit(tickets.confirm_ticket, t["id"], req=_displayed(env), kite=env.kite)
+            first = pool.submit(tickets.confirm_ticket, t["id"], req=_displayed(env, t["id"]), kite=env.kite)
             assert entered.wait(timeout=10), "first confirm never reached place_order"
-            second = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+            second = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
             release.set()
             first_result = first.result(timeout=10)
     finally:
@@ -223,8 +225,8 @@ def test_p0_1_second_confirm_while_first_in_flight_is_rejected(env, market_open)
 def test_p0_1_sequential_second_confirm_is_rejected(env, market_open):
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    first = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
-    second = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    first = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
+    second = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
 
     assert first.status_code == 200 and first.json()["data"]["status"] == "executed"
     assert second.status_code == 409
@@ -256,7 +258,7 @@ def test_p0_1_concurrent_confirms_place_exactly_one_order(env, market_open, monk
     monkeypatch.setattr(execution, "get_execution_mode", synchronised_get_mode)
 
     def confirm():
-        return _call(tickets.confirm_ticket, t["id"], req=_displayed(env), kite=env.kite)
+        return _call(tickets.confirm_ticket, t["id"], req=_displayed(env, t["id"]), kite=env.kite)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = [f.result(timeout=30) for f in [pool.submit(confirm), pool.submit(confirm)]]
@@ -291,7 +293,7 @@ def test_p0_1_concurrent_confirms_place_exactly_one_order(env, market_open, monk
 def test_p0_1_confirm_only_from_pending_confirmation(env, market_open, status):
     set_mode(env.db, "live")
     tid = _insert_ticket(env.db, status=status, mode=None)
-    r = env.client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid))
 
     assert r.status_code == 409
     assert r.json()["detail"]["error_code"] == "CONFLICT_INVALID_STATE"
@@ -327,7 +329,7 @@ def test_p0_1_reject_cannot_overwrite_ticket_confirmed_after_its_read(env, marke
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
     confirm = _run_first_inside_transition(
-        monkeypatch, "rejected", lambda: _call(tickets.confirm_ticket, t["id"], req=_displayed(env), kite=env.kite))
+        monkeypatch, "rejected", lambda: _call(tickets.confirm_ticket, t["id"], req=_displayed(env, t["id"]), kite=env.kite))
 
     r = env.client.post(f"/api/tickets/{t['id']}/reject", json={"reason": "too late"})
 
@@ -349,7 +351,7 @@ def test_p0_1_confirm_cannot_execute_ticket_rejected_after_its_read(env, market_
         monkeypatch, "confirmed",
         lambda: _call(tickets.reject_ticket, t["id"], TicketRejectRequest(reason="no"), kite=env.kite))
 
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
 
     _precondition(reject["result"][0] == 200, f"competing reject should win: {reject}")
     assert r.status_code == 409
@@ -367,7 +369,7 @@ def test_p0_1_cancel_all_pending_skips_ticket_confirmed_concurrently(env, market
         symbol="INFY", entry_price=1500.0, stop_loss=1450.0, target_1=1650.0)).json()["data"]
     _precondition(tcs["status"] == infy["status"] == "pending_confirmation", "both tickets must be pending")
     confirm = _run_first_inside_transition(
-        monkeypatch, "rejected", lambda: _call(tickets.confirm_ticket, tcs["id"], req=_displayed(env), kite=env.kite))
+        monkeypatch, "rejected", lambda: _call(tickets.confirm_ticket, tcs["id"], req=_displayed(env, tcs["id"]), kite=env.kite))
 
     r = env.client.post("/api/tickets/cancel-all-pending")
 
@@ -401,7 +403,7 @@ def test_p0_2_kite_network_exception_reports_unknown(env, market_open):
     set_mode(env.db, "live")
     env.kite.raise_on_next("place_order", NetworkException("Gateway timed out"))
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
     assert r.status_code == 200
     data = r.json()["data"]
     assert data["success"] is False and "UNKNOWN" in data["execution_message"]
@@ -453,7 +455,7 @@ def _confirm_unknown_entry(env, client, inject, exc, **ticket):
     t = env.client.post("/api/tickets", json=_manual_ticket(**ticket)).json()["data"]
     _precondition(t["status"] == "pending_confirmation", f"ticket not approvable: {t['status']}")
     getattr(env.kite, inject)("place_order", exc)
-    return t["id"], client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    return t["id"], client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
 
 
 def _unknown_ticket(env, submission_state="unknown", submitted_at=_SUBMITTED_AT, **overrides) -> int:
@@ -500,7 +502,7 @@ def test_p0_2_entry_accepted_but_response_lost(env, unsafe_client, market_open, 
     tid, r = _confirm_unknown_entry(env, unsafe_client, "accept_then_raise", exc)
     _precondition(len(env.kite.order_book) == 1, "the broker should hold the accepted BUY order")
     _assert_unknown_response(r)
-    assert env.client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db)).status_code == 409  # not reopened
+    assert env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid)).status_code == 409  # not reopened
 
     _run_background_cycles(env)
     row = ticket_row(env.db, tid)
@@ -544,7 +546,7 @@ def test_p0_2_orders_carry_deterministic_kite_tag(env, market_open):
     from backend import execution
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
     buy_id, _ = _live_position(env)
     sell_id = _pending_exit(env, buy_id)
     env.client.post(f"/api/tickets/{sell_id}/confirm")
@@ -606,7 +608,7 @@ def test_p0_2_timeout_before_acceptance_reaches_not_found_after_window(env, mark
     assert (row["status"], row["submission_state"]) == ("failed", "not_found")
     assert row["kite_order_id"] is None
     assert len(env.kite.calls_to("place_order")) == 1
-    assert env.client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db)).status_code == 409  # not back to approval
+    assert env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid)).status_code == 409  # not back to approval
     events = _rows(env, "SELECT event_type, detail FROM ticket_events WHERE ticket_id = ? ORDER BY id", tid)
     assert events[-1]["event_type"] == "execution_failed" and "NOT placed" in events[-1]["detail"]
 
@@ -673,7 +675,7 @@ def test_p0_2_unknown_ticket_stays_non_actionable_while_searching(env, market_op
     for _ in range(3):
         _run_background_cycles(env)
         assert ticket_row(env.db, tid)["submission_state"] == "unknown"
-    assert env.client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db)).status_code == 409
+    assert env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid)).status_code == 409
     assert env.client.post(f"/api/tickets/{tid}/reject", json={"reason": "x"}).status_code == 409
     assert env.client.put(f"/api/tickets/{tid}", json=_manual_ticket()).status_code == 409
     assert env.client.delete(f"/api/tickets/{tid}").status_code == 409
@@ -702,7 +704,7 @@ def test_p0_2_ambiguous_tagged_orders_need_review(env, market_open, case):
     assert len(_urgent_updates(env)) == 1
     assert _event_types(env, tid).count("submission_unknown") == 1
     assert env.kite.calls_to("place_order") == [] and env.kite.calls_to("cancel_order") == []
-    assert env.client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db)).status_code == 409
+    assert env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid)).status_code == 409
 
 
 def _run_first_inside_update(monkeypatch, competitor):
@@ -734,7 +736,7 @@ def test_p0_2_race_monitor_adopts_before_request_records_unknown(env, market_ope
     env.kite.accept_then_raise("place_order", requests.ReadTimeout("timed out"))
     monitor = _run_first_inside_update(monkeypatch, lambda: _monitor(env))
 
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
 
     _precondition(monitor["result"]["updated"] >= 1, f"the monitor should have resolved first: {monitor}")
     assert r.status_code == 200
@@ -755,7 +757,7 @@ def test_p0_2_race_request_result_after_adoption_attaches_gtt_without_overwritin
     env.kite.auto_fill = False
     _run_first_inside_update(monkeypatch, lambda: _monitor(env))
 
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
 
     assert r.status_code == 200
     row = ticket_row(env.db, t["id"])
@@ -787,7 +789,7 @@ def test_p0_2_race_request_result_cannot_clear_needs_review(env, market_open, mo
         env.kite.accept_then_raise("place_order", requests.ReadTimeout("timed out"))
     monitor = _run_first_inside_update(monkeypatch, lambda: _monitor(env))
 
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
 
     _precondition(monitor["result"]["updated"] >= 1, f"the monitor should have resolved first: {monitor}")
     assert r.status_code == 200
@@ -1097,7 +1099,7 @@ def test_p0_3_unlinked_alert_action_sell_follows_global_mode(env, market_open):
     }).json()["data"]
     _precondition(created["closes_ticket_id"] is None and created["mode"] is None, f"unexpected link: {created}")
 
-    done = env.client.post(f"/api/tickets/{created['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    done = env.client.post(f"/api/tickets/{created['id']}/confirm", json=approval_body(env.db, created['id'])).json()["data"]
 
     assert done["mode"] == "dry_run" and _broker_calls(env) == []
 
@@ -1151,7 +1153,7 @@ def test_p0_3_stamped_mode_survives_global_toggles(env, market_open):
     _toggle_mode(env, "dry_run")
     dry = env.client.post("/api/tickets", json=_manual_ticket(
         symbol="INFY", entry_price=1500.0, stop_loss=1450.0, target_1=1650.0)).json()["data"]
-    dry = env.client.post(f"/api/tickets/{dry['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    dry = env.client.post(f"/api/tickets/{dry['id']}/confirm", json=approval_body(env.db, dry['id'])).json()["data"]
     _precondition(dry["mode"] == "dry_run" and dry["status"] == "executed", f"dry-run entry not simulated: {dry}")
     pending_exit = _strategy_exit_for(env, live_entry["id"])
 
@@ -1207,7 +1209,7 @@ def test_p0_4a_draft_ticket_cannot_be_confirmed(env, unsafe_client, market_open,
                   f"expected an unchecked draft, got {row['status']}/{row['risk_check_results']}")
 
     set_mode(env.db, "live")
-    r = unsafe_client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db))
+    r = unsafe_client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid))
     violations = []
     if r.status_code != 409:
         violations.append(f"confirm of an unchecked draft returned {r.status_code} "
@@ -1261,7 +1263,7 @@ def test_p0_4c_pending_entries_cannot_jointly_exceed_open_position_limit(env, un
                   "each ticket must pass risk checks on its own")
 
     set_mode(env.db, "live")
-    r1 = env.client.post(f"/api/tickets/{first['id']}/confirm", json=displayed_mode(env.db)).json()["data"]
+    r1 = env.client.post(f"/api/tickets/{first['id']}/confirm", json=approval_body(env.db, first['id'])).json()["data"]
     _precondition(r1["status"] == "executed", f"first entry not placed: {r1}")
 
     conn = env.db.get_connection()
@@ -1274,7 +1276,7 @@ def test_p0_4c_pending_entries_cannot_jointly_exceed_open_position_limit(env, un
     failing = [c.rule for c in now.checks if not c.passed]
     _precondition(failing == ["max_open_positions"], f"re-run checks should now fail open positions: {failing}")
 
-    r2 = unsafe_client.post(f"/api/tickets/{second['id']}/confirm", json=displayed_mode(env.db))
+    r2 = unsafe_client.post(f"/api/tickets/{second['id']}/confirm", json=approval_body(env.db, second['id']))
     orders = env.kite.calls_to("place_order")
     assert len(orders) == 1, (
         f"second entry confirmed (HTTP {r2.status_code}, status "
@@ -1336,13 +1338,13 @@ def _assert_revalidation_refused(env, r, ticket_id, failed_rules):
     assert [c["rule"] for c in json.loads(row["risk_check_results"]) if not c["passed"]] == failed_rules
     assert _event_types(env, ticket_id)[-2:] == ["confirmed", "risk_rejected"]
     assert "Passed creation-time risk checks but failed confirmation-time revalidation" in _details(env, ticket_id)[-1]
-    assert env.client.post(f"/api/tickets/{ticket_id}/confirm", json=displayed_mode(env.db)).status_code == 409
+    assert env.client.post(f"/api/tickets/{ticket_id}/confirm", json=approval_body(env.db, ticket_id)).status_code == 409
 
 
 def test_p0_4_revalidation_success_is_recorded_before_the_order(env, market_open):
     set_mode(env.db, "live")
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
-    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    r = env.client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
 
     assert r.status_code == 200 and r.json()["data"]["status"] == "executed"
     assert _event_types(env, t["id"])[-3:] == ["confirmed", "modified", "executed"]
@@ -1372,9 +1374,9 @@ def test_p0_4_concurrent_approval_counts_the_entry_still_in_flight(env, market_o
     env.kite.on_call("place_order", hold_inside_place_order)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
-            first = pool.submit(_call, tickets.confirm_ticket, a["id"], req=_displayed(env), kite=env.kite)
+            first = pool.submit(_call, tickets.confirm_ticket, a["id"], req=_displayed(env, a["id"]), kite=env.kite)
             assert entered.wait(timeout=10), "A never reached place_order"
-            r = env.client.post(f"/api/tickets/{b['id']}/confirm", json=displayed_mode(env.db))
+            r = env.client.post(f"/api/tickets/{b['id']}/confirm", json=approval_body(env.db, b['id']))
             release.set()
             first_result = first.result(timeout=10)
     finally:
@@ -1395,8 +1397,8 @@ def test_p0_4_total_portfolio_risk_revalidated_at_confirmation(env, market_open)
     _precondition(a["status"] == b["status"] == "pending_confirmation", "both tickets must pass on their own")
     set_mode(env.db, "live")
 
-    assert env.client.post(f"/api/tickets/{a['id']}/confirm", json=displayed_mode(env.db)).json()["data"]["status"] == "executed"
-    r = env.client.post(f"/api/tickets/{b['id']}/confirm", json=displayed_mode(env.db))
+    assert env.client.post(f"/api/tickets/{a['id']}/confirm", json=approval_body(env.db, a['id'])).json()["data"]["status"] == "executed"
+    r = env.client.post(f"/api/tickets/{b['id']}/confirm", json=approval_body(env.db, b['id']))
 
     _assert_revalidation_refused(env, r, b["id"], ["max_total_portfolio_risk_pct"])
     assert len(env.kite.calls_to("place_order")) == 1
@@ -1421,8 +1423,8 @@ def test_p0_4_exposure_revalidated_at_confirmation(env, market_open, limit):
     _precondition(a["status"] == b["status"] == "pending_confirmation", "both tickets must pass on their own")
     set_mode(env.db, "live")
 
-    assert env.client.post(f"/api/tickets/{a['id']}/confirm", json=displayed_mode(env.db)).json()["data"]["status"] == "executed"
-    r = env.client.post(f"/api/tickets/{b['id']}/confirm", json=displayed_mode(env.db))
+    assert env.client.post(f"/api/tickets/{a['id']}/confirm", json=approval_body(env.db, a['id'])).json()["data"]["status"] == "executed"
+    r = env.client.post(f"/api/tickets/{b['id']}/confirm", json=approval_body(env.db, b['id']))
 
     _assert_revalidation_refused(env, r, b["id"], [rule])
     assert len(env.kite.calls_to("place_order")) == 1
@@ -1435,7 +1437,7 @@ def test_p0_4_risk_unavailable_at_confirmation_fails_closed(env, unsafe_client, 
     t = env.client.post("/api/tickets", json=_manual_ticket()).json()["data"]
     env.kite.raise_on_next("holdings", exc)
 
-    r = unsafe_client.post(f"/api/tickets/{t['id']}/confirm", json=displayed_mode(env.db))
+    r = unsafe_client.post(f"/api/tickets/{t['id']}/confirm", json=approval_body(env.db, t['id']))
 
     assert r.status_code == 503, r.text
     detail = r.json()["detail"]
@@ -1665,7 +1667,7 @@ def test_p0_4_risk_check_cannot_resurrect_a_ticket_cancelled_mid_check(env, mark
     assert _event_types(env, tid) == ["created", "rejected", "modified"]
     assert "discarded" in _details(env, tid)[-1]
     set_mode(env.db, "live")
-    assert env.client.post(f"/api/tickets/{tid}/confirm", json=displayed_mode(env.db)).status_code == 409
+    assert env.client.post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid)).status_code == 409
     assert env.kite.calls_to("place_order") == []
 
 
