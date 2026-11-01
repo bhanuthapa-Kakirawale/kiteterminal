@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from kiteconnect import KiteConnect
 from kiteconnect.exceptions import KiteException, TokenException
 
-from backend import execution, paper_broker, system_events
+from backend import execution, live_arming, live_preflight, paper_broker, system_events
 from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
@@ -56,9 +56,18 @@ def get_mode(kite: KiteConnect = Depends(require_trading_account)):
 
 @router.post("/api/execution/mode")
 def set_mode(req: ExecutionModeRequest, kite: KiteConnect = Depends(require_trading_account)):
+    """SEC-1: arming LIVE requires a fresh, broker-checked Live Readiness
+    pass (read-only broker calls only). It may pass with the trading lock
+    still ON. Switching to dry run is never gated."""
     account = get_trading_account()
+    readiness = None
+    if req.mode == "live" and req.confirm_real_money and live_arming.needs_live_arming(account["id"]):
+        readiness = live_preflight.evaluate(broker=True, refresh=True)
     try:
-        mode = execution.set_execution_mode(req.mode, req.confirm_real_money, account_id=account["id"])
+        mode = live_arming.set_mode(req.mode, req.confirm_real_money, account["id"], readiness=readiness)
+    except live_arming.LiveReadinessNotMet as e:
+        raise HTTPException(status_code=409, detail={"error_code": live_arming.LIVE_READINESS_NOT_MET,
+                                                     "message": e.message, "blocking_codes": e.blocking_codes})
     except ValueError as e:
         raise HTTPException(status_code=400, detail={"error_code": "CONFIRMATION_REQUIRED", "message": str(e)})
     return {"data": {"mode": mode}}

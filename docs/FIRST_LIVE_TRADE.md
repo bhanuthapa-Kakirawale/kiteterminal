@@ -67,7 +67,12 @@ you. Every step below that changes something is yours to do deliberately.
 7. **Confirm the global mode is LIVE.** Turn on the **Live trading** toggle in
    the mode banner → read and accept the dialog (it repeats the static-IP
    requirement). The terminal never switches this for you. Switching mode does
-   not unlock trading.
+   not unlock trading. SEC-1: the switch itself re-runs Live Readiness with
+   its broker check and is **refused** (`LIVE_READINESS_NOT_MET`, naming the
+   blocking checks) unless it is READY or blocked only by the trading lock.
+   LIVE is armed for **this Kite session only**: every new Kite login, and
+   every logout, switches back to DRY RUN (open live positions keep their
+   exits and GTTs), so repeat this step after each daily login.
 
 8. **Keep the trading lock ON** while you prepare the ticket.
 

@@ -201,6 +201,38 @@ test pins the fields the PK-14/15 exposure maths reads to it. The `/ws/ticks`
 handler is tested to end when a tab closes while no tick flows (the shutdown
 hang LIVE-0 fixed).
 
+**SEC-1 — live-trading safety gates** (`tests/test_live_critical_gate.py`,
+`tests/test_live_arming.py`, plus the tightened `tests/test_csrf_protection.py`
+/ `tests/test_security_hardening.py`). Covered:
+- A write or WebSocket handshake with neither Origin nor Referer is refused
+  on every mutating route, the static header notwithstanding (as are empty
+  and `null` Origins).
+- The confirm-time critical-state gate refuses a live entry before any
+  broker call, for each degraded state: reconciliation never ran / stale /
+  stamped in the future / GTT book or holdings unreadable / checks failed;
+  each `CRITICAL_ISSUES` code and a NULL-coded finding; paper/live id mix;
+  each critical worker dead / stalled / failing; uncovered calendar.
+- The final gate catches a finding that appears after the claim, and the
+  claim is withdrawn.
+- Dry run is not gated. Emergency Exit, a linked exit, an alert-action sell
+  and a switch to dry run all work with everything degraded at once.
+- Mark-reviewed requires a reason and logs it.
+- Arming LIVE runs a real broker-checked readiness evaluation (no stub),
+  refuses each blocking code and changes nothing, and allows the trading
+  lock to stay ON.
+- A login or logout disarms LIVE, and an entry armed for an earlier session
+  is refused.
+- An AST test keeps the pre-SEC-1 setter `execution.set_execution_mode`
+  uncalled. `backend/execution.py` is left byte-identical, because its hash
+  is part of the PK-25 research freeze.
+
+Fixtures: the `env` fixture now also seeds a healthy, just-reconciled
+process (`seed_healthy_live_state`: workers alive and fresh, a complete
+reconciliation cycle); `clear_healthy_live_state` gives a fresh process.
+`set_mode(db, "live")` stamps the live arming for the seeded session.
+`make_live_ready(env)` builds the state in which a real Live Readiness
+evaluation passes, for tests that switch to LIVE through the API.
+
 ### 1.5 Known coverage gaps
 
 These are not currently exercised by automated tests — treat them as a

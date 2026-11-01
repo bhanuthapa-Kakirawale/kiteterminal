@@ -916,7 +916,11 @@ def _strategy_exit_for(env, buy_id) -> int:
 
 
 def _toggle_mode(env, mode):
-    """Flips the global switch the way the UI does."""
+    """Flips the global switch the way the UI does. SEC-1: arming LIVE needs
+    a passing, broker-checked Live Readiness (real, not stubbed)."""
+    if mode == "live":
+        from conftest import make_live_ready
+        make_live_ready(env)
     r = env.client.post("/api/execution/mode", json={"mode": mode, "confirm_real_money": mode == "live"})
     _precondition(r.status_code == 200 and r.json()["data"]["mode"] == mode, f"mode toggle failed: {r.text}")
 

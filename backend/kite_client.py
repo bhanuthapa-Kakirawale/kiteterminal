@@ -83,7 +83,12 @@ def exchange_request_token(request_token: str, account_id: int | None = None) ->
     login_time = datetime.now(IST).isoformat()
 
     conn = get_connection()
+    disarmed = False
     try:
+        # SEC-1: a new broker session is not the one Live Readiness checked:
+        # LIVE goes back to dry run in the same transaction (live_arming.disarm_live).
+        from backend import live_arming
+        disarmed = live_arming.disarm_live(conn, account["id"], "a new Kite login replaced the broker session")
         conn.execute(
             "UPDATE sessions SET is_active = 0 WHERE is_active = 1 AND account_id = ?",
             (account["id"],),
@@ -110,6 +115,9 @@ def exchange_request_token(request_token: str, account_id: int | None = None) ->
         conn.commit()
     finally:
         conn.close()
+    if disarmed:
+        from backend import live_arming
+        live_arming.broadcast_mode_reset()
 
     return data
 

@@ -4,7 +4,7 @@ import logging
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse
 
-from backend import automation, data_jobs, instruments, kite_client, sector_mapping, workers
+from backend import automation, data_jobs, instruments, kite_client, live_arming, sector_mapping, workers
 from backend.accounts import get_default_account
 from backend.db import get_connection
 from backend.ticker import collect_instrument_tokens, ticker_manager
@@ -81,6 +81,8 @@ def logout():
     account = get_default_account()
     conn = get_connection()
     try:
+        # SEC-1: no session, nothing armed: LIVE goes back to dry run.
+        disarmed = live_arming.disarm_live(conn, account["id"], "logged out of Kite")
         conn.execute(
             "UPDATE sessions SET is_active = 0 WHERE is_active = 1 AND account_id = ?", (account["id"],)
         )
@@ -88,5 +90,7 @@ def logout():
         conn.commit()
     finally:
         conn.close()
+    if disarmed:
+        live_arming.broadcast_mode_reset()
     ticker_manager.stop()
     return {"success": True}

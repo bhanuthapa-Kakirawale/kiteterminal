@@ -10,6 +10,30 @@ run it, and what each one requires.
 opening port 8000 on a VM's public IP), with or without TLS. That setup would
 need real authentication, which the terminal does not have.
 
+## What the app's request checks do not stop
+
+The Host and Origin checks protect against **web pages**: a foreign site, a
+DNS-rebinding page, or another local web app on a different port. They are
+not authentication:
+- Any **non-browser process on this machine** can reach the loopback port and
+  forge `Host`, `Origin` and `X-Kite-Terminal` headers. On a shared machine
+  this includes processes of other Windows users, WSL, and containers with
+  host networking.
+- Malware running as **your own Windows user** can additionally read the
+  database, `.env` (the encryption key and the Kite secrets) and the
+  browser's storage, and can drive the browser. No in-app control stops it.
+
+The defences that still hold are Kite-side and server-side:
+- the static-IP whitelist;
+- the per-order notional cap and the daily loss limit, enforced at
+  confirmation;
+- the trading lock;
+- the live-arming and live-state gates (SEC-1).
+
+Keep the machine itself clean. A per-launch session credential (planned,
+SEC-1 P1-F) would close the "other local process" gap, but not the
+same-user one.
+
 ## What the app enforces (PK-18)
 
 | Protection | Behaviour |

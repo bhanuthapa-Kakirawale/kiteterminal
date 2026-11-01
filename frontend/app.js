@@ -3817,7 +3817,11 @@ el.liveModeConfirmBtn.addEventListener("click", async () => {
     toast("LIVE trading enabled — approvals now place real orders.", { type: "warning" });
   } catch (e) {
     el.modeToggleCheckbox.checked = false;
-    toast(e.message, { type: "error" });
+    // SEC-1: LIVE is armed only after Live Readiness passes with its broker
+    // check; a new Kite login disarms it again.
+    toast(e.message, e.errorCode === "LIVE_READINESS_NOT_MET"
+      ? { type: "error", title: "LIVE not enabled — see Live Readiness", timeout: 0 }
+      : { type: "error" });
   }
   state.ownModeSwitch = null;
   renderModeBanner();

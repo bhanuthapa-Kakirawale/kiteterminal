@@ -704,14 +704,23 @@ def _static_ip_checks(conn: sqlite3.Connection, account_id: int, now: datetime) 
 
 def _mode_and_lock_checks(conn: sqlite3.Connection, account_id: int) -> list[dict]:
     out = []
+    from backend import live_arming
     mode = conn.execute("SELECT mode FROM execution_settings WHERE id = 1").fetchone()["mode"]
-    if mode == "live":
-        out.append(_check("EXECUTION_MODE", "trading_lock", PASS, "Global execution mode is LIVE.", False,
-                          detail={"mode": mode}))
+    if mode == "live" and live_arming.live_armed_for_active_session(conn, account_id):
+        out.append(_check("EXECUTION_MODE", "trading_lock", PASS,
+                          "Global execution mode is LIVE, armed for the current Kite session.", False,
+                          detail={"mode": mode, "armed": True}))
+    elif mode == "live":
+        out.append(_check("EXECUTION_MODE", "trading_lock", USER_ACTION,
+                          "Global execution mode is LIVE but not armed for the current Kite session: live new "
+                          "entries are refused. Switch to DRY RUN and back to LIVE once this page passes.", False,
+                          detail={"mode": mode, "armed": False}))
     else:
         out.append(_check("EXECUTION_MODE", "trading_lock", USER_ACTION,
                           "Global execution mode is DRY RUN. The pre-flight never switches it: switch to LIVE "
-                          "deliberately, and only for the first controlled trade.", False, detail={"mode": mode}))
+                          "deliberately, and only for the first controlled trade. Switching needs this page to "
+                          "pass with its broker check (the trading lock may stay ON), and every new Kite login "
+                          "switches back to DRY RUN.", False, detail={"mode": mode}))
     state = conn.execute("SELECT * FROM account_safety_state WHERE account_id = ?", (account_id,)).fetchone()
     if state is not None and state["trading_locked"]:
         out.append(_check("TRADING_LOCK", "trading_lock", USER_ACTION,

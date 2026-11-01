@@ -259,6 +259,8 @@ def test_emergency_exit(env):
 
 
 def test_execution_mode_switch(env):
+    from conftest import make_live_ready
+    make_live_ready(env)   # SEC-1: arming LIVE needs a passing, broker-checked Live Readiness
     c = env.client
     assert c.post("/api/execution/mode", json={"mode": "live", "confirm_real_money": False}).status_code == 400
     assert c.post("/api/execution/mode", json={"mode": "live", "confirm_real_money": True}).json()["data"]["mode"] == "live"

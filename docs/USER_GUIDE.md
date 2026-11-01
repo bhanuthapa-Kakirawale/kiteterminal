@@ -100,6 +100,23 @@ A persistent banner also shows your current mode with two safety buttons
   by an outbound-IP check), and no earlier live order has an unknown outcome.
   Exits are never blocked by this. Before the first live trade, run **Live
   Readiness** and follow [FIRST_LIVE_TRADE.md](FIRST_LIVE_TRADE.md).
+- Since SEC-1, three more live controls apply:
+  - **Arming.** Switching to Live re-runs Live Readiness with its broker
+    check and is refused unless it passes. The trading lock may stay ON while
+    you switch. Live is armed for the current Kite session only: each new
+    Kite login, and each logout, switches back to Dry Run, so switch again
+    after logging in. Your open live positions keep their exits and GTTs.
+  - **Live state at every approval.** Every live new entry is also refused
+    at approval while the terminal's view of the broker cannot be trusted:
+    reconciliation has not run recently or did not complete, or the order
+    monitor, trailing or reconciliation loop is not healthy
+    (`LIVE_STATE_UNVERIFIED`). It is also refused while a critical
+    reconciliation finding is unresolved (`RECONCILIATION_CRITICAL`).
+  - **Reviewing a finding.** Marking a finding reviewed now asks what you
+    checked in Kite, and the answer is logged.
+
+  Exits, Emergency Exit and switching to Dry Run are never blocked by these
+  controls.
 
 Your **Journal** (§8) tracks Dry Run and Live results completely
 separately, so paper-trading history never mixes with real results.

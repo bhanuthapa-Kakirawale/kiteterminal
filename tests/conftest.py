@@ -139,6 +139,27 @@ def clear_healthy_live_state(monkeypatch) -> None:
     monkeypatch.setattr(reconciliation, "last_cycle", {})
 
 
+def make_live_ready(env) -> None:
+    """SEC-1: the state in which a REAL broker-checked Live Readiness
+    evaluation passes (no stub): the stored session token, today's login,
+    and fresh strategy history for one watched symbol. Together with the
+    healthy process state env seeds, POST /api/execution/mode can arm LIVE.
+    Used by tests that switch to live through the API without testing
+    readiness itself."""
+    from backend import crypto, diagnostics, live_preflight, trading_calendar
+    conn = env.db.get_connection()
+    try:
+        conn.execute("UPDATE accounts SET access_token_enc = ?", (crypto.encrypt("fake-access-token"),))
+        conn.execute("UPDATE sessions SET login_time = ?", (datetime.now(IST).isoformat(),))
+        conn.commit()
+    finally:
+        conn.close()
+    seed_ohlc(env.db, 2953217, "TCS", make_candles(trading_calendar.latest_completed_session(), 60, 3000.0))
+    add_watch(env.db, "TCS", 2953217)
+    diagnostics.reset_cache()
+    live_preflight.reset_cache()
+
+
 def add_watch(db, symbol: str, instrument_token: int) -> None:
     conn = db.get_connection()
     try:
@@ -247,9 +268,16 @@ def account_id(db) -> int:
 
 
 def set_mode(db, mode: str) -> None:
+    """Puts the global mode straight into the database. SEC-1: live is
+    stamped as armed for the active session, the state a successful
+    readiness-gated switch leaves; tests of arming itself go through
+    POST /api/execution/mode."""
     conn = db.get_connection()
     try:
-        conn.execute("UPDATE execution_settings SET mode = ? WHERE id = 1", (mode,))
+        conn.execute(
+            "UPDATE execution_settings SET mode = ?, live_armed_session_id = CASE WHEN ? = 'live' THEN "
+            "(SELECT id FROM sessions WHERE is_active = 1 ORDER BY id DESC LIMIT 1) END WHERE id = 1",
+            (mode, mode))
         conn.commit()
     finally:
         conn.close()
@@ -277,5 +305,5 @@ def ticket_row(db, ticket_id: int) -> dict:
 
 __all__ = ["FakeKite", "make_candles", "seed_ohlc", "add_watch", "account_id", "set_mode", "displayed_mode", "ticket_row",
            "as_pre_pk22_database", "seed_live_prerequisites", "clear_live_prerequisites", "TEST_STATIC_IP",
-           "seed_healthy_live_state", "clear_healthy_live_state",
+           "seed_healthy_live_state", "clear_healthy_live_state", "make_live_ready",
            "last_weekday", "IST", "TERMINAL_ORIGIN", "TERMINAL_HEADERS", "terminal_client"]

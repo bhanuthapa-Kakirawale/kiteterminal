@@ -159,6 +159,8 @@ def test_dry_run_position_exit_ignores_expected_mode_and_global_mode(env, market
 # ---------------------------------------------------------------- 6. broadcast
 
 def test_mode_switch_broadcasts_mode_changed(env):
+    from conftest import make_live_ready
+    make_live_ready(env)   # SEC-1: arming LIVE needs a passing, broker-checked Live Readiness
     set_mode(env.db, "dry_run")
 
     assert env.client.post("/api/execution/mode", json={"mode": "live", "confirm_real_money": True}).status_code == 200
@@ -180,6 +182,8 @@ def test_refused_live_switch_broadcasts_nothing(env):
 # ---------------------------------------------------------------- 7. stale tab
 
 def test_stale_tab_cannot_approve_live_while_showing_dry_run(env, market_open):
+    from conftest import make_live_ready
+    make_live_ready(env)   # SEC-1: arming LIVE needs a passing, broker-checked Live Readiness
     set_mode(env.db, "dry_run")
     tid = _entry(env)
     tab_a_shows = env.client.get("/api/execution/mode").json()["data"]["mode"]  # tab A loads: DRY RUN

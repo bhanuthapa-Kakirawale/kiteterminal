@@ -19,6 +19,7 @@ Controls (one small function each):
   12H  market hours / AMO      decide_variety            live
   L0   live prerequisites      check_live_prerequisites  live (LIVE-0: notional + ₹ loss set,
                                                           static IP confirmed, no UNKNOWN order)
+  S0   live armed for session  check_live_armed          live (SEC-1: login/logout disarms)
   S1   live critical state     check_live_critical_state live (SEC-1: reconciliation fresh and
                                                           complete, no critical finding, critical
                                                           workers healthy, paper/live isolated,
@@ -72,6 +73,7 @@ AMO_DISABLED = "AMO_DISABLED"
 ACCOUNT_SAFETY_UNAVAILABLE = "ACCOUNT_SAFETY_UNAVAILABLE"
 LIVE_PREREQUISITE_MISSING = "LIVE_PREREQUISITE_MISSING"
 LIVE_STATE_UNVERIFIED = "LIVE_STATE_UNVERIFIED"
+LIVE_NOT_ARMED_FOR_SESSION = "LIVE_NOT_ARMED_FOR_SESSION"
 RECONCILIATION_CRITICAL = "RECONCILIATION_CRITICAL"
 
 VARIETY_REGULAR = "regular"
@@ -461,6 +463,25 @@ def check_live_prerequisites(conn: sqlite3.Connection, account_id: int, settings
                          + ". See Live Readiness. Nothing was executed; exits are still allowed.")
 
 
+def check_live_armed(conn: sqlite3.Connection, account_id: int) -> SafetyFailure | None:
+    """SEC-1 backstop: LIVE is armed for one broker session (live_arming.
+    set_mode, after Live Readiness passed). A login or logout
+    disarms it; should any path have skipped that, a live new entry is still
+    refused while the armed session is not the active one."""
+    try:
+        from backend import live_arming
+        if live_arming.live_armed_for_active_session(conn, account_id):
+            return None
+    except Exception as e:
+        return SafetyFailure(LIVE_STATE_UNVERIFIED, f"Whether LIVE is armed for this session could not be read "
+                                                    f"({type(e).__name__}: {e}) — no new live entry is sent.",
+                             http_status=503)
+    return SafetyFailure(LIVE_NOT_ARMED_FOR_SESSION,
+                         "LIVE mode is not armed for the current Kite session (a new login resets it): switch to "
+                         "LIVE again once Live Readiness passes with its broker check. Nothing was executed; exits "
+                         "are still allowed.")
+
+
 def check_live_critical_state(conn: sqlite3.Connection, account_id: int, now: datetime) -> list[SafetyFailure]:
     """SEC-1: the live state a NEW entry's safety rests on, re-evaluated at
     confirmation and not just when the Live Readiness page is displayed:
@@ -584,6 +605,7 @@ def precheck(conn: sqlite3.Connection, account_id: int, ticket: sqlite3.Row, mod
     decision.add(check_trading_lock(state))
     live = mode == "live"
     if live:
+        decision.add(check_live_armed(conn, account_id))
         decision.add(check_live_prerequisites(conn, account_id, settings, now))
         for failure in check_live_critical_state(conn, account_id, now):
             decision.add(failure)
@@ -618,6 +640,7 @@ def final_gate(conn: sqlite3.Connection, account_id: int, ticket: sqlite3.Row, k
         return decision
     settings = risk_engine.get_settings(conn, account_id)
     decision.add(check_breaker(state))
+    decision.add(check_live_armed(conn, account_id))
     decision.add(check_daily_loss(conn, account_id, settings, now, portfolio_value))
     # SEC-1: re-evaluated here as well: reconciliation can raise a critical
     # finding, or a worker can stall, between the pre-check and this point.
