@@ -33,6 +33,17 @@ step, and writes `e2e_results.json` with pass/fail results.
 
 ### 1.3 Test infrastructure
 
+- **Real account data is off limits.** `tests/real_data_guard.py`, installed
+  by `conftest.py` before any test runs, refuses (with an audit hook) every
+  `open`, `sqlite3.connect` and `shutil.copyfile` of `backend/kite_terminal.db*`:
+  the real database, its WAL/SHM files and every backup. The hook fires before
+  the file is opened, and `tests/test_real_data_guard.py` proves every channel
+  against a decoy file. An audit hook cannot see a child process, so a static
+  check also keeps every test source from naming the real backup. Migration
+  compatibility with pre-PK-22 databases is tested on a synthetic database
+  built from `tests/fixtures/pre_pk22_schema.sql`: the exact DDL that the
+  pre-PK-22 code (commit `6446c79`) produced, captured from an empty temporary
+  database. It never uses the developer's local backup.
 - **`tests/conftest.py`** — the `env` fixture spins up a fresh throwaway
   SQLite database per test, a fresh encryption key, 5 seeded instruments, an
   active session, and monkeypatches `kite_client.get_kite` to return a

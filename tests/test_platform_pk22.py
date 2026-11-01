@@ -11,7 +11,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import shutil
 import sqlite3
 import threading
 import time
@@ -335,35 +334,195 @@ def test_an_old_database_migrates_forward_keeping_its_rows(tmp_path, monkeypatch
     assert len(list(tmp_path.glob(f"legacy.db.pre_schema_v{db.LATEST_SCHEMA_VERSION}_bak*"))) == 1
 
 
-BACKUP = REPO / "backend" / "kite_terminal.db.pre_pk22_bak"
+# Audit P2-13, without real account data. This test used to copy the
+# developer's local pre-PK-22 backup of the real database. It now builds a
+# synthetic pre-PK-22 database from tests/fixtures/pre_pk22_schema.sql: the
+# exact DDL that the last pre-PK-22 code (commit 6446c79) produced, captured
+# from that code on an empty temporary database (see the fixture header).
+# It is filled with representative rows of every kind a pre-PK-22 install
+# held. The real backup is never read: tests/real_data_guard.py refuses any
+# access to it, suite-wide.
+PRE_PK22_SCHEMA = REPO / "tests" / "fixtures" / "pre_pk22_schema.sql"
+
+# The rows the startup invariants may ADD to a pre-PK-22 database: seeds
+# for panels and strategies that did not exist yet. Pre-existing rows are
+# never changed or removed (asserted below).
+_SEEDED_BY_STARTUP = {"dashboard_panels", "strategy_configs", "strategy_config_versions"}
 
 
-@pytest.mark.skipif(not BACKUP.exists(), reason="no local pre-PK-22 backup of the real database")
-def test_a_copy_of_the_real_pre_pk22_backup_migrates(tmp_path, monkeypatch):
-    """Audit P2-13: the migrations run against a COPY of the real database
-    (never the live file); every pre-existing trade ticket is kept."""
-    from cryptography.fernet import Fernet
-    from backend import crypto, db
-    copy = tmp_path / "real_copy.db"
-    shutil.copyfile(BACKUP, copy)
-    monkeypatch.setenv("KITE_TERMINAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
-    monkeypatch.setattr(crypto, "ENV_PATH", tmp_path / ".env")
-    monkeypatch.setattr(db, "DB_PATH", copy)
-    before = sqlite3.connect(copy)
-    tickets_before = before.execute("SELECT id, symbol, quantity, status FROM trade_tickets ORDER BY id").fetchall()
-    ohlc_before = before.execute("SELECT COUNT(*) FROM ohlc_daily").fetchone()[0]
-    before.close()
-    db.init_db()
-    db.init_db()
-    after = sqlite3.connect(copy)
+def _seed_pre_pk22_rows(conn, crypto) -> None:
+    """Representative pre-PK-22 data (synthetic; placeholder identifiers)."""
+    def ticket(**fields):
+        base = dict(account_id=1, source="manual", symbol="TCS", exchange="NSE", instrument_token=2953217,
+                    transaction_type="BUY", quantity=5, entry_price=3000.0, entry_order_type="LIMIT",
+                    stop_loss=2900.0, target_1=3300.0, product_type="CNC", rationale="synthetic pre-PK-22",
+                    status="pending_confirmation")
+        base.update(fields)
+        conn.execute(f"INSERT INTO trade_tickets ({', '.join(base)}) VALUES ({', '.join('?' * len(base))})",
+                     tuple(base.values()))
+
+    conn.execute("INSERT INTO accounts (id, label, api_key, api_secret_enc, access_token_enc, account_type, "
+                 "is_default) VALUES (1, 'Primary', 'synthetic_key', ?, ?, 'trading', 1)",
+                 (crypto.encrypt("synthetic_secret"), crypto.encrypt("synthetic-access-token")))
+    conn.execute("INSERT INTO sessions (access_token, user_id, user_name, login_time, account_id) "
+                 "VALUES ('', 'XX0000', 'Synthetic Trader', '2026-09-25T09:00:00+05:30', 1)")
+    conn.execute("INSERT INTO execution_settings (id, mode) VALUES (1, 'live')")
+    conn.execute("INSERT INTO risk_settings (account_id, max_order_notional, max_daily_loss_amount, "
+                 "max_new_entries_per_day) VALUES (1, 50000, 2000, 2)")
+    conn.execute("INSERT INTO account_safety_state (account_id, trading_locked, trading_locked_at, "
+                 "trading_lock_reason) VALUES (1, 1, '2026-09-25 04:00:00', 'pre-PK-22 lock')")
+    # 1: an OPEN live position (filled, protected); 2+3: a CLOSED live round
+    # trip; 4: a dry-run paper fill; 5: approvable; 6: risk-rejected;
+    # 7: an alert-action sell; 8: a live order with an UNKNOWN outcome.
+    ticket(id=1, source="strategy", strategy_name="momentum_breakout", status="executed", mode="live",
+           kite_order_id="O-OPEN", kite_gtt_id=9001, executed_at="2026-09-24 04:00:00", order_tag="kt1xpre",
+           submission_state="acknowledged", entry_fill_status="filled", filled_price=3001.5,
+           filled_at="2026-09-24 04:00:05", filled_quantity=5, current_stop_loss=2900.0, signal_date="2026-09-23")
+    ticket(id=2, symbol="INFY", instrument_token=408065, quantity=7, entry_price=1500.0, stop_loss=1400.0,
+           target_1=1700.0, status="executed", mode="live", kite_order_id="O-INFY", executed_at="2026-09-22 04:00:00",
+           entry_fill_status="filled", filled_price=1500.0, filled_quantity=7, closed_at="2026-09-24 05:00:00")
+    ticket(id=3, source="strategy", strategy_name="momentum_breakout_exit", symbol="INFY", instrument_token=408065,
+           transaction_type="SELL", quantity=7, entry_price=1600.0, entry_order_type="MARKET", stop_loss=1400.0,
+           target_1=1700.0, status="executed", mode="live", kite_order_id="O-INFY-X", closes_ticket_id=2,
+           executed_at="2026-09-24 04:59:00", entry_fill_status="filled", filled_price=1600.0, filled_quantity=7)
+    ticket(id=4, symbol="RELIANCE", instrument_token=738561, quantity=10, entry_price=1300.0, stop_loss=1250.0,
+           target_1=1450.0, status="executed", mode="dry_run", kite_order_id="PAPER-O-1", kite_gtt_id=None,
+           entry_fill_status="filled", filled_price=1300.65, filled_quantity=10, executed_at="2026-09-23 04:00:00")
+    ticket(id=5, symbol="SUNPHARMA", instrument_token=857857, entry_price=1700.0, stop_loss=1650.0, target_1=1900.0,
+           risk_check_results='[{"rule": "max_open_positions", "passed": true}]')
+    ticket(id=6, status="risk_rejected", risk_check_results='[{"rule": "max_open_positions", "passed": false}]')
+    ticket(id=7, source="alert_action", symbol="RELIANCE", instrument_token=738561, transaction_type="SELL",
+           quantity=3, entry_price=1290.0, entry_order_type="MARKET", stop_loss=1250.0, target_1=1290.0,
+           status="rejected")
+    ticket(id=8, status="confirmed", mode="live", order_tag="kt8xpre", submission_state="unknown",
+           submitted_at="2026-09-25 04:10:00")
+    for tid, event, detail in ((1, "executed", "order_id=O-OPEN"), (3, "executed", "exit filled"),
+                               (6, "risk_rejected", "max_open_positions"), (8, "submission_unknown", "timeout")):
+        conn.execute("INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, ?, ?)", (tid, event, detail))
+    conn.execute(
+        "INSERT INTO closed_trades (buy_ticket_id, sell_ticket_id, account_id, symbol, strategy_name, source, mode, "
+        "entry_price, exit_price, quantity, realized_pnl, realized_pnl_pct, entry_date, exit_date, "
+        "holding_period_calendar_days, holding_period_trading_days, exit_reason) VALUES (2, 3, 1, 'INFY', NULL, "
+        "'manual', 'live', 1500, 1600, 7, 700, 6.67, '2026-09-22', '2026-09-24', 2, 2, 'manual')")
+    for event, detail in (("mode_switched", "dry_run -> live"), ("account_safety_refusal", "TRADING_LOCKED"),
+                          ("trading_locked", "pre-PK-22 lock")):
+        conn.execute("INSERT INTO system_events (account_id, event_type, detail) VALUES (1, ?, ?)", (event, detail))
+    conn.execute("INSERT INTO reconciliation_log (check_type, expected, actual, detail, issue_code, severity, symbol, "
+                 "expected_quantity, broker_quantity) VALUES ('position_state', '5 shares', '3 shares', 'shortfall', "
+                 "'BROKER_POSITION_SHORTFALL', 'urgent', 'TCS', 5, 3)")
+    conn.execute("INSERT INTO reconciliation_log (ticket_id, check_type, expected, actual, detail, resolved) "
+                 "VALUES (1, 'order_status', 'COMPLETE', 'COMPLETE', 'reviewed earlier', 1)")
+    conn.execute("INSERT INTO broker_failure_log (account_id, source, detail) VALUES (1, 'order_submission', 'timeout')")
+    conn.execute("INSERT INTO paper_orders (paper_order_id, account_id, ticket_id, tag, variety, exchange, "
+                 "tradingsymbol, transaction_type, product, order_type, quantity, filled_quantity, pending_quantity, "
+                 "price, average_price, status, session_date) VALUES ('PAPER-O-1', 1, 4, 'kt4xpre', 'regular', "
+                 "'NSE', 'RELIANCE', 'BUY', 'CNC', 'LIMIT', 10, 10, 0, 1300, 1300.65, 'COMPLETE', '2026-09-23')")
+    conn.execute("INSERT INTO dashboard_panels (account_id, panel_type, display_order) VALUES (1, 'holdings_table', 0)")
+    conn.execute("INSERT INTO dashboard_panels (account_id, panel_type, display_order, visible) "
+                 "VALUES (1, 'positions_table', 1, 0)")
+    conn.execute("INSERT INTO strategy_configs (account_id, strategy_name, enabled, params) "
+                 "VALUES (1, 'momentum_breakout', 1, '{\"lookback\": 20}')")
+    for symbol, token in (("TCS", 2953217), ("INFY", 408065)):
+        conn.execute("INSERT INTO watchlist (account_id, symbol, instrument_token, tag) VALUES (1, ?, ?, 'core')",
+                     (symbol, token))
+    for symbol, token, split in (("TCS", 2953217, False), ("INFY", 408065, True)):
+        for i, c in enumerate(make_candles(PIN_SESSION, 40, 1000.0)):
+            factor = 0.5 if split and i >= 20 else 1.0  # INFY: a 1:2 split, never back-adjusted
+            conn.execute("INSERT INTO ohlc_daily (instrument_token, symbol, date, open, high, low, close, volume) "
+                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                         (token, symbol, c["date"].strftime("%Y-%m-%d"), c["open"] * factor, c["high"] * factor,
+                          c["low"] * factor, c["close"] * factor, c["volume"]))
+
+
+def _snapshot(path) -> dict:
+    """{table: (columns, rows keyed by rowid)} for every table."""
+    conn = sqlite3.connect(path)
     try:
-        assert [r[0] for r in after.execute("SELECT version FROM schema_version")] == [v for v, _, _ in db.MIGRATIONS]
-        assert after.execute("SELECT id, symbol, quantity, status FROM trade_tickets ORDER BY id").fetchall() == \
-            tickets_before
-        assert after.execute("SELECT COUNT(*) FROM ohlc_daily").fetchone()[0] == ohlc_before
-        assert after.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        out = {}
+        for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+            columns = [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')]
+            select = ", ".join(f'"{c}"' for c in columns)
+            out[table] = (columns, {r[0]: r[1:] for r in conn.execute(f'SELECT rowid, {select} FROM "{table}"')})
+        return out
     finally:
-        after.close()
+        conn.close()
+
+
+def test_a_synthetic_pre_pk22_database_migrates_keeping_every_row(tmp_path, monkeypatch):
+    from cryptography.fernet import Fernet
+    from backend import crypto, db, lifecycle, live_preflight, live_arming, risk_engine
+    monkeypatch.setenv("KITE_TERMINAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("KITE_API_KEY", "synthetic_key")
+    monkeypatch.setenv("KITE_API_SECRET", "synthetic_secret")
+    monkeypatch.setattr(crypto, "ENV_PATH", tmp_path / ".env")
+    path = tmp_path / "pre_pk22.db"
+    monkeypatch.setattr(db, "DB_PATH", path)
+    conn = sqlite3.connect(path)
+    conn.executescript(PRE_PK22_SCHEMA.read_text(encoding="utf-8"))
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'schema_version'").fetchone()[0] == 0
+    _seed_pre_pk22_rows(conn, crypto)
+    conn.commit()
+    conn.close()
+    before = _snapshot(path)
+
+    db.init_db()
+    db.init_db()  # a second start changes nothing
+    assert db.last_init["applied_migrations"] == [] and db.last_init["startup_row_changes"] == 0
+    after = _snapshot(path)
+
+    # Every pre-existing table survives with every pre-existing row unchanged
+    # in its original columns. Only the startup seeds may add rows.
+    for table, (columns, rows) in before.items():
+        assert table in after, f"table {table} disappeared"
+        new_columns, new_rows = after[table]
+        index = [new_columns.index(c) for c in columns]
+        kept = {rowid: tuple(row[i] for i in index) for rowid, row in new_rows.items() if rowid in rows}
+        assert kept == rows, f"{table}: pre-existing rows changed or were lost"
+        if table not in _SEEDED_BY_STARTUP:
+            assert set(new_rows) == set(rows), f"{table}: unexpected rows added by the migration"
+    assert len(before["trade_tickets"][1]) == 8 and len(before["ohlc_daily"][1]) == 80
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        assert [r[0] for r in conn.execute("SELECT version FROM schema_version")] == [v for v, _, _ in db.MIGRATIONS]
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        assert "idx_dashboard_panels_account_type" not in names                   # v2
+        assert "idx_dashboard_panels_account_screen_type" in names
+        assert {"idx_trade_tickets_closes_ticket", "idx_trade_tickets_account_mode_status",
+                "idx_trade_tickets_kite_order", "idx_trade_tickets_kite_gtt"} <= names    # v3
+        statuses = {r["symbol"]: (r["status"], r["bar_count"]) for r in conn.execute(
+            "SELECT symbol, status, bar_count FROM ohlc_history_status")}            # v4
+        assert statuses["INFY"] == ("SUSPECT", 40) and statuses["TCS"][1] == 40
+        assert conn.execute("SELECT COUNT(*) FROM live_readiness").fetchone()[0] == 0   # v5: no IP is assumed
+        settings = conn.execute("SELECT mode, live_armed_session_id FROM execution_settings").fetchone()
+        assert (settings["mode"], settings["live_armed_session_id"]) == ("live", None)  # v6: never armed by a migration
+        sql = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'system_events'").fetchone()[0]
+        assert "'reconciliation_reviewed'" in sql and "'live_switch_refused'" in sql
+        assert crypto.decrypt(conn.execute("SELECT access_token_enc FROM accounts").fetchone()[0]) == \
+            "synthetic-access-token"
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        conn.close()
+
+    # The data still MEANS the same to the running app.
+    conn = db.get_connection()
+    try:
+        assert [p["id"] for p in risk_engine.list_open_positions(conn, 1)] == [1]   # 2 closed, 4 is dry run
+        ctx = lifecycle.build_context(conn, 1)
+        assert lifecycle.derive(ctx.tickets[1], ctx)["lifecycle_state"] == lifecycle.OPEN
+        assert lifecycle.derive(ctx.tickets[2], ctx)["lifecycle_state"] == lifecycle.CLOSED
+        assert [u["id"] for u in live_preflight.unresolved_live_submissions(conn, 1)] == [8]
+        assert live_preflight._critical_findings_check(conn)["status"] == live_preflight.FAIL   # still blocks live
+        assert not live_arming.live_armed_for_active_session(conn, 1)
+        assert conn.execute("SELECT trading_locked FROM account_safety_state").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+    # The automatic pre-migration backup is the database exactly as it was.
+    [backup] = tmp_path.glob(f"pre_pk22.db.pre_schema_v{db.LATEST_SCHEMA_VERSION}_bak*")
+    assert _snapshot(backup) == before
 
 
 # ============================================================ PK-22B indexes / idempotency

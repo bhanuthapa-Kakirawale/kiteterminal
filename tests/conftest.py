@@ -11,6 +11,11 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fake_kite import FakeKite, make_candles  # noqa: E402
+import real_data_guard  # noqa: E402
+
+# Before any test runs: nothing in the suite may open, connect to, copy or
+# pass on the real account database or its backups (tests/real_data_guard.py).
+real_data_guard.install()
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
