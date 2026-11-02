@@ -23,7 +23,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from conftest import approval_body, displayed_mode, TERMINAL_ORIGIN, set_mode, ticket_row
+from conftest import approval_body, displayed_mode, TERMINAL_ORIGIN, set_mode, ticket_row, terminal_credential
 from test_baseline_api import _insert_ticket, _manual_ticket
 from test_review_changes import _breakeven_proposal
 
@@ -42,6 +42,13 @@ def market_open(monkeypatch):
 def _bare(base_url=TERMINAL_ORIGIN, **kwargs):
     from backend.main import app
     return TestClient(app, base_url=base_url, **kwargs)
+
+
+def _authorized(base_url=TERMINAL_ORIGIN, headers=None, **kwargs):
+    """A bare client that also holds this launch's terminal credential
+    (SEC-1 P1-F), as the browser has after its Kite login. The Origin and
+    header checks under test here are unaffected by it: they run first."""
+    return _bare(base_url, headers={**(headers or {}), "Cookie": f"kt_session={terminal_credential()}"}, **kwargs)
 
 
 def _is_csrf_reject(r):
@@ -201,13 +208,13 @@ def test_c_wrong_header_value_is_rejected(env, value):
 def test_d_same_origin_with_header_behaves_normally(env, market_open):
     set_mode(env.db, "dry_run")
     tid = _pending_ticket(env)
-    r = _bare().post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid), headers={**APP_HEADER, "Origin": TERMINAL_ORIGIN})
+    r = _authorized().post(f"/api/tickets/{tid}/confirm", json=approval_body(env.db, tid), headers={**APP_HEADER, "Origin": TERMINAL_ORIGIN})
     assert r.status_code == 200, r.text
     assert r.json()["data"]["status"] == "executed" and r.json()["data"]["mode"] == "dry_run"
 
 
 def test_d_same_origin_put_and_delete_behave_normally(env):
-    c = _bare(headers={**APP_HEADER, "Origin": TERMINAL_ORIGIN})
+    c = _authorized(headers={**APP_HEADER, "Origin": TERMINAL_ORIGIN})
     draft = _insert_ticket(env.db, status="draft", mode=None)
     r = c.put(f"/api/tickets/{draft}", json=_manual_ticket(quantity=4))
     assert r.status_code == 200, r.text
@@ -236,7 +243,7 @@ def test_route_errors_pass_through_unchanged(env):
     ("http://LOCALHOST:8000", "http://Localhost:8000"),
 ])
 def test_e_loopback_origins_are_accepted(env, base, origin):
-    r = _bare(base).post("/api/ui-prefs", json={"theme": "dark"}, headers={**APP_HEADER, "Origin": origin})
+    r = _authorized(base).post("/api/ui-prefs", json={"theme": "dark"}, headers={**APP_HEADER, "Origin": origin})
     assert r.status_code == 200, (base, origin, r.status_code)
 
 
@@ -304,8 +311,8 @@ def test_g_no_origin_without_header_is_rejected(env):
 
 
 def test_g_referer_is_checked_when_origin_is_absent(env):
-    ok = _bare().post("/api/ui-prefs", json={"a": 1},
-                      headers={**APP_HEADER, "Referer": f"{TERMINAL_ORIGIN}/?tab=approvals"})
+    ok = _authorized().post("/api/ui-prefs", json={"a": 1},
+                            headers={**APP_HEADER, "Referer": f"{TERMINAL_ORIGIN}/?tab=approvals"})
     assert ok.status_code == 200
     bad = _bare().post("/api/ui-prefs", json={"a": 1},
                        headers={**APP_HEADER, "Referer": f"{FOREIGN}/page.html"})
@@ -362,6 +369,7 @@ def test_h_websocket_foreign_origin_is_refused(env, one_tick, origin):
 @pytest.mark.parametrize("headers", [{"Origin": TERMINAL_ORIGIN}, {"Origin": "http://localhost:8000"}],
                          ids=["same_origin", "localhost_alias"])
 def test_i_websocket_terminal_origin_is_accepted(env, one_tick, headers):
+    headers = {**headers, "Cookie": f"kt_session={terminal_credential()}"}   # SEC-1 P1-F
     with _bare().websocket_connect(WS_URL, headers=headers) as ws:
         assert ws.receive_json() == {"type": "tick", "n": 1}
 

@@ -30,9 +30,53 @@ The defences that still hold are Kite-side and server-side:
 - the trading lock;
 - the live-arming and live-state gates (SEC-1).
 
-Keep the machine itself clean. A per-launch session credential (planned,
-SEC-1 P1-F) would close the "other local process" gap, but not the
-same-user one.
+Keep the machine itself clean.
+
+### The per-launch terminal credential (SEC-1 P1-F)
+
+Every write (any method other than GET/HEAD/OPTIONS) and the `/ws/ticks`
+handshake must also carry this launch's **terminal credential**. It is
+checked after Host and Origin, which stay exactly as before. A missing or
+wrong credential gets 401 `TERMINAL_SESSION_REQUIRED` (or, for the
+WebSocket, a refused handshake). Nothing is changed.
+
+**Lifecycle:**
+
+| Event | Effect |
+|---|---|
+| Kite login completes (`/callback`, after a successful request-token exchange) | A new random credential (`secrets.token_urlsafe(32)`) is issued and set as cookie `kt_session`: `HttpOnly`, `SameSite=Strict`, `Path=/`, plus `Secure` over https. Any earlier credential stops working. |
+| Logout | The credential is revoked and the cookie cleared. |
+| App restart | The credential lived only in process memory, as a SHA-256 digest. Every old cookie is now refused. |
+
+- **After a restart you must log in to Zerodha again before any change**:
+  approvals, the trading lock, switching to dry run, Emergency Exit. The UI
+  shows a "Changes are locked … log in to Zerodha again" banner, and reading
+  still works. Until then, Kite web and the protective GTTs at the broker
+  remain your fallback.
+- **Where the credential never appears:** in a URL, a page, a static file,
+  a JSON body or a GET response. It is registered with the log redactor, and
+  the guard logs only the reason for a refusal. JavaScript cannot read it.
+- **Cookie host.** The cookie belongs to the host of the Kite redirect URL
+  (`127.0.0.1:8000`). A UI opened on `localhost` is asked to log in again,
+  and the login lands back on `127.0.0.1`.
+
+**What it stops:** any local process that can reach the port but can
+neither complete your Kite login (password + 2FA) nor read your browser
+profile. That covers:
+- other Windows accounts on the machine;
+- sandboxed or less-privileged processes, and containers or WSL with host
+  networking but no access to your profile;
+- a request replayed from a previous launch.
+
+**What it does not stop:**
+- malware running as **your own** Windows user: it can read the browser's
+  cookie store, `.env` and the database, or drive the browser itself;
+- a browser extension allowed on this host;
+- anything with debugger or administrator rights.
+
+Reads (GET) stay protected by the Host check only, as before. Login CSRF
+(no `state` on the callback, P2-G) stays open: a forced callback could
+rotate the credential, but never hands it to the attacker.
 
 ## What the app enforces (PK-18)
 

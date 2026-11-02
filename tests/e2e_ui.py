@@ -40,6 +40,9 @@ def main() -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch(channel="msedge", headless=True)
         page = browser.new_page(viewport={"width": 1440, "height": 900})
+        # SEC-1 P1-F: writes need this launch's terminal credential, issued by
+        # a Kite login; the demo's stand-in sets the same HttpOnly cookie.
+        assert page.request.get(args.base + "/demo/authorize").ok
         if args.pin_clock:
             from datetime import datetime
             r = page.request.post(args.base + "/api/demo/clock", data=json.dumps({"time": "11:00"}),

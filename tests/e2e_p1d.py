@@ -40,6 +40,7 @@ CHECKS = {
     10: "Quick-Action SELL, ordinary exit and Emergency Exit remain available",
     11: "trading lock and dry-run behaviour remain correct",
     12: "market-window transition invalidates an old review",
+    13: "P1-F: writes need the per-launch terminal credential (HttpOnly cookie)",
 }
 
 
@@ -58,6 +59,9 @@ def main() -> None:
     expected_409: list[str] = []      # declared error codes, consumed as observed
     observed_409: list[dict] = []
     unexpected_http: list[str] = []
+    # Codes the page itself read from refusal bodies a listener could not
+    # read: (url suffix, code), matched to observed refusals at the end.
+    page_read_codes: list[tuple[str, str]] = []
 
     def check(n: int, name: str, ok, detail="") -> None:
         results[n].append((name, bool(ok), str(detail)[:240]))
@@ -70,7 +74,7 @@ def main() -> None:
         page_errors: list[str] = []
 
         def on_response(response):
-            if response.status == 409 and "/api/" in response.url:
+            if response.status in (401, 409) and "/api/" in response.url:
                 try:
                     code = response.json()["detail"]["error_code"]
                 except Exception:
@@ -160,11 +164,7 @@ def main() -> None:
                 const j = await r.json();
                 return [r.status, (j.detail && j.detail.error_code) || null];
             }""", [tid, body])
-            pg.wait_for_timeout(300)
-            for entry in reversed(observed_409):
-                if entry["url"].endswith(f"/api/tickets/{tid}/confirm") and entry["code"] is None:
-                    entry["code"] = code
-                    break
+            page_read_codes.append((f"/api/tickets/{tid}/confirm", code))
             return status, code
 
         def open_card_dialog(pg, tid: int) -> None:
@@ -172,6 +172,35 @@ def main() -> None:
             card = pg.locator(f'.approval-card[data-ticket-id="{tid}"]')
             card.locator('button[data-action="details"]').click()
             pg.wait_for_selector("#ticket-confirm-dialog[open]", timeout=10000)
+
+        # ---------------------------------------------------------------- P1-F: before authorization
+        # The demo seeds a Kite session, but this browser has no terminal
+        # credential yet (as after an app restart): reads work, writes do not.
+        page.goto(base + "/")
+        page.wait_for_selector("#app-shell:not([hidden])", timeout=20000)
+        page.wait_for_timeout(800)
+        check(13, "unauthorized: the UI loads read-only and shows the authorize banner",
+              page.is_visible("#authorize-banner"))
+        expect_409("TERMINAL_SESSION_REQUIRED")
+        status, code = page.evaluate("""async () => {
+            const r = await fetch('/api/ui-prefs', {method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-Kite-Terminal': '1'}, body: '{"theme": "dark"}'});
+            const j = await r.json();
+            return [r.status, (j.detail && j.detail.error_code) || null];
+        }""")
+        page_read_codes.append(("/api/ui-prefs", code))
+        check(13, "unauthorized: a same-origin write with the right headers is refused (401 TERMINAL_SESSION_REQUIRED)",
+              (status, code) == (401, "TERMINAL_SESSION_REQUIRED"), (status, code))
+        authorized = context.request.get(base + "/demo/authorize", max_redirects=0)
+        set_cookie = authorized.headers.get("set-cookie", "")
+        check(13, "the authorization response sets an HttpOnly, SameSite=Strict credential cookie",
+              "kt_session=" in set_cookie and "httponly" in set_cookie.lower()
+              and "samesite=strict" in set_cookie.lower(), set_cookie[:0])
+        page.goto(base + "/")
+        page.wait_for_selector("#app-shell:not([hidden])", timeout=20000)
+        page.wait_for_timeout(800)
+        check(13, "authorized: the banner is gone and page scripts cannot read the credential",
+              not page.is_visible("#authorize-banner") and "kt_session" not in page.evaluate("() => document.cookie"))
 
         # ---------------------------------------------------------------- setup
         start = set_clock([page], time="11:00")   # a weekday, market open, demo signals current
@@ -236,7 +265,8 @@ def main() -> None:
             page.click("#app-confirm-ok")
         page.wait_for_selector("#connect-gate:not([hidden])", timeout=10000)
         check(9, "logout shows the connect gate", True)
-        demo("/api/demo/kite-login")                          # the real session replacement, fake Kite
+        login = context.request.get(base + "/demo/kite-login")   # real session replacement + new credential
+        assert login.ok, login.text()
         boot(page, "approvals")
         card = page.locator(f'.approval-card[data-ticket-id="{tid9}"]')
         check(9, "after a new Kite login the ticket's card says 'needs re-review'",
@@ -419,20 +449,25 @@ def main() -> None:
         browser.close()
 
     # ---------------------------------------------------------------- expected refusals / errors
+    for suffix, code in page_read_codes:
+        for entry in observed_409:
+            if entry["code"] is None and entry["url"].endswith(suffix):
+                entry["code"] = code
+                break
     observed_codes = [o["code"] for o in observed_409]
     unexpected = list(observed_codes)
     for code in expected_409:
         if code in unexpected:
             unexpected.remove(code)
     missing = [c for c in expected_409 if c not in observed_codes]
-    resource_409 = [e for e in console_errors if "status of 409" in e]
-    other_console = [e for e in console_errors if "status of 409" not in e]
+    resource_409 = [e for e in console_errors if "status of 409" in e or "status of 401" in e]
+    other_console = [e for e in console_errors if "status of 409" not in e and "status of 401" not in e]
     print()
-    print(f"Expected 409s declared: {expected_409}")
-    print(f"409s observed:          {observed_codes}")
+    print(f"Expected refusals (401/409) declared: {expected_409}")
+    print(f"Refusals observed:                     {observed_codes}")
     ok_http = not unexpected and not missing and len(resource_409) <= len(observed_409)
-    print(f"{'PASS' if ok_http else 'FAIL'} every 409 was declared and observed "
-          f"(unexpected {unexpected}, missing {missing}, console 409 lines {len(resource_409)})")
+    print(f"{'PASS' if ok_http else 'FAIL'} every refusal was declared and observed "
+          f"(unexpected {unexpected}, missing {missing}, console 401/409 lines {len(resource_409)})")
     ok_errors = not other_console and not page_errors and not unexpected_http
     print(f"{'PASS' if ok_errors else 'FAIL'} no other console error, page error or HTTP error "
           f"{(other_console + page_errors + unexpected_http)[:4]}")

@@ -1,8 +1,10 @@
-"""Request-level security: Host validation, cross-origin write protection and
-response security headers.
+"""Request-level security: Host validation, cross-origin write protection, the
+per-launch terminal credential and response security headers.
 
-Three pure ASGI middlewares, registered in ``backend/main.py``. They run in
-this order, outermost first, and all of them before routing:
+Four pure ASGI middlewares, registered in ``backend/main.py``. They run in
+this order, outermost first, and all of them before routing (the fourth,
+``TerminalCredentialGuard`` (SEC-1 P1-F), runs after the three below and is
+described with the credential further down):
 
 1. ``SecurityHeadersMiddleware`` (PK-18) adds CSP, anti-framing, nosniff,
    referrer and cache headers to every HTTP response, rejections included.
@@ -54,11 +56,16 @@ kite.zerodha.com) working. They are still subject to the Host check.
 """
 
 import functools
+import hashlib
+import hmac
 import ipaddress
 import json
 import logging
 import os
 import re
+import secrets
+import threading
+from http.cookies import CookieError, SimpleCookie
 from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
@@ -270,6 +277,148 @@ class TerminalOriginGuard:
             await send({"type": "websocket.close", "code": 1008})
             return
         await _send_json(send, 403, _REJECTED_BODY)
+
+
+# ---------------------------------------------------------------- per-launch terminal credential (SEC-1 P1-F)
+#
+# The Host and Origin checks above stop browser-borne attacks only: any local
+# program can forge Host, Origin and the static header. The terminal
+# credential is what a write (and the /ws/ticks handshake) must also present:
+#
+# - Issued ONLY when a Kite login completes (routes/auth.py /callback, after a
+#   successful request-token exchange — the user's Kite password and 2FA), as
+#   an HttpOnly, SameSite=Strict cookie. No URL, page, static asset or GET
+#   response ever carries it, and JavaScript cannot read it.
+# - Unpredictable (secrets.token_urlsafe(32)) and held only as a SHA-256
+#   digest in this process's memory: an application restart forgets it, so a
+#   credential from a previous launch never works again. A new login replaces
+#   it; logout revokes it. One worker per process (server.REQUIRED_WORKERS),
+#   so one in-memory value is the whole truth.
+# - Compared in constant time (hmac.compare_digest on the digests).
+# - Registered with backend.redaction, so it cannot appear in a log line or an
+#   error detail even by accident; the guard itself logs only the reason.
+#
+# What it stops: any local process that can reach the port but cannot complete
+# the user's Kite login nor read the user's browser profile — other Windows
+# accounts, sandboxed or less-privileged processes — and a request replayed
+# from a previous launch. What it cannot stop: malware running as the same
+# Windows user (it can read the browser's cookie store or drive the browser),
+# a browser extension with access to this host, a debugger/administrator.
+# See docs/DEPLOYMENT.md.
+
+CREDENTIAL_COOKIE = "kt_session"
+CREDENTIAL_ERROR_CODE = "TERMINAL_SESSION_REQUIRED"
+_CREDENTIAL_REJECTED_BODY = json.dumps({"detail": {
+    "error_code": CREDENTIAL_ERROR_CODE,
+    "message": "This terminal session is not authorized for changes: log in to Zerodha again from this browser. "
+               "Nothing was changed.",
+}}).encode()
+
+
+class _TerminalCredential:
+    def __init__(self) -> None:
+        self._digest: bytes | None = None
+        self._lock = threading.Lock()
+
+    def issue(self) -> str:
+        token = secrets.token_urlsafe(32)
+        from backend.redaction import register_secret
+        register_secret(token)
+        with self._lock:
+            self._digest = hashlib.sha256(token.encode("ascii")).digest()
+        return token
+
+    def revoke(self) -> None:
+        with self._lock:
+            self._digest = None
+
+    def valid(self, presented: str | None) -> bool:
+        with self._lock:
+            expected = self._digest
+        if expected is None or not presented:
+            return False
+        try:
+            candidate = hashlib.sha256(presented.encode("ascii")).digest()
+        except UnicodeEncodeError:
+            return False
+        return hmac.compare_digest(candidate, expected)
+
+
+_credential = _TerminalCredential()
+
+
+def issue_terminal_credential() -> str:
+    """A new credential for this launch, replacing any previous one. Called by
+    the Kite login callback only (and by tests / the demo server)."""
+    return _credential.issue()
+
+
+def revoke_terminal_credential() -> None:
+    _credential.revoke()
+
+
+def terminal_credential_valid(presented: str | None) -> bool:
+    return _credential.valid(presented)
+
+
+def set_credential_cookie(response, token: str, secure: bool) -> None:
+    """HttpOnly (no script can read it), SameSite=Strict (never sent on a
+    cross-site request), whole-site path, Secure when served over https."""
+    response.set_cookie(CREDENTIAL_COOKIE, token, httponly=True, samesite="strict", path="/", secure=secure)
+
+
+def clear_credential_cookie(response, secure: bool) -> None:
+    response.delete_cookie(CREDENTIAL_COOKIE, path="/", httponly=True, samesite="strict", secure=secure)
+
+
+def request_cookie(scope, name: str) -> str | None:
+    """The value of cookie `name` in the request (first occurrence), or None."""
+    for key, value in scope.get("headers", []):
+        if key.lower() != b"cookie":
+            continue
+        parsed = SimpleCookie()
+        try:
+            parsed.load(value.decode("latin-1"))
+        except CookieError:
+            continue
+        if name in parsed:
+            return parsed[name].value
+    return None
+
+
+def credential_rejection_reason(scope) -> str | None:
+    """None if the request needs no credential or carries the current one."""
+    if scope["type"] == "http" and scope["method"].upper() in SAFE_METHODS:
+        return None
+    presented = request_cookie(scope, CREDENTIAL_COOKIE)
+    if presented is None:
+        return "missing terminal credential"
+    if not terminal_credential_valid(presented):
+        return "invalid or expired terminal credential"
+    return None
+
+
+class TerminalCredentialGuard:
+    """Pure ASGI middleware, registered inside the Origin guard: a write or
+    WebSocket handshake that passed the Host and Origin checks must also
+    carry this launch's terminal credential."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        reason = credential_rejection_reason(scope)
+        if reason is None:
+            return await self.app(scope, receive, send)
+
+        logger.warning("Credential guard blocked %s %s: %s",
+                       scope.get("method", "WEBSOCKET"), scope.get("path"), reason)
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        await _send_json(send, 401, _CREDENTIAL_REJECTED_BODY)
 
 
 # style-src keeps 'unsafe-inline' because app.js renders style="" attributes

@@ -44,7 +44,9 @@ from backend import server
 from backend.accounts import get_default_account
 from backend.db import init_db
 from backend.obs import CorrelationIdMiddleware, log_event
-from backend.security import SecurityHeadersMiddleware, TerminalOriginGuard, TrustedHostGuard
+from backend.security import (
+    SecurityHeadersMiddleware, TerminalCredentialGuard, TerminalOriginGuard, TrustedHostGuard,
+)
 from backend.routes import (
     account_safety as account_safety_routes,
     auth,
@@ -182,7 +184,9 @@ app.include_router(research_scanner_routes.router)
 # Registered innermost first; each add_middleware wraps the previous, so a
 # request meets them in reverse order: security headers, then the Host check
 # (DNS rebinding, reads and writes, PK-18), then the cross-origin write and
-# WebSocket check (P0-8). All three answer before routing.
+# WebSocket check (P0-8), then the per-launch terminal credential every write
+# and WebSocket handshake must carry (SEC-1 P1-F). All answer before routing.
+app.add_middleware(TerminalCredentialGuard)
 app.add_middleware(TerminalOriginGuard)
 app.add_middleware(TrustedHostGuard)
 app.add_middleware(SecurityHeadersMiddleware)

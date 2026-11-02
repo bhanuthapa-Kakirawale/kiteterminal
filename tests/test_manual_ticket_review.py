@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 from kiteconnect.exceptions import NetworkException
 
-from conftest import IST, account_id, approval_body, displayed_mode, set_mode, ticket_row
+from conftest import IST, account_id, approval_body, displayed_mode, reauthorize, set_mode, ticket_row
 from test_account_safety import (  # noqa: F401 — live is a fixture
     _assert_untouched_pending, _calls_since, _code, _codes, _confirm, _lock, _re_review, _risk, _sql,
     _strategy_entry, live,
@@ -325,6 +325,7 @@ def test_a_logout_and_login_ends_the_review_too(env, market_open, clock, monkeyp
     t = _create(env)
     assert env.client.post("/api/logout").status_code == 200
     kite_client.exchange_request_token("req-token-2")
+    reauthorize(env.client)          # SEC-1 P1-F: the new login also authorizes this browser again
     r = _confirm(env, t["id"])
     assert r.status_code == 409 and _code(r) == "TICKET_REVIEW_REQUIRED"
 

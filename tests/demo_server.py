@@ -492,9 +492,11 @@ def install_review_controls(app, fake) -> None:
       strategy signals stay current), {"ist": "2026-11-03T11:00:00"} pins an
       exact instant, {"ist": null} restores the real clock. The answer gives
       the pinned instant, for the browser's own clock.
-    - POST /api/demo/kite-login runs the REAL kite_client.exchange_request_token
+    - GET /demo/kite-login runs the REAL kite_client.exchange_request_token
       with a fake KiteConnect: the real session replacement (and the P0-C
-      LIVE disarm) happens, without a Kite round trip.
+      LIVE disarm) happens, without a Kite round trip. Like /callback it then
+      issues the terminal credential cookie (SEC-1 P1-F). A GET, because
+      after a logout there is no credential to send a POST with.
     - POST /api/demo/tamper/{ticket_id} changes a pending ticket's stored
       quantity behind the app's back, in this throwaway database.
     - POST /api/demo/holding-loss {"symbol": "ITC", "pct": 12} marks a
@@ -502,8 +504,9 @@ def install_review_controls(app, fake) -> None:
       raises the per-stock loss alert whose Quick Action offers a BUY.
     """
     from datetime import datetime as _dt
-    from fastapi import Body, HTTPException
-    from backend import db, kite_client, trading_calendar
+    from fastapi import Body, HTTPException, Request
+    from fastapi.responses import JSONResponse
+    from backend import db, kite_client, security, trading_calendar
 
     real_now = trading_calendar.now_ist
     pinned = {"at": None}
@@ -541,11 +544,15 @@ def install_review_controls(app, fake) -> None:
         def set_access_token(self, token):
             pass
 
-    @app.post("/api/demo/kite-login")
-    def demo_kite_login():
+    @app.get("/demo/kite-login")
+    def demo_kite_login(request: Request):
+        # Mirrors /callback: the session replacement, then this launch's
+        # terminal credential (SEC-1 P1-F) for the browser that "logged in".
         kite_client.KiteConnect = _FakeKiteConnect
         kite_client.exchange_request_token("demo-request-token")
-        return {"data": {"logged_in": True}}
+        response = JSONResponse({"data": {"logged_in": True}})
+        security.set_credential_cookie(response, security.issue_terminal_credential(), secure=False)
+        return response
 
     @app.post("/api/demo/holding-loss")
     def demo_holding_loss(body: dict = Body(...)):
@@ -570,6 +577,24 @@ def install_review_controls(app, fake) -> None:
         finally:
             conn.close()
         return {"data": {"tampered": changed == 1}}
+
+
+def install_demo_authorization(app) -> None:
+    """SEC-1 P1-F, demo server only (never in backend/main.py): the demo has
+    no Kite login, so GET /demo/authorize stands in for the /callback that
+    issues this launch's terminal credential cookie, then opens the UI. Open
+    it once per browser; a restart of the demo needs it again, exactly like
+    a restarted terminal needs a fresh Zerodha login. It hands the
+    credential to whatever asks — acceptable only because this process holds
+    synthetic data and a FakeKite."""
+    from fastapi.responses import RedirectResponse
+    from backend import security
+
+    @app.get("/demo/authorize")
+    def demo_authorize():
+        response = RedirectResponse(url="/")
+        security.set_credential_cookie(response, security.issue_terminal_credential(), secure=False)
+        return response
 
 
 def _serve_frontend_from(app, frontend_dir: Path) -> None:
@@ -628,6 +653,7 @@ def main() -> None:
     from backend.main import app
     if args.frontend_dir:
         _serve_frontend_from(app, Path(args.frontend_dir))
+    install_demo_authorization(app)
     if args.review_controls:
         install_review_controls(app, fake)
     if args.paper_controls:

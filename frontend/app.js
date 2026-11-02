@@ -5,6 +5,9 @@
 const LC = window.KTLifecycle;
 
 class SessionExpiredError extends Error {}
+// SEC-1 P1-F: a write refused because this browser holds no credential for
+// this launch of the terminal (restart or logout). Reading still works.
+class TerminalAuthorizationError extends Error {}
 class ApiError extends Error {
   constructor(message, errorCode, failures = null) {
     super(message);
@@ -37,8 +40,12 @@ async function fetchJsonMutate(url, method, body) {
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   if (res.status === 401) {
-    const parsed = await res.json();
-    throw new SessionExpiredError(parsed.detail.message);
+    const parsed = await res.json().catch(() => null);
+    if (parsed?.detail?.error_code === "TERMINAL_SESSION_REQUIRED") {
+      showAuthorizeBanner(true);
+      throw new TerminalAuthorizationError(parsed.detail.message);
+    }
+    throw new SessionExpiredError(parsed?.detail?.message || "Session expired");
   }
   const parsed = await res.json().catch(() => null);
   if (!res.ok) {
@@ -183,6 +190,8 @@ const API = {
 
 const el = {
   connectGate: document.getElementById("connect-gate"),
+  authorizeBanner: document.getElementById("authorize-banner"),
+  authorizeBtn: document.getElementById("authorize-btn"),
   connectBtn: document.getElementById("connect-btn"),
   sessionExpiredBanner: document.getElementById("session-expired-banner"),
   reconnectBtn: document.getElementById("reconnect-btn"),
@@ -559,6 +568,15 @@ const state = {
 };
 
 const TRAILING_CHECK_INTERVAL_SECONDS = 45; // mirrors backend/config.py
+
+// SEC-1 P1-F: the terminal credential is an HttpOnly cookie set by the Kite
+// login callback; this page never sees it. It only learns whether it has one
+// (session status terminal_authorized) or that a write was refused for lack
+// of it, and then offers the login that issues a new one.
+function showAuthorizeBanner(show) {
+  state.terminalAuthorized = !show;
+  el.authorizeBanner.hidden = !show;
+}
 
 function hideAllStates() {
   el.connectGate.hidden = true;
@@ -2986,6 +3004,9 @@ function applyTick(tick) {
 function connectTickWs() {
   // Refresh re-runs loadDashboard(); never stack a second socket on top of a live one.
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  // SEC-1 P1-F: the handshake needs this launch's credential; without it the
+  // server refuses the socket, so do not keep retrying — the banner says why.
+  if (state.terminalAuthorized === false) return;
   wsIntentionallyClosed = false;
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   ws = new WebSocket(`${protocol}//${location.host}/ws/ticks`);
@@ -5906,6 +5927,7 @@ async function init() {
     showConnectGate();
     return;
   }
+  showAuthorizeBanner(!status.terminal_authorized);
   await loadDashboard();
   await loadDashboardPanels();
   const requestedSection = location.hash.slice(1);
@@ -5927,6 +5949,7 @@ async function init() {
 
 el.connectBtn.addEventListener("click", () => { location.href = "/login"; });
 el.reconnectBtn.addEventListener("click", () => { location.href = "/login"; });
+el.authorizeBtn.addEventListener("click", () => { location.href = "/login"; });
 el.refreshBtn.addEventListener("click", () => {
   loadDashboard();
   refreshTicketViews();

@@ -46,9 +46,49 @@ def _no_kite_rest_proxy(monkeypatch):
     monkeypatch.delenv("KITE_REST_PROXY", raising=False)
 
 
+# SEC-1 P1-F: a write also needs this launch's terminal credential, which the
+# app issues only when a Kite login completes. Each test starts with none
+# (the in-memory credential is reset around every test); the first terminal
+# client issues one, exactly as the /callback would, and every further client
+# in the same test reuses it — issuing again would rotate the first client's
+# cookie away. Security tests that need to omit or alter it build a bare
+# TestClient.
+_TEST_CREDENTIAL: dict = {"token": None}
+
+
+@pytest.fixture(autouse=True)
+def _fresh_terminal_credential():
+    from backend import security
+    security.revoke_terminal_credential()
+    _TEST_CREDENTIAL["token"] = None
+    yield
+    security.revoke_terminal_credential()
+    _TEST_CREDENTIAL["token"] = None
+
+
+def terminal_credential() -> str:
+    """This test's current terminal credential, issued on first use."""
+    from backend import security
+    if _TEST_CREDENTIAL["token"] is None or not security.terminal_credential_valid(_TEST_CREDENTIAL["token"]):
+        _TEST_CREDENTIAL["token"] = security.issue_terminal_credential()
+    return _TEST_CREDENTIAL["token"]
+
+
+def reauthorize(client) -> str:
+    """What a fresh Kite login in the browser does for the terminal: a new
+    credential for this client (after a logout or a simulated restart)."""
+    from backend import security
+    _TEST_CREDENTIAL["token"] = security.issue_terminal_credential()
+    client.cookies.set(security.CREDENTIAL_COOKIE, _TEST_CREDENTIAL["token"])
+    return _TEST_CREDENTIAL["token"]
+
+
 def terminal_client(app, **kwargs):
     from fastapi.testclient import TestClient
-    return TestClient(app, base_url=TERMINAL_ORIGIN, headers=TERMINAL_HEADERS, **kwargs)
+    from backend import security
+    client = TestClient(app, base_url=TERMINAL_ORIGIN, headers=TERMINAL_HEADERS, **kwargs)
+    client.cookies.set(security.CREDENTIAL_COOKIE, terminal_credential())
+    return client
 
 
 def last_weekday(d: date) -> date:
@@ -329,7 +369,7 @@ def ticket_row(db, ticket_id: int) -> dict:
 
 
 __all__ = ["FakeKite", "make_candles", "seed_ohlc", "add_watch", "account_id", "set_mode", "displayed_mode",
-           "approval_body", "ticket_row",
+           "approval_body", "ticket_row", "terminal_credential", "reauthorize",
            "as_pre_pk22_database", "seed_live_prerequisites", "clear_live_prerequisites", "TEST_STATIC_IP",
            "seed_healthy_live_state", "clear_healthy_live_state", "make_live_ready",
            "last_weekday", "IST", "TERMINAL_ORIGIN", "TERMINAL_HEADERS", "terminal_client"]

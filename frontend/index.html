@@ -107,6 +107,14 @@
     <button id="connect-btn" class="btn btn-primary btn-lg">Connect to Zerodha</button>
   </div>
 
+  <!-- SEC-1 P1-F: Kite is connected, but this browser holds no credential for this launch of the terminal
+       (it was restarted, or you logged out). Reading works; changes need a fresh Zerodha login. -->
+  <div id="authorize-banner" class="banner" hidden>
+    Changes are locked: this terminal session is not authorized (the terminal was restarted or you logged
+    out). — <button id="authorize-btn" class="link-btn">log in to Zerodha again</button> to approve, lock, switch
+    mode or exit.
+  </div>
+
   <div id="session-expired-banner" class="banner" hidden>
     Session expired — <button id="reconnect-btn" class="link-btn">click to reconnect</button>
   </div>

@@ -38,6 +38,12 @@ clock (Playwright `page.clock`) to 11:00 IST on the trading day after the
 demo's seeded session. Without it, on a weekend or after hours the browser
 says "market closed" and the first approval opens the AMO dialog instead.
 
+Since SEC-1 P1-F every write needs the terminal credential that a Kite
+login issues. The demo has no Kite login, so both scripts first open the
+demo-only `GET /demo/authorize`, which sets the same HttpOnly cookie. In
+pytest, `conftest.terminal_client` carries the test's credential, and
+`conftest.reauthorize(client)` stands in for a fresh login after a logout.
+
 The SEC-1 P1-D review flows (manual / Quick Action buy review, two tabs,
 tampering, Kite re-login, the trading lock, exits, the market window) have
 their own script:

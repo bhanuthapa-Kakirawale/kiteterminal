@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from backend import kite_client as _kite_client_module
-from conftest import approval_body, TERMINAL_ORIGIN, displayed_mode, set_mode, ticket_row
+from conftest import approval_body, TERMINAL_ORIGIN, displayed_mode, set_mode, ticket_row, terminal_credential
 from test_baseline_api import _manual_ticket
 
 # Captured at import, before the env fixture replaces it with the FakeKite factory.
@@ -214,7 +214,8 @@ def test_configured_allowed_host(env, monkeypatch):
     assert _bare(base).get("/api/holdings").status_code == 200
     assert _bare("http://10.8.0.2:8000").get("/api/holdings").status_code == 200
     # The configured name is also a terminal origin for writes (same port).
-    ok = _bare(base).post("/api/ui-prefs", json={"theme": "dark"}, headers={**APP_HEADER, "Origin": base})
+    ok = _bare(base).post("/api/ui-prefs", json={"theme": "dark"},
+                          headers={**APP_HEADER, "Origin": base, "Cookie": f"kt_session={terminal_credential()}"})
     assert ok.status_code == 200, ok.text
     # Other names stay rejected.
     assert _is_host_reject(_bare(EVIL).get("/api/holdings"))
@@ -311,6 +312,7 @@ WS_EVIL = EVIL.replace("http://", "ws://") + "/ws/ticks"
     ("ws://localhost:8000/ws/ticks", {"Origin": "http://localhost:8000"}),
 ])
 def test_ws_approved_host_and_origin_connects(env, one_tick, url, headers):
+    headers = {**headers, "Cookie": f"kt_session={terminal_credential()}"}   # SEC-1 P1-F
     with _bare().websocket_connect(url, headers=headers) as ws:
         assert ws.receive_json() == {"type": "tick", "n": 1}
 
