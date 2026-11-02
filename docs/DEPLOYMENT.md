@@ -392,6 +392,12 @@ circular (published each December) and its amendments. Each December:
 3. Validate, and cross-check against stored candles on a **copy** of the DB:
    `python -m backend.trading_calendar check --verify-db <copy.db>`.
 
+**Status, 2026-11-02:** the file covers 2023–2026. NSE has not yet published
+its 2027 circular (it is expected mid-December 2026). Do not add 2027 dates
+from third-party lists: they are estimates. From 2026-12-01 the confirm-time
+`CALENDAR_YEAR` check (SEC-1) refuses every live new entry until the official
+2027 list is added. This is fail-closed by design. Exits are unaffected.
+
 If a year is missing, weekdays are assumed to trade (as before PK-22) and
 readiness reports the warning `CALENDAR_YEAR_UNCOVERED`. Special sessions
 (Muhurat trading, a weekend budget session) are listed but their hours are not
