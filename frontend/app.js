@@ -3187,6 +3187,29 @@ function shownModeFor(t) {
 // rendered, never re-read at send time, so a view left open across a
 // Re-review (or an edit) in another tab cannot approve what it did not show.
 // Strategy entries and exits carry none.
+// SEC-1 P1-E: "accepted by the broker" and "filled" are different facts. The
+// server decides both (lifecycle.order_progress, from broker-reported fills
+// only); this only words them. Nothing is shown before the order is sent.
+const ACCEPTANCE_LABELS = {
+  SUBMITTING: "sending…", UNKNOWN: "outcome UNKNOWN — do not resubmit", NEEDS_REVIEW: "needs review in Kite",
+  ACCEPTED: "accepted", REJECTED: "rejected", NOT_FOUND: "never reached the broker", NOT_RECORDED: "not recorded",
+};
+const FILL_LABELS = {
+  NONE: "nothing filled", UNKNOWN: "unknown", AWAITING_FILL: "awaiting fill", PARTIAL: "partly filled",
+  FILLED: "filled", CANCELLED: "cancelled, nothing filled", REJECTED: "rejected by the exchange",
+  UNCONFIRMED: "fill not confirmed — check Kite", NOT_RECORDED: "not recorded",
+};
+
+function orderProgressRowHtml(p) {
+  if (!p || p.acceptance === "NOT_SUBMITTED") return "";
+  const qty = p.filled_quantity != null ? ` · ${fmt(p.filled_quantity, 0)}/${fmt(p.requested_quantity, 0)}` : "";
+  const working = p.working ? " · order working" : "";
+  const legacy = p.fill_evidence === "LEGACY_RECORD" ? " (legacy record)" : "";
+  const broker = p.simulated ? "Paper broker" : "Broker";
+  return `<div class="row"><span>${broker} / fill</span><strong>${esc(ACCEPTANCE_LABELS[p.acceptance] || p.acceptance)}`
+    + ` · ${esc(FILL_LABELS[p.fill] || p.fill)}${qty}${working}${legacy}</strong></div>`;
+}
+
 function shownReviewFor(t) {
   return t && t.review && t.review.subject ? (t.review.token || undefined) : undefined;
 }
@@ -3609,7 +3632,8 @@ async function openDetailDialog(ticket) {
       + `<strong>${esc(ticket.kite_gtt_id)}</strong></div>` : "";
   const tagRow = ticket.order_tag
     ? `<div class="row"><span>Kite order tag</span><strong>${esc(ticket.order_tag)}</strong></div>` : "";
-  el.ticketDetailBody.innerHTML = statusRow + modeRow + orderRow + gttRow + tagRow + ticketConfirmHtml(ticket);
+  el.ticketDetailBody.innerHTML = statusRow + modeRow + orderProgressRowHtml(ticket.order_progress) + orderRow
+    + gttRow + tagRow + ticketConfirmHtml(ticket);
   renderTicketDetailEvents([]); // populated below once we fetch full detail
 
   const isDraft = ticket.status === "draft";

@@ -3,9 +3,9 @@
 **Scope.** The three P0 packets of the cross-repo audit remediation plan.
 - **Done since:** P1-D (manual-ticket re-review), see
   `docs/SEC1_P1D_REPORT.md`; P1-F (per-launch terminal credential), see
-  `docs/SEC1_P1F_REPORT.md`.
-- **Not started:** P1-E (acknowledged vs
-  filled API fields) and P2-G (callback `state`, loosening audit).
+  `docs/SEC1_P1F_REPORT.md`; P1-E (acknowledged vs filled API fields), see
+  `docs/SEC1_P1E_REPORT.md`.
+- **Not started:** P2-G (callback `state`, loosening audit).
 - **Out of scope:** the DMB candidate inbox.
 - **Never done:** no real broker order was placed or tested. Everything runs
   against FakeKite and temporary databases.

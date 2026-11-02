@@ -113,6 +113,9 @@ def _serialize(ticket: sqlite3.Row) -> dict:
     # frontend renders it. The position lifecycle is added by the callers
     # that hold a lifecycle context (_with_lifecycle).
     data["ticket_state"] = lifecycle.ticket_state(ticket)
+    # SEC-1 P1-E: status 'executed' means the broker ACCEPTED the order; how
+    # much of it filled is stated separately, from broker-reported fills only.
+    data["order_progress"] = lifecycle.order_progress(ticket)
     return data
 
 

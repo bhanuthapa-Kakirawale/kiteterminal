@@ -443,6 +443,9 @@ def derive(row, ctx: Context) -> dict:
         "opened_at": row["filled_at"] or row["executed_at"], "closed_at": row["closed_at"],
         "closed_trade": _closed_trade(journal),
         "allowed_actions": actions,
+        # SEC-1 P1-E: the entry order's broker acceptance and actual fill,
+        # stated separately (an accepted order is not a filled one).
+        "entry_progress": order_progress(row),
     }
 
 
@@ -560,6 +563,104 @@ def ticket_state(row, now: datetime | None = None) -> dict:
     label = _STATUS_LABELS.get(status, status.replace("_", " "))
     tone = {"executed": "ok", "pending_confirmation": "info", "draft": "info", "confirmed": "info"}.get(status, "muted")
     return state(status.upper(), label, tone, status)
+
+
+# ---- SEC-1 P1-E: broker acceptance vs actual fill ---------------------------------
+#
+# A ticket's stored status 'executed' has always meant "the broker ACCEPTED the
+# order" (PK-8): it says nothing about how much of it filled. order_progress()
+# states the two separately, derived only from what is persisted — the
+# submission bookkeeping (PK-1/PK-2), the broker order id, and the fill the
+# order monitor recorded from the broker's own order history (PK-8/PK-13). It
+# acquires nothing, changes nothing and never infers a fill from an
+# acknowledgement; where the record cannot say, it says so.
+
+# Was the order accepted by the broker?
+ACC_NOT_SUBMITTED = "NOT_SUBMITTED"      # never sent (awaiting approval, refused, withdrawn)
+ACC_SUBMITTING = "SUBMITTING"            # claimed, broker call in flight
+ACC_UNKNOWN = "UNKNOWN"                  # outcome unknown — may exist at the broker; never resubmitted
+ACC_NEEDS_REVIEW = "NEEDS_REVIEW"        # contradictory broker evidence — resolve in Kite
+ACC_ACCEPTED = "ACCEPTED"                # the broker holds (or held) this order
+ACC_REJECTED = "REJECTED"                # definitively rejected at submission
+ACC_NOT_FOUND = "NOT_FOUND"              # proven never to have reached the broker
+ACC_NOT_RECORDED = "NOT_RECORDED"        # a legacy row with no submission record
+
+# How much of it filled — broker-reported only.
+FILL_NONE = "NONE"                       # nothing was sent, so nothing can fill
+FILL_UNKNOWN = "UNKNOWN"                 # the order may exist; its fill is not known
+FILL_AWAITING = "AWAITING_FILL"          # accepted, working, 0 filled so far
+FILL_PARTIAL = "PARTIAL"                 # part filled (still working, or ended)
+FILL_FILLED = "FILLED"                   # the whole quantity filled
+FILL_CANCELLED = "CANCELLED"             # accepted, then cancelled with nothing filled
+FILL_REJECTED = "REJECTED"               # accepted, then rejected by the exchange/RMS
+FILL_UNCONFIRMED = "UNCONFIRMED"         # left the order book before its fill was confirmed
+FILL_NOT_RECORDED = "NOT_RECORDED"       # a legacy row with no fill record
+
+# Where the filled quantity comes from.
+EVIDENCE_BROKER = "BROKER"               # the order monitor's record of the broker's order history
+EVIDENCE_LEGACY = "LEGACY_RECORD"        # a pre-fill-tracking row (migration backfill rule), not re-verified
+
+
+def order_progress(row, now: datetime | None = None) -> dict:
+    """{acceptance, fill, filled_quantity, requested_quantity, working,
+    simulated, fill_evidence} for one ticket row. filled_quantity is None
+    whenever the record cannot say (an unknown submission, a legacy row with
+    no fill record) — never assumed from an acknowledgement."""
+    now = now or datetime.now(timezone.utc)
+    status, sub, efs = row["status"], row["submission_state"], row["entry_fill_status"]
+    order_id = row["kite_order_id"]
+    simulated = row["mode"] == "dry_run" or paper_broker.is_paper_id(order_id)
+
+    def progress(acceptance, fill, filled, working=False, evidence=None):
+        return {"acceptance": acceptance, "fill": fill, "filled_quantity": filled,
+                "requested_quantity": row["quantity"], "working": working, "simulated": simulated,
+                "fill_evidence": evidence}
+
+    # Not (yet) at the broker.
+    if status in ("draft", "pending_confirmation", "risk_rejected"):
+        return progress(ACC_NOT_SUBMITTED, FILL_NONE, 0)
+    if status == "confirmed":
+        if sub == execution.NEEDS_REVIEW:
+            return progress(ACC_NEEDS_REVIEW, FILL_UNKNOWN, None)
+        if sub == execution.UNKNOWN or _submission_stale(row, now):
+            return progress(ACC_UNKNOWN, FILL_UNKNOWN, None)
+        if sub == execution.SUBMITTING:
+            return progress(ACC_SUBMITTING, FILL_UNKNOWN, None)
+        return progress(ACC_NOT_RECORDED, FILL_UNKNOWN, None)
+    if sub == execution.NOT_FOUND:
+        return progress(ACC_NOT_FOUND, FILL_NONE, 0)
+    if order_id is None:
+        if status in ("rejected", "cancelled") and sub is None:
+            return progress(ACC_NOT_SUBMITTED, FILL_NONE, 0)            # withdrawn before any broker call
+        if sub == execution.REJECTED:
+            return progress(ACC_REJECTED, FILL_NONE, 0)
+        if status == "failed":
+            return progress(ACC_NOT_RECORDED, FILL_NOT_RECORDED, None)    # legacy failure, outcome unrecorded
+        return progress(ACC_NOT_SUBMITTED, FILL_NONE, 0)
+
+    # The broker accepted it (it has an order id): what filled is what the
+    # order monitor recorded from the broker's order history.
+    filled = row["filled_quantity"]
+    if efs == "pending":
+        if (filled or 0) > 0:
+            return progress(ACC_ACCEPTED, FILL_PARTIAL, filled, working=True, evidence=EVIDENCE_BROKER)
+        return progress(ACC_ACCEPTED, FILL_AWAITING, 0, working=True, evidence=EVIDENCE_BROKER)
+    if efs == "partial":
+        return progress(ACC_ACCEPTED, FILL_PARTIAL, filled, evidence=EVIDENCE_BROKER)
+    if efs == "filled":
+        return progress(ACC_ACCEPTED, FILL_FILLED, filled if filled is not None else row["quantity"],
+                        evidence=EVIDENCE_BROKER)
+    if efs == "unconfirmed":
+        return progress(ACC_ACCEPTED, FILL_UNCONFIRMED, filled, evidence=EVIDENCE_BROKER)
+    if efs == "cancelled":
+        return progress(ACC_ACCEPTED, FILL_CANCELLED, filled or 0, evidence=EVIDENCE_BROKER)
+    if efs == "rejected":
+        return progress(ACC_ACCEPTED, FILL_REJECTED, filled or 0, evidence=EVIDENCE_BROKER)
+    # A row from before fill tracking (no entry_fill_status).
+    if filled is not None:
+        fill = FILL_FILLED if filled == row["quantity"] else FILL_PARTIAL
+        return progress(ACC_ACCEPTED, fill, filled, evidence=EVIDENCE_LEGACY)
+    return progress(ACC_ACCEPTED, FILL_NOT_RECORDED, None)
 
 
 # ---- batch helpers for routes ------------------------------------------------------

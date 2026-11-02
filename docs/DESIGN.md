@@ -147,6 +147,14 @@ draft/pending ──risk checks──► pending_confirmation ──human confir
   (`account_safety.check_ticket_review`). Strategy entries are judged by
   their signal candle instead. Exits never are. See
   `docs/SEC1_P1D_REPORT.md`.
+- **Accepted is not filled (SEC-1 P1-E)**: the stored status `executed`
+  means the broker ACCEPTED the order. Every ticket payload also carries
+  `order_progress` = `{acceptance, fill, filled_quantity, requested_quantity,
+  working, simulated, fill_evidence}`, and every app position carries the
+  same object as `entry_progress`. It is derived by
+  `lifecycle.order_progress` from the submission bookkeeping and the fill the
+  order monitor recorded from the broker's order history, never from an
+  acknowledgement. See `docs/SEC1_P1E_REPORT.md`.
 - **Creation**: manual tickets are created via `POST /api/tickets`; strategy
   tickets are created by `strategy_engine.run_entry_scan` /
   `run_exit_scan`; the Dashboard's **Quick Action popup** (clicking a
