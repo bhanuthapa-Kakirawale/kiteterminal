@@ -164,7 +164,7 @@ def _subject(**fields) -> dict:
                use_gtt=1, entry_price=3000.0, stop_loss=2900.0, target_1=3300.0, target_2=None,
                trailing_distance=None, source="manual", symbol="TCS", exchange="NSE", transaction_type="BUY",
                entry_order_type="LIMIT", trailing_trigger=None, product_type="CNC",
-               reviewed_at="2026-09-28 04:30:00", reviewed_session_id=1)
+               reviewed_at="2026-09-28 04:30:00", reviewed_session_id=1, review_generation="g" * 32)
     row["review_digest"] = account_safety.ticket_review_digest(row)
     row.update(fields)
     return row
@@ -705,6 +705,106 @@ def test_hardening_works_on_plain_dict_tickets():
                                              now).code == "STALE_SIGNAL"
 
 
+# ============================================================ review generations (v8)
+#
+# reviewed_at has one-second resolution. Without a per-review nonce, two
+# reviews of one ticket in the same second produced the same token and a
+# stale approval dialog stayed valid. The clock fixture is pinned, so every
+# review below happens in the SAME second.
+
+def test_every_review_gets_its_own_generation_even_in_the_same_second(live, clock):
+    t = _create(live)
+    first = ticket_row(live.db, t["id"])["review_generation"]
+    _re_review(live, t["id"])
+    second = ticket_row(live.db, t["id"])["review_generation"]
+    _re_review(live, t["id"])
+    third = ticket_row(live.db, t["id"])["review_generation"]
+    assert len({first, second, third}) == 3 and all(len(g) == 32 for g in (first, second, third))
+    assert ticket_row(live.db, t["id"])["reviewed_at"] == "2026-09-28 04:30:00"   # one and the same second
+
+
+def test_a_same_second_re_review_invalidates_the_previous_token(live, clock):
+    t = _create(live)
+    created = approval_body(live.db, t["id"])
+    _re_review(live, t["id"])
+    re_reviewed = approval_body(live.db, t["id"])
+    _re_review(live, t["id"])                                  # another tab, the same second
+    current = approval_body(live.db, t["id"])
+    tokens = {b["expected_review_token"] for b in (created, re_reviewed, current)}
+    assert len(tokens) == 3
+    for stale in (created, re_reviewed):
+        r = live.client.post(f"/api/tickets/{t['id']}/confirm", json=stale)
+        assert r.status_code == 409 and _code(r) == "TICKET_REVIEW_CHANGED", r.text
+    assert live.kite.calls_to("place_order") == []
+    r = live.client.post(f"/api/tickets/{t['id']}/confirm", json=current)
+    assert r.status_code == 200 and r.json()["data"]["status"] == "executed"
+
+
+def test_tokens_of_two_identical_tickets_are_not_interchangeable(live, clock):
+    a, b = _create(live), _create(live)
+    r = live.client.post(f"/api/tickets/{b['id']}/confirm",
+                         json=approval_body(live.db, b["id"], expected_review_token=a["review"]["token"]))
+    assert r.status_code == 409 and _code(r) == "TICKET_REVIEW_CHANGED"
+    assert live.kite.calls_to("place_order") == []
+
+
+def test_a_kite_session_change_invalidates_the_old_token(live, clock):
+    t = _create(live)
+    old = approval_body(live.db, t["id"])
+    _new_kite_session(live)
+    set_mode(live.db, "live")
+    r = live.client.post(f"/api/tickets/{t['id']}/confirm", json=old)
+    assert r.status_code == 409 and _code(r) == "TICKET_REVIEW_REQUIRED"
+    _re_review(live, t["id"])                                   # current again, under the new login
+    r = live.client.post(f"/api/tickets/{t['id']}/confirm", json=old)
+    assert r.status_code == 409 and _code(r) == "TICKET_REVIEW_CHANGED"
+    assert live.kite.calls_to("place_order") == []
+
+
+def test_concurrent_re_reviews_commit_exactly_one_new_generation(live, clock, monkeypatch):
+    from backend import risk_engine
+    from backend.routes import tickets
+    t = _create(live)
+    before = ticket_row(live.db, t["id"])["review_generation"]
+    barrier = threading.Barrier(2, timeout=5)
+    real = risk_engine.build_portfolio_context
+
+    def synchronised(kite):
+        try:
+            barrier.wait()                                     # both have read the same generation
+        except threading.BrokenBarrierError:
+            pass
+        return real(kite)
+    monkeypatch.setattr(risk_engine, "build_portfolio_context", synchronised)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [f.result(timeout=30) for f in
+                   [pool.submit(_call, tickets.re_review_ticket, t["id"], kite=live.kite) for _ in range(2)]]
+    assert not barrier.broken
+    assert sorted(code for code, _ in results) == [200, 409], results
+    winner = next(body for code, body in results if code == 200)
+    loser = next(body for code, body in results if code == 409)
+    assert loser["error_code"] == "CONFLICT_INVALID_STATE"
+    row = ticket_row(live.db, t["id"])
+    assert row["review_generation"] not in (None, before)
+    assert winner["review"]["token"] == approval_body(live.db, t["id"])["expected_review_token"]
+    assert _confirm(live, t["id"]).status_code == 200
+
+
+def test_a_review_recorded_without_a_generation_needs_a_re_review(live, clock):
+    from backend import account_safety
+    tid = _insert_ticket(live.db, status="pending_confirmation", mode=None, risk_check_results="[]",
+                         review_generation=None)
+    row = ticket_row(live.db, tid)
+    _sql(live, "UPDATE trade_tickets SET reviewed_at = ?, reviewed_session_id = ?, review_digest = ? WHERE id = ?",
+         "2026-09-28 04:30:00", _sql(live, "SELECT id FROM sessions WHERE is_active = 1")[0]["id"],
+         account_safety.ticket_review_digest(row), tid)            # a v7-era review: no generation
+    review = live.client.get(f"/api/tickets/{tid}").json()["data"]["review"]
+    assert review["current"] is False and "review generations" in review["reason"] and review["token"] is None
+    assert _code(_confirm(live, tid)) == "TICKET_REVIEW_REQUIRED"
+    _re_review(live, tid)
+    assert _confirm(live, tid).status_code == 200
+
+
 # ============================================================ frontend contract
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -778,7 +878,7 @@ def test_migration_v7_is_idempotent(env):
         conn.close()
     assert (columns["reviewed_at"], columns["reviewed_session_id"], columns["review_digest"]) == \
         ("TEXT", "INTEGER", "TEXT")
-    assert db.MIGRATIONS[-1][:2] == (7, "p1d_ticket_review")
+    assert db.MIGRATIONS[-2][:2] == (7, "p1d_ticket_review")
 
 
 def test_a_pending_manual_ticket_from_before_v7_needs_a_re_review(live):

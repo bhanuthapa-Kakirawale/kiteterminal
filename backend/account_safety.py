@@ -64,6 +64,7 @@ import hashlib
 import json
 import logging
 import math
+import secrets
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -660,20 +661,31 @@ def ticket_review_digest(ticket) -> str:
 
 
 def review_token(ticket) -> str | None:
-    """What an approval echoes: changes with every review (time, session) and
-    with the content, so a view that showed an earlier review cannot approve
-    a later one. None when the ticket carries no complete review stamp."""
-    if not is_review_subject(ticket) or ticket["review_digest"] is None or ticket["reviewed_at"] is None:
+    """What an approval echoes. It binds the ticket, the content digest, the
+    review GENERATION (a fresh random nonce per review), the review time and
+    the Kite session — so a view that showed an earlier review cannot approve
+    a later one, even when both reviews fall in the same second. None when
+    the ticket carries no complete review stamp."""
+    if not is_review_subject(ticket) or ticket["review_digest"] is None or ticket["reviewed_at"] is None \
+            or ticket["review_generation"] is None:
         return None
-    raw = f"{ticket['id']}|{ticket['review_digest']}|{ticket['reviewed_at']}|{ticket['reviewed_session_id']}"
+    raw = (f"{ticket['id']}|{ticket['review_digest']}|{ticket['review_generation']}|{ticket['reviewed_at']}|"
+           f"{ticket['reviewed_session_id']}")
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def new_review_generation() -> str:
+    """128 random bits: every successful review gets its own, never reused."""
+    return secrets.token_hex(16)
+
+
 def review_stamp(conn: sqlite3.Connection, account_id: int, now: datetime | None = None) -> dict:
-    """The review time and session to write for a review happening now."""
+    """The review time, session and a new review generation to write — in
+    one UPDATE — for a review happening now."""
     from backend import live_arming
     return {"reviewed_at": _to_utc_sql(now or now_ist()),
-            "reviewed_session_id": live_arming.active_session_id(conn, account_id)}
+            "reviewed_session_id": live_arming.active_session_id(conn, account_id),
+            "review_generation": new_review_generation()}
 
 
 def _parse_utc_sql(text) -> datetime | None:
@@ -711,6 +723,9 @@ def review_problem(conn: sqlite3.Connection, account_id: int, ticket, now: datet
     if ticket["review_digest"] is None:
         return ReviewProblem(TICKET_REVIEW_REQUIRED, "this ticket has no review record (created before reviews "
                                                      "were recorded)")
+    if ticket["review_generation"] is None:
+        return ReviewProblem(TICKET_REVIEW_REQUIRED, "its review was recorded before review generations were "
+                                                     "introduced")
     reviewed = _parse_utc_sql(ticket["reviewed_at"])
     if reviewed is None:
         return ReviewProblem(TICKET_REVIEW_REQUIRED, f"its review time {ticket['reviewed_at']!r} cannot be read")

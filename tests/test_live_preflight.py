@@ -841,12 +841,12 @@ def test_the_tick_socket_still_delivers_events_before_ticks(env, monkeypatch):
 
 def test_migration_v5_creates_the_live_readiness_table_idempotently(env):
     from backend import db
-    assert db.LATEST_SCHEMA_VERSION == 7   # SEC-1 added v6, P1-D v7
+    assert db.LATEST_SCHEMA_VERSION == 8   # SEC-1 added v6, P1-D v7 + v8
     names = {r["name"] for r in _rows(env, "SELECT name FROM sqlite_master WHERE type='table'")}
     assert "live_readiness" in names
     env.db.init_db()
     env.db.init_db()
-    assert env.db.last_init == {"applied_migrations": [], "startup_row_changes": 0, "schema_version": 7}
+    assert env.db.last_init == {"applied_migrations": [], "startup_row_changes": 0, "schema_version": 8}
 
 
 def test_maintenance_migrate_applies_the_pending_migration(env, capsys):
@@ -855,9 +855,9 @@ def test_maintenance_migrate_applies_the_pending_migration(env, capsys):
     _exec(env, "DELETE FROM schema_version WHERE version >= 5")   # v5, and SEC-1's v6 + P1-D's v7 on top
     assert db_maintenance.main(["migrate", "--db", str(env.db.DB_PATH)]) == 0
     out = capsys.readouterr().out
-    assert "v4 -> v7" in out and "applied migrations:  [5, 6, 7]" in out
+    assert "v4 -> v8" in out and "applied migrations:  [5, 6, 7, 8]" in out
     assert "live_readiness" in {r["name"] for r in _rows(env, "SELECT name FROM sqlite_master")}
-    assert list(env.tmp_path.glob("test.db.pre_schema_v7_bak*"))            # the verified automatic backup
+    assert list(env.tmp_path.glob("test.db.pre_schema_v8_bak*"))            # the verified automatic backup
     assert db_maintenance.main(["migrate", "--db", str(env.db.DB_PATH)]) == 0
     assert "applied migrations:  none" in capsys.readouterr().out
 

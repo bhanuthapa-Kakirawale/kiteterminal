@@ -652,8 +652,11 @@ def re_review_ticket(ticket_id: int, kite: KiteConnect = Depends(require_trading
 
         results = json.dumps(report.as_list())
         # Compare-and-set on the state read above: a confirmation, reject or
-        # another re-review that got there first is never overwritten.
-        unchanged = ("review_digest IS ?", (ticket["review_digest"],))
+        # another re-review that got there first is never overwritten. The
+        # review generation is part of it, so of two concurrent re-reviews
+        # exactly one commits its new generation; the other gets 409.
+        unchanged = ("review_digest IS ? AND review_generation IS ?",
+                     (ticket["review_digest"], ticket["review_generation"]))
         if report.passed:
             columns = account_safety.review_stamp(conn, account["id"])
             if ticket["review_digest"] is None:

@@ -52,7 +52,7 @@ def _insert_ticket(db, **fields) -> int:
 # conftest seeds a healthy live state. Only manual / Quick-Action BUY entries
 # that can still be approved are stamped. Tests of the review gate itself
 # pass any review field explicitly (e.g. reviewed_at=None) to opt out.
-_REVIEW_FIELDS = ("reviewed_at", "reviewed_session_id", "review_digest")
+_REVIEW_FIELDS = ("reviewed_at", "reviewed_session_id", "review_digest", "review_generation")
 _REVIEWABLE_STATUSES = ("draft", "pending_confirmation", "rejected", "risk_rejected")
 
 
@@ -63,8 +63,10 @@ def _stamp_current_review(conn, ticket_id: int) -> None:
         return
     columns = account_safety.review_stamp(conn, row["account_id"])
     columns["review_digest"] = account_safety.ticket_review_digest(row)
-    conn.execute("UPDATE trade_tickets SET reviewed_at = ?, reviewed_session_id = ?, review_digest = ? WHERE id = ?",
-                 (columns["reviewed_at"], columns["reviewed_session_id"], columns["review_digest"], ticket_id))
+    conn.execute("UPDATE trade_tickets SET reviewed_at = ?, reviewed_session_id = ?, review_digest = ?, "
+                 "review_generation = ? WHERE id = ?",
+                 (columns["reviewed_at"], columns["reviewed_session_id"], columns["review_digest"],
+                  columns["review_generation"], ticket_id))
 
 
 # ---------------------------------------------------------------- session / portfolio

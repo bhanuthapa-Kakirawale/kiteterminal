@@ -1913,6 +1913,17 @@ def _m007_p1d_ticket_review(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE trade_tickets ADD COLUMN {name} {sql_type}")
 
 
+def _m008_p1d_review_generation(conn: sqlite3.Connection) -> None:
+    # SEC-1 P1-D follow-up: review_generation is a fresh random nonce written
+    # with every review (creation, edit, Re-review) and bound into the review
+    # token. reviewed_at has one-second resolution, so without it two reviews
+    # of one ticket in the same second produced the same token and a stale
+    # approval dialog stayed valid. Guarded plain ALTER. Existing rows stay
+    # NULL: a review recorded without a generation needs a Re-review.
+    if not _column_exists(conn, "trade_tickets", "review_generation"):
+        conn.execute("ALTER TABLE trade_tickets ADD COLUMN review_generation TEXT")
+
+
 # (version, name, function) — append only; never renumber or rename a
 # released migration: the name is checked against every database's history.
 MIGRATIONS: list[tuple[int, str, object]] = [
@@ -1923,6 +1934,7 @@ MIGRATIONS: list[tuple[int, str, object]] = [
     (5, "live0_live_readiness", _m005_live_readiness),
     (6, "sec1_live_safety", _m006_sec1_live_safety),
     (7, "p1d_ticket_review", _m007_p1d_ticket_review),
+    (8, "p1d_review_generation", _m008_p1d_review_generation),
 ]
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
 
