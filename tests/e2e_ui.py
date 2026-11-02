@@ -2,7 +2,12 @@
 + throwaway database), driven through Playwright with the locally installed
 Microsoft Edge. Saves screenshots and a JSON result file to --out.
 
-    .venv/Scripts/python.exe tests/e2e_ui.py --base http://127.0.0.1:8765 --out <dir>
+    .venv/Scripts/python.exe tests/e2e_ui.py --base http://127.0.0.1:8765 --out <dir> [--pin-clock]
+
+--pin-clock (needs the demo server's --review-controls) pins the server's
+trading clock and the browser's clock to 11:00 IST on the trading day after
+the demo's seeded session, so the run does not depend on the real day or
+hour (on a weekend the browser's own clock says "market closed").
 """
 
 import argparse
@@ -20,6 +25,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:8765")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--pin-clock", action="store_true")
     args = parser.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
     out = Path(args.out)
@@ -34,6 +40,15 @@ def main() -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch(channel="msedge", headless=True)
         page = browser.new_page(viewport={"width": 1440, "height": 900})
+        if args.pin_clock:
+            from datetime import datetime
+            r = page.request.post(args.base + "/api/demo/clock", data=json.dumps({"time": "11:00"}),
+                                  headers={"Origin": args.base, "X-Kite-Terminal": "1",
+                                           "Content-Type": "application/json"})
+            assert r.ok, r.text()
+            pinned = datetime.fromisoformat(r.json()["data"]["now_ist"])
+            page.clock.set_fixed_time(pinned)
+            print(f"Clocks pinned to {pinned.isoformat()}", flush=True)
         errors: list[str] = []
         page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
         page.on("console", lambda m: errors.append(f"console: {m.text} @ {m.location.get('url', '')}")

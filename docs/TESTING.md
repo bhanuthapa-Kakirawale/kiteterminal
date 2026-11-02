@@ -31,6 +31,28 @@ Playwright end-to-end UI test (requires the demo server running separately):
 This drives the real UI in headless Edge, takes numbered screenshots at each
 step, and writes `e2e_results.json` with pass/fail results.
 
+Both browser scripts can run at any hour. Start the demo with
+`--review-controls`, then pass `--pin-clock` to `e2e_ui.py`. That pins the
+server's trading clock (`POST /api/demo/clock`, demo only) and the browser's
+clock (Playwright `page.clock`) to 11:00 IST on the trading day after the
+demo's seeded session. Without it, on a weekend or after hours the browser
+says "market closed" and the first approval opens the AMO dialog instead.
+
+The SEC-1 P1-D review flows (manual / Quick Action buy review, two tabs,
+tampering, Kite re-login, the trading lock, exits, the market window) have
+their own script:
+```
+.venv/Scripts/python.exe tests/demo_server.py --port 8765 --workdir <scratch> --review-controls
+.venv/Scripts/python.exe tests/e2e_p1d.py --base http://127.0.0.1:8765 --out <output-dir>
+```
+It prints one PASS/FAIL per check, asserts every expected HTTP 409 explicitly
+(declared, then matched against the observed response), and fails on any
+other console or page error. `--review-controls` adds demo-only routes
+(clock, simulated Kite login, out-of-band tamper, a holding at a loss) that
+never exist in `backend/main.py`. Do not combine it with
+`--lifecycle-fixtures`: its ten open positions fill `max_open_positions`
+and block every new entry.
+
 ### 1.3 Test infrastructure
 
 - **Real account data is off limits.** `tests/real_data_guard.py`, installed

@@ -25,6 +25,9 @@ from cryptography.fernet import Fernet  # noqa: E402
 os.environ["KITE_TERMINAL_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
 os.environ["KITE_API_KEY"] = "demo_api_key"
 os.environ["KITE_API_SECRET"] = "demo_api_secret"
+# NET-1: likewise, a real .env's KITE_REST_PROXY must not route the demo's
+# (fake) Kite client. Set but empty means "direct" and blocks load_dotenv.
+os.environ["KITE_REST_PROXY"] = ""
 
 from fake_kite import FakeKite, make_candles  # noqa: E402
 
@@ -477,6 +480,98 @@ def install_paper_controls(app, fake) -> None:
         return {"data": {"order_id": body["order_id"], "plan": body["plan"]}}
 
 
+def install_review_controls(app, fake) -> None:
+    """SEC-1 P1-D browser validation, opt-in (--review-controls), demo server
+    only — these routes do not exist in backend/main.py. They let a
+    Playwright run control what a real session cannot be scripted to do:
+
+    - POST /api/demo/clock pins the server's one trading clock
+      (trading_calendar.now_ist), so the review window, market hours and AMO
+      timing all follow it. {"time": "11:00"} pins that IST time on the
+      trading day after the session the demo data was seeded for (its
+      strategy signals stay current), {"ist": "2026-11-03T11:00:00"} pins an
+      exact instant, {"ist": null} restores the real clock. The answer gives
+      the pinned instant, for the browser's own clock.
+    - POST /api/demo/kite-login runs the REAL kite_client.exchange_request_token
+      with a fake KiteConnect: the real session replacement (and the P0-C
+      LIVE disarm) happens, without a Kite round trip.
+    - POST /api/demo/tamper/{ticket_id} changes a pending ticket's stored
+      quantity behind the app's back, in this throwaway database.
+    - POST /api/demo/holding-loss {"symbol": "ITC", "pct": 12} marks a
+      FakeKite holding that far below its average cost, so the dashboard
+      raises the per-stock loss alert whose Quick Action offers a BUY.
+    """
+    from datetime import datetime as _dt
+    from fastapi import Body, HTTPException
+    from backend import db, kite_client, trading_calendar
+
+    real_now = trading_calendar.now_ist
+    pinned = {"at": None}
+    # The demo's candles end at the session completed when it started; the
+    # trading day after it is when those signals are current.
+    trade_day = trading_calendar.next_trading_day(trading_calendar.latest_completed_session(real_now()))
+
+    def demo_now():
+        return pinned["at"] if pinned["at"] is not None else real_now()
+    trading_calendar.now_ist = demo_now
+
+    @app.post("/api/demo/clock")
+    def demo_clock(body: dict = Body(...)):
+        try:
+            if body.get("time") is not None:
+                hh, mm = (int(x) for x in str(body["time"]).split(":"))
+                pinned["at"] = _dt(trade_day.year, trade_day.month, trade_day.day, hh, mm, tzinfo=trading_calendar.IST)
+            elif body.get("ist") is not None:
+                parsed = _dt.fromisoformat(str(body["ist"]))
+                pinned["at"] = parsed.replace(tzinfo=trading_calendar.IST) if parsed.tzinfo is None else parsed
+            else:
+                pinned["at"] = None
+        except ValueError:
+            raise HTTPException(400, {"error_code": "BAD_CLOCK", "message": "time HH:MM or ist ISO datetime"})
+        return {"data": {"now_ist": demo_now().isoformat(), "trade_day": trade_day.isoformat()}}
+
+    class _FakeKiteConnect:
+        def __init__(self, api_key, **kwargs):
+            self.api_key = api_key
+
+        def generate_session(self, request_token, api_secret):
+            return {"access_token": "demo-token", "public_token": "demo-public", "user_id": "DT0001",
+                    "user_name": "Demo Trader"}
+
+        def set_access_token(self, token):
+            pass
+
+    @app.post("/api/demo/kite-login")
+    def demo_kite_login():
+        kite_client.KiteConnect = _FakeKiteConnect
+        kite_client.exchange_request_token("demo-request-token")
+        return {"data": {"logged_in": True}}
+
+    @app.post("/api/demo/holding-loss")
+    def demo_holding_loss(body: dict = Body(...)):
+        symbol, pct = str(body["symbol"]).upper(), float(body.get("pct", 12))
+        holding = next((h for h in fake._holdings if h["tradingsymbol"] == symbol), None)
+        if holding is None:
+            raise HTTPException(404, {"error_code": "NOT_HELD", "message": f"{symbol} is not a demo holding"})
+        last = round(holding["average_price"] * (1 - pct / 100), 2)
+        holding["last_price"] = last
+        holding["pnl"] = round((last - holding["average_price"]) * holding["quantity"], 2)
+        fake.ltp_map[f"NSE:{symbol}"] = last
+        return {"data": {"symbol": symbol, "last_price": last}}
+
+    @app.post("/api/demo/tamper/{ticket_id}")
+    def demo_tamper(ticket_id: int):
+        conn = db.get_connection()
+        try:
+            changed = conn.execute(
+                "UPDATE trade_tickets SET quantity = quantity + 1 WHERE id = ? AND status = 'pending_confirmation'",
+                (ticket_id,)).rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        return {"data": {"tampered": changed == 1}}
+
+
 def _serve_frontend_from(app, frontend_dir: Path) -> None:
     """Swap in a different frontend build (e.g. an older one, for a
     before/after comparison) without touching backend/main.py."""
@@ -500,6 +595,9 @@ def main() -> None:
                         help="PK-20: demo-only routes to set simulated LTPs and run paper cycles (off by default)")
     parser.add_argument("--market-open", action="store_true",
                         help="pin the NSE clock to 'open' (a deterministic paper rehearsal at any hour)")
+    parser.add_argument("--review-controls", action="store_true",
+                        help="SEC-1 P1-D: demo-only routes to pin the trading clock, simulate a new Kite login and "
+                             "tamper with a ticket (off by default)")
     args = parser.parse_args()
 
     workdir = Path(args.workdir or tempfile.mkdtemp(prefix="kite-demo-"))
@@ -530,6 +628,8 @@ def main() -> None:
     from backend.main import app
     if args.frontend_dir:
         _serve_frontend_from(app, Path(args.frontend_dir))
+    if args.review_controls:
+        install_review_controls(app, fake)
     if args.paper_controls:
         install_paper_controls(app, fake)
     print(f"Demo server on http://127.0.0.1:{args.port}  (db: {db.DB_PATH})", flush=True)
