@@ -284,6 +284,38 @@ reconciliation cycle); `clear_healthy_live_state` gives a fresh process.
 `make_live_ready(env)` builds the state in which a real Live Readiness
 evaluation passes, for tests that switch to LIVE through the API.
 
+**DMB Research Inbox** (`docs/DMB_RESEARCH_INBOX.md`):
+- `tests/test_dmb_inbox_contract.py`: the strict bundle validator, pure. A well-formed
+  synthetic bundle passes, and every refusal class fails closed with its code: schema
+  versions, unknown keys at any depth, normalised forbidden order/account/credential keys at
+  any depth, size, depth, text and list bounds, symbol and exchange, provenance, quality,
+  rights (a classification is never a permission), naive/future/out-of-order timestamps,
+  stale evidence, invalid sessions, a review session that disagrees with the NSE calendar,
+  2027 not covered, corrupt JSON (duplicate keys, NaN), duplicate and conflicting packets, and
+  tampered packet or bundle ids.
+- `tests/test_dmb_inbox.py`: migration v9 and its append-only / immutability triggers; import
+  needs the P1-F credential, a terminal Origin, the app header and an active Kite login (as do
+  dismiss, note, research watchlist, Start ticket and ticket link); the credential never
+  appears in a read; import, duplicate (idempotent), revisions and out-of-order revisions,
+  conflicting stored content, malicious bundles refused whole and recorded; path traversal,
+  junctions, hard links and (where the OS allows creating them) symlinks refused; DMB's files
+  are never modified; no Kite client is built and no broker call happens; importing changes no
+  ticket, order, mode, strategy or watchlist row; Start ticket returns only symbol, exchange
+  and rationale and refuses degraded, stale, superseded, dismissed, unresolved and
+  calendar-uncovered items; the manual ticket goes through the P1-D review and is linked
+  without being changed; a link never touches the ticket.
+- `tests/test_dmb_inbox_ui.py` + `tests/js/render_dmb_inbox.js` (Node): the disclaimer, the
+  evidence and provenance fields, escaping, no score or rank, and the New Ticket wiring (only
+  symbol and rationale are set; direction, order type and product start unselected).
+- `tests/test_dmb_handoff_roundtrip.py`: the cross-repository round trip. It runs Daily Market
+  Byte's real exporter in DMB's own venv, as a separate process with a temporary output root
+  and its committed synthetic fixture, then imports the bundle here and goes on to a reviewed
+  manual ticket. Skipped when the sibling `daily_byte` checkout (or `DMB_REPO`) and its venv
+  are absent.
+
+Real-data guard: the inbox tests use the conftest `env` throwaway database and a temporary
+handoff directory; `tests/real_data_guard.py` stays installed.
+
 ### 1.5 Known coverage gaps
 
 These are not currently exercised by automated tests — treat them as a

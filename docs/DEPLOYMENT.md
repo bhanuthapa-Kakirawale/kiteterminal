@@ -119,6 +119,7 @@ All settings are environment variables, which can go in `.env`; see
 | `KITE_TERMINAL_WORKERS` | `1` | Must be 1. |
 | `KITE_TERMINAL_LOG_FILE` | `logs/kite_terminal.log` (launcher) | PK-22: rotating log file, 10 MB × 11 files at most. `off` disables it (console only). Bare `uvicorn` and the tests log to the console unless it is set. |
 | `KITE_REST_PROXY` | *(empty)* | NET-1: `http://host:port` (or `https://`) proxy for **every Kite REST call** only — login, reads, historical data, orders, GTTs. KiteTicker stays direct. No credentials. Malformed → refuses to start. See Mode A+. |
+| `KITE_DMB_HANDOFF_DIR` | *(unset)* | DMB Research Inbox: absolute path of Daily Market Byte's handoff folder (`output/private_desk/handoff`). Read only, never written. Unset = import off. Importing needs an active Kite login and this launch's terminal credential, like every write. See `docs/DMB_RESEARCH_INBOX.md`. |
 | `KITE_TERMINAL_ENCRYPTION_KEY` | generated | Fernet key for the stored secret and token. The app appends a generated key to `.env` if none is set. For a VM, supply it from the service environment instead. A value already in the environment is never overridden by `.env`. |
 
 ## Mode A — Local desktop (default)
@@ -353,11 +354,14 @@ with `integrity_check`). A database written by a **newer** version is refused
 with `DATABASE_SCHEMA_UNSUPPORTED` and nothing is changed: run the newer code,
 or restore the matching backup.
 
-The current schema is **v7** (SEC-1 P1-D added the ticket review columns),
-so the first start of this version leaves `kite_terminal.db.pre_schema_v7_bak`.
-Manual / Quick Action buy tickets still pending at that moment carry no
-review record and need one **Re-review** before they can be approved
-(`docs/SEC1_P1D_REPORT.md`).
+The current schema is **v9**. SEC-1 P1-D added the ticket review columns
+(v7) and the review generation (v8); manual / Quick Action buy tickets still
+pending at the v7 upgrade carry no review record and need one **Re-review**
+before they can be approved (`docs/SEC1_P1D_REPORT.md`). v9
+(`dmb_research_inbox`) only adds the four DMB Research Inbox tables
+(`docs/DMB_RESEARCH_INBOX.md`) and changes no existing table, so the first
+start of this version leaves `kite_terminal.db.pre_schema_v9_bak` and needs
+no other action.
 
 Maintenance (stop the app first for `vacuum`):
 

@@ -338,6 +338,32 @@ trend direction, RSI-14, and distance to the 20-day high — this is also the
 universe the strategy scans run against (holdings are always included
 automatically).
 
+### DMB Research Inbox
+
+**Research → DMB Research Inbox** shows Daily Market Byte candidates you
+imported yourself. It is **private research context, not a trade
+recommendation or order instruction**: a packet carries evidence and where it
+came from, never a side, quantity or price level, and its evidence
+*direction* is not a trade side.
+
+- **Import** reads one bundle file from the folder set in
+  `KITE_DMB_HANDOFF_DIR`. **You must be logged in to Zerodha** (after an app
+  restart, log in again first). Nothing is imported automatically, and nothing
+  in Daily Market Byte's folder is changed.
+- **Dismiss**, **Add note** and **Add to research watchlist** are recorded in
+  the item's history. The research watchlist is the inbox's own list, not the
+  Watchlist above, so it never changes what the strategies scan.
+- **Start ticket** opens New Ticket with only the symbol, the exchange and a
+  research rationale. Choose the direction, order type and product, and enter
+  the quantity and every price yourself; the ticket then goes through the
+  normal risk checks, review and approval. A candidate can start a ticket only
+  until its review session (the next NSE session) closes at 15:30 IST, and only
+  if its evidence is complete; otherwise it is shown as *research only* with
+  the reason.
+- Today only synthetic test bundles (marked **SYNTHETIC**) can be imported:
+  Daily Market Byte does not export real data until its source rights are
+  confirmed. Details: `docs/DMB_RESEARCH_INBOX.md`.
+
 ## 12. Today's Actions
 
 A read-only pre-market briefing: buy candidates ranked by breakout
