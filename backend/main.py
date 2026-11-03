@@ -54,6 +54,7 @@ from backend.routes import (
     dashboard_panels,
     data_health as data_health_routes,
     diagnostics as diagnostics_routes,
+    dmb_inbox as dmb_inbox_routes,
     instruments as instruments_routes,
     journal as journal_routes,
     kill_switch,
@@ -180,6 +181,7 @@ app.include_router(live_readiness_routes.router)
 app.include_router(volume_intelligence_routes.router)
 app.include_router(smart_money_score_routes.router)
 app.include_router(research_scanner_routes.router)
+app.include_router(dmb_inbox_routes.router)
 
 # Registered innermost first; each add_middleware wraps the previous, so a
 # request meets them in reverse order: security headers, then the Host check
