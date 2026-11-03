@@ -45,14 +45,33 @@ DATA_FILE = Path(__file__).parent / "calendar_data" / "nse_equity_holidays.json"
 _SQL_TIME = "%Y-%m-%d %H:%M:%S"
 _MAX_WALK_DAYS = 31  # no real gap between NSE sessions comes close
 
+# ---- session records (DMB/Kite parity) ----------------------------------------
+# Typed, sourced session semantics, shared string for string with Daily Market Byte's
+# core/trading_calendar.py and compared day by day by tests/test_calendar_parity.py. A Sunday Budget
+# session is a full session and Muhurat a short one; neither is a REGULAR session, and neither is
+# ever a review session, an AMO target or "market open" here (hours of special sessions are
+# recorded, not modelled - see Known Limitations, PK-22).
+SEGMENT = "NSE_CM"
+REGULAR = "REGULAR"                 # a weekday that is not a listed holiday, 09:15-15:30 IST
+SPECIAL_FULL = "SPECIAL_FULL"       # a live session at standard timings on a weekend/holiday (Budget day)
+SPECIAL_SHORT = "SPECIAL_SHORT"     # a short special session (Diwali Muhurat, a DR drill)
+HOLIDAY = "HOLIDAY"                 # no session: a listed trading holiday or a weekend
+UNVERIFIED = "UNVERIFIED"           # an uncovered year, or a special session without official evidence
+SESSION_TYPES = (REGULAR, SPECIAL_FULL, SPECIAL_SHORT, HOLIDAY, UNVERIFIED)
+VERIFIED = "VERIFIED"               # the official NSE circular itself was retrieved and read
+REFERENCED = "REFERENCED"           # recorded from an official NSE reference, not itself retrieved
+_EVIDENCED = (VERIFIED, REFERENCED)
+
 
 @dataclass(frozen=True)
 class Calendar:
     holidays: dict = field(default_factory=dict)          # date -> name
-    special_sessions: dict = field(default_factory=dict)  # date -> {"kind", "note"}
+    special_sessions: dict = field(default_factory=dict)  # date -> {"kind", "note", "session_type", "open", ...}
     covered_years: frozenset = frozenset()
     sources: dict = field(default_factory=dict)            # year -> circular reference
     verified_through: str | None = None
+    year_evidence: dict = field(default_factory=dict)      # year -> {"source", "published", "verification"}
+    holiday_evidence: dict = field(default_factory=dict)   # date -> the same, for an amendment holiday
 
 
 class CalendarDataError(ValueError):
@@ -63,9 +82,12 @@ def load_calendar(path: Path = DATA_FILE) -> Calendar:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     holidays: dict[date, str] = {}
     sources: dict[int, str] = {}
+    year_evidence: dict[int, dict] = {}
+    holiday_evidence: dict[date, dict] = {}
     for year_text, year in data["years"].items():
         year_no = int(year_text)
         sources[year_no] = year.get("source", "")
+        year_evidence[year_no] = _evidence(year, f"year {year_no}")
         for entry in year["holidays"]:
             d = date.fromisoformat(entry["date"])
             if d.year != year_no:
@@ -75,14 +97,32 @@ def load_calendar(path: Path = DATA_FILE) -> Calendar:
             if d in holidays:
                 raise CalendarDataError(f"{d} is listed twice")
             holidays[d] = entry["name"]
+            if "source" in entry:
+                holiday_evidence[d] = _evidence(entry, f"holiday {d}")
     specials: dict[date, dict] = {}
     for entry in data.get("special_sessions", []):
         d = date.fromisoformat(entry["date"])
         if d in specials:
             raise CalendarDataError(f"special session {d} is listed twice")
-        specials[d] = {"kind": entry["kind"], "note": entry.get("note", "")}
+        session_type = entry.get("session_type")
+        if session_type not in (SPECIAL_FULL, SPECIAL_SHORT):
+            raise CalendarDataError(f"special session {d}: session_type must be {SPECIAL_FULL} or {SPECIAL_SHORT}")
+        evidence = _evidence(entry, f"special session {d}")
+        if evidence["verification"] in _EVIDENCED and not (entry.get("open") and entry.get("close")
+                                                            and evidence["source"] and evidence["published"]):
+            raise CalendarDataError(f"special session {d}: an evidenced session needs open, close, source, published")
+        specials[d] = {"kind": entry["kind"], "note": entry.get("note", ""), "session_type": session_type,
+                       "open": entry.get("open"), "close": entry.get("close"), **evidence}
     return Calendar(holidays=holidays, special_sessions=specials, covered_years=frozenset(sources),
-                    sources=sources, verified_through=data.get("verified_against_ohlc_through"))
+                    sources=sources, verified_through=data.get("verified_against_ohlc_through"),
+                    year_evidence=year_evidence, holiday_evidence=holiday_evidence)
+
+
+def _evidence(entry: dict, where: str) -> dict:
+    verification = entry.get("verification", UNVERIFIED)
+    if verification not in (*_EVIDENCED, UNVERIFIED):
+        raise CalendarDataError(f"{where}: unknown verification {verification!r}")
+    return {"source": entry.get("source"), "published": entry.get("published"), "verification": verification}
 
 
 _active: Calendar = load_calendar()
@@ -100,7 +140,8 @@ def use_calendar(holidays=None, special_sessions=None, covered_years=None):
     years = frozenset(covered_years) if covered_years is not None else frozenset(d.year for d in holidays)
     _active = Calendar(
         holidays=holidays,
-        special_sessions={d: {"kind": "special_live", "note": "test"} for d in (special_sessions or ())},
+        special_sessions={d: {"kind": "special_live", "note": "test", "session_type": SPECIAL_FULL,
+                              "verification": UNVERIFIED} for d in (special_sessions or ())},
         covered_years=years,
         sources={y: "test fixture" for y in years},
     )
@@ -140,6 +181,29 @@ def holiday_name(d: date) -> str | None:
 
 def special_session(d: date) -> dict | None:
     return _active.special_sessions.get(d)
+
+
+def session_record(d: date) -> dict:
+    """The typed, sourced record of `d` for the NSE CM segment (SESSION_TYPES). Fail closed: an
+    uncovered year, or a special session without official evidence, is UNVERIFIED."""
+    record = {"date": d.isoformat(), "segment": SEGMENT, "session_type": UNVERIFIED, "open": None, "close": None,
+              "source": None, "published": None, "verification": UNVERIFIED}
+    if d.year not in _active.covered_years:
+        return record
+    special = _active.special_sessions.get(d)
+    if special is not None:
+        if special.get("verification") not in _EVIDENCED:
+            return {**record, "source": special.get("source")}
+        return {**record, "session_type": special["session_type"], "open": special["open"], "close": special["close"],
+                "source": special["source"], "published": special["published"],
+                "verification": special["verification"]}
+    evidence = (_active.holiday_evidence.get(d) or _active.year_evidence.get(d.year)
+                or {"source": _active.sources.get(d.year), "published": None, "verification": UNVERIFIED})
+    base = {**record, **evidence}
+    if is_trading_day(d):
+        return {**base, "session_type": REGULAR, "open": MARKET_OPEN.strftime("%H:%M"),
+                "close": MARKET_CLOSE.strftime("%H:%M")}
+    return {**base, "session_type": HOLIDAY}
 
 
 def is_trading_day(d: date) -> bool:

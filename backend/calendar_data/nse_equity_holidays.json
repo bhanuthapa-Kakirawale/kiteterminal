@@ -1,10 +1,12 @@
 {
-  "_about": "NSE Capital Market (equity) trading holidays on weekdays, plus exchange sessions held outside the regular calendar. Loaded by backend/trading_calendar.py; never fetched at runtime. Weekends are always closed and are not listed. Yearly update: add the new year from NSE's 'Trading holidays for the calendar year' circular (published each December) and any later amendment circular, then run: python -m backend.trading_calendar check --verify-db <copy of the DB>.",
+  "_about": "NSE Capital Market (equity) trading holidays on weekdays, plus exchange sessions held outside the regular calendar. Loaded by backend/trading_calendar.py; never fetched at runtime. Weekends are always closed and are not listed. Yearly update: add the new year from NSE's 'Trading holidays for the calendar year' circular (published each December) and any later amendment circular, then run: python -m backend.trading_calendar check --verify-db <copy of the DB>. Session records (P2-G readiness sprint): every year carries its circular's publication date and a verification status (VERIFIED = the circular itself was retrieved and read; REFERENCED = recorded from an official NSE reference, not retrieved this sprint), and every special session its session_type (SPECIAL_FULL | SPECIAL_SHORT), normal-market open/close IST, source and status; a special session without official evidence is UNVERIFIED and never typed as a session. Identical vocabulary to Daily Market Byte's core/trading_calendar.py (tests/test_calendar_parity.py).",
   "segment": "NSE Capital Market",
   "verified_against_ohlc_through": "2026-09-22",
   "years": {
     "2023": {
       "source": "NSE/CMTR/54757 (circular 150/2022, 08-Dec-2022)",
+      "published": "2022-12-08",
+      "verification": "REFERENCED",
       "amendments": ["Bakri Id moved from 28-Jun-2023 to 29-Jun-2023 by NSE circular of June 2023"],
       "holidays": [
         {"date": "2023-01-26", "name": "Republic Day"},
@@ -26,11 +28,9 @@
     },
     "2024": {
       "source": "NSE/CMTR/59722 (circular 154/2023, 12-Dec-2023)",
-      "amendments": [
-        "22-Jan-2024 declared a holiday (Maharashtra public holiday); 20-Jan-2024 (Saturday) traded as a full session",
-        "20-May-2024 General Elections (Mumbai)",
-        "20-Nov-2024 Maharashtra Legislative Assembly Elections"
-      ],
+      "published": "2023-12-12",
+      "verification": "REFERENCED",
+      "amendments": ["22-Jan-2024 declared a holiday (Maharashtra public holiday); 20-Jan-2024 (Saturday) traded as a full session", "20-May-2024 General Elections (Mumbai)", "20-Nov-2024 Maharashtra Legislative Assembly Elections"],
       "holidays": [
         {"date": "2024-01-22", "name": "Special holiday (Maharashtra public holiday)"},
         {"date": "2024-01-26", "name": "Republic Day"},
@@ -53,6 +53,8 @@
     },
     "2025": {
       "source": "NSE/CMTR/65587 (circular 170/2024, 13-Dec-2024)",
+      "published": "2024-12-13",
+      "verification": "REFERENCED",
       "amendments": [],
       "holidays": [
         {"date": "2025-02-26", "name": "Mahashivratri"},
@@ -73,9 +75,11 @@
     },
     "2026": {
       "source": "NSE/CMTR/71775 (circular 172/2025, 12-Dec-2025)",
+      "published": "2025-12-12",
+      "verification": "VERIFIED",
       "amendments": ["15-Jan-2026 Municipal Corporation Elections (Maharashtra)"],
       "holidays": [
-        {"date": "2026-01-15", "name": "Municipal Corporation Elections (Maharashtra)"},
+        {"date": "2026-01-15", "name": "Municipal Corporation Elections (Maharashtra)", "source": "NSE amendment of 09-Jan-2026, Municipal Corporation Elections (Maharashtra); CM circular not retrieved, same notice NSE/CD/72233 and NSE Clearing NCL/CMPT/72278", "published": "2026-01-09", "verification": "REFERENCED"},
         {"date": "2026-01-26", "name": "Republic Day"},
         {"date": "2026-03-03", "name": "Holi"},
         {"date": "2026-03-26", "name": "Shri Ram Navami"},
@@ -95,14 +99,14 @@
     }
   },
   "special_sessions": [
-    {"date": "2023-11-12", "kind": "muhurat", "note": "Muhurat Trading (Diwali Laxmi Pujan, Sunday)"},
-    {"date": "2024-01-20", "kind": "special_live", "note": "Saturday full trading session (22-Jan-2024 was declared a holiday)"},
-    {"date": "2024-03-02", "kind": "special_live", "note": "Saturday special live session (disaster-recovery site switchover)"},
-    {"date": "2024-05-18", "kind": "special_live", "note": "Saturday special live session (disaster-recovery site switchover)"},
-    {"date": "2024-11-01", "kind": "muhurat", "note": "Muhurat Trading on the Diwali Laxmi Pujan holiday"},
-    {"date": "2025-02-01", "kind": "special_live", "note": "Saturday live session for the Union Budget"},
-    {"date": "2025-10-21", "kind": "muhurat", "note": "Muhurat Trading on the Diwali Laxmi Pujan holiday"},
-    {"date": "2026-02-01", "kind": "special_live", "note": "Sunday live session for the Union Budget"},
-    {"date": "2026-11-08", "kind": "muhurat", "note": "Muhurat Trading (Diwali Laxmi Pujan, Sunday); timings to be notified by NSE"}
+    {"date": "2023-11-12", "kind": "muhurat", "session_type": "SPECIAL_SHORT", "open": null, "close": null, "source": null, "published": null, "verification": "UNVERIFIED", "note": "Muhurat Trading (Diwali Laxmi Pujan, Sunday)"},
+    {"date": "2024-01-20", "kind": "special_live", "session_type": "SPECIAL_FULL", "open": null, "close": null, "source": null, "published": null, "verification": "UNVERIFIED", "note": "Saturday full trading session (22-Jan-2024 was declared a holiday)"},
+    {"date": "2024-03-02", "kind": "special_live", "session_type": "SPECIAL_SHORT", "open": null, "close": null, "source": null, "published": null, "verification": "UNVERIFIED", "note": "Saturday special live session (disaster-recovery site switchover)"},
+    {"date": "2024-05-18", "kind": "special_live", "session_type": "SPECIAL_SHORT", "open": null, "close": null, "source": null, "published": null, "verification": "UNVERIFIED", "note": "Saturday special live session (disaster-recovery site switchover)"},
+    {"date": "2024-11-01", "kind": "muhurat", "session_type": "SPECIAL_SHORT", "open": null, "close": null, "source": null, "published": null, "verification": "UNVERIFIED", "note": "Muhurat Trading on the Diwali Laxmi Pujan holiday"},
+    {"date": "2025-02-01", "kind": "special_live", "session_type": "SPECIAL_FULL", "open": "09:15", "close": "15:30", "source": "NSE/CMTR/65729, cited by NSE Indices press release of 24-Jan-2025 (standard timings)", "published": "2024-12-23", "verification": "REFERENCED", "note": "Saturday live session for the Union Budget"},
+    {"date": "2025-10-21", "kind": "muhurat", "session_type": "SPECIAL_SHORT", "open": "13:45", "close": "14:45", "source": "NSE/CMTR/70319 (circular 124/2025)", "published": "2025-09-22", "verification": "VERIFIED", "note": "Muhurat Trading on the Diwali Laxmi Pujan holiday"},
+    {"date": "2026-02-01", "kind": "special_live", "session_type": "SPECIAL_FULL", "open": "09:15", "close": "15:30", "source": "NSE/CMTR/72349 (circular 11/2026); F&O: NSE/FAOP/72352 (circular 07/2026)", "published": "2026-01-16", "verification": "VERIFIED", "note": "Sunday live session for the Union Budget (T0 session not held: settlement holiday)"},
+    {"date": "2026-11-08", "kind": "muhurat", "session_type": "SPECIAL_SHORT", "open": "14:20", "close": "15:30", "source": "NSE/CMTR/76941 (circular 149/2026); announced in NSE/CMTR/71775", "published": "2026-10-19", "verification": "VERIFIED", "note": "Muhurat Trading (Diwali Laxmi Pujan, Sunday); CAS securities' normal market closes 15:15"}
   ]
 }

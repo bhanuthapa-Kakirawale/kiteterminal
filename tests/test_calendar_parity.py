@@ -5,6 +5,14 @@ The two repositories keep independent copies of NSE's holiday circulars. A DMB p
 must agree for every year both cover, and both must fail closed for a year neither covers
 (2027 until NSE publishes its circular). DMB runs in its own interpreter as a separate process,
 read-only; skipped when the checkout or its venv is absent.
+
+Readiness sprint (P2-G): both sides now carry typed, sourced session records (REGULAR /
+SPECIAL_FULL / SPECIAL_SHORT / HOLIDAY / UNVERIFIED, open/close, official source, publication date,
+verification) and must agree on EVERY field for every day of 2025-2026 and on UNVERIFIED for 2027.
+The two differences found in the previous sprint are resolved from NSE's own circulars: DMB now
+lists the 2026-02-01 Sunday Budget session (NSE/CMTR/72349, NSE/FAOP/72352), and DMB no longer
+computes a review session for a special-session day (its own rule: session_date is a REGULAR
+session), so both refuse such a packet.
 """
 import json
 import os
@@ -21,22 +29,23 @@ DMB_PY = DMB / ("venv/Scripts/python.exe" if sys.platform == "win32" else "venv/
 needs_dmb = pytest.mark.skipif(not (DMB_PY.exists() and (DMB / "core" / "trading_calendar.py").exists()),
                                reason="the Daily Market Byte checkout or its venv is not present")
 
-# Sessions held outside the regular calendar that only one side lists. Neither is ever a review
-# session (both sides walk REGULAR sessions), so packets are unaffected; reported in
-# docs/NSE_CALENDAR_MONITORING.md for DMB's owner, not changed by this sprint.
-KNOWN_SPECIAL_SESSION_DIFFERENCES = {"kite_only": ["2026-02-01"], "dmb_only": []}
-# DMB special sessions for which DMB would compute a review session and this terminal refuses.
-KNOWN_SPECIAL_SESSION_PACKET_DATES = ["2025-02-01", "2025-10-21", "2026-11-08"]
+# No known difference remains (docs/NSE_CALENDAR_MONITORING.md, "Calendar parity"). A new entry
+# here must be a deliberate, documented decision.
+KNOWN_SPECIAL_SESSION_DIFFERENCES = {"kite_only": [], "dmb_only": []}
+KNOWN_SPECIAL_SESSION_PACKET_DATES: list = []
+SPECIAL_SESSION_DATES = ["2025-02-01", "2025-10-21", "2026-02-01", "2026-11-08"]
 
 _DUMP = """
 import datetime as dt, json, sys
-from core.trading_calendar import NSE_TRADING_HOLIDAYS, SPECIAL_SESSIONS
+from core.trading_calendar import NSE_TRADING_HOLIDAYS, SPECIAL_SESSIONS, SESSION_TYPES, session_record
 from private_desk.handoff.evidence import review_session_for
 probes = json.loads(sys.argv[1])
 out = {"years": sorted(NSE_TRADING_HOLIDAYS),
        "weekday_holidays": sorted(d.isoformat() for y in NSE_TRADING_HOLIDAYS for d in NSE_TRADING_HOLIDAYS[y]
                                   if d.weekday() < 5),
        "special": sorted(d.isoformat() for d in SPECIAL_SESSIONS),
+       "session_types": list(SESSION_TYPES),
+       "records": {p: session_record(dt.date.fromisoformat(p)) for p in probes},
        "review": {p: (lambda r: r.isoformat() if r else None)(review_session_for(dt.date.fromisoformat(p)))
                   for p in probes}}
 print(json.dumps(out))
@@ -45,7 +54,7 @@ print(json.dumps(out))
 
 def _probes() -> list[str]:
     d, out = date(2025, 1, 1), []
-    while d <= date(2026, 12, 31):
+    while d <= date(2027, 1, 31):
         out.append(d.isoformat())
         d += timedelta(days=1)
     return out
@@ -80,6 +89,8 @@ def test_every_review_session_agrees(dmb):
     mismatches = []
     for probe, theirs in dmb["review"].items():
         d = date.fromisoformat(probe)
+        if d.year > 2026:
+            continue                                      # 2027: test_both_fail_closed_for_2027
         if not trading_calendar.is_trading_day(d):
             ours = None
         else:
@@ -91,17 +102,54 @@ def test_every_review_session_agrees(dmb):
                 ours = None
         if ours != theirs:
             mismatches.append((probe, ours, theirs))
-    # Known, fail-closed difference: DMB treats a special session (Budget Saturday, Muhurat) as a
-    # session a packet may describe; this terminal refuses such a packet (INVALID_SESSION_DATE),
-    # because the agreed rule counts regular sessions only. Never the other way round.
-    assert [m[0] for m in mismatches] == KNOWN_SPECIAL_SESSION_PACKET_DATES
-    assert all(ours is None for _, ours, _ in mismatches)
-    from backend import dmb_inbox_contract as contract
-    for probe, _, theirs in mismatches:
-        with pytest.raises(contract.BundleRejected) as e:
-            contract.check_sessions(date.fromisoformat(probe), date.fromisoformat(theirs),
-                                    datetime.fromisoformat(theirs + "T08:00:00+05:30"))
-        assert e.value.code == "INVALID_SESSION_DATE"
+    assert [m[0] for m in mismatches] == KNOWN_SPECIAL_SESSION_PACKET_DATES, mismatches
+
+
+@needs_dmb
+def test_every_session_record_agrees(dmb):
+    """Type, hours, official source, publication date and verification, for every day of
+    2025-01-01..2027-01-31 (2027: UNVERIFIED on both sides)."""
+    from backend import trading_calendar
+    assert dmb["session_types"] == list(trading_calendar.SESSION_TYPES)
+    differing = [(p, theirs, trading_calendar.session_record(date.fromisoformat(p)))
+                 for p, theirs in dmb["records"].items()
+                 if theirs != trading_calendar.session_record(date.fromisoformat(p))]
+    assert differing == []
+
+
+@needs_dmb
+def test_special_sessions_are_typed_sourced_and_never_packet_sessions(dmb):
+    """Both sides: the four 2025-2026 special sessions are SPECIAL_FULL / SPECIAL_SHORT with their
+    official hours, DMB exports no packet for them, and this terminal refuses one."""
+    from backend import dmb_inbox_contract as contract, trading_calendar
+    expected = {"2025-02-01": ("SPECIAL_FULL", "09:15", "15:30"), "2025-10-21": ("SPECIAL_SHORT", "13:45", "14:45"),
+                "2026-02-01": ("SPECIAL_FULL", "09:15", "15:30"), "2026-11-08": ("SPECIAL_SHORT", "14:20", "15:30")}
+    for d, (session_type, opens, closes) in expected.items():
+        record = dmb["records"][d]
+        assert (record["session_type"], record["open"], record["close"]) == (session_type, opens, closes), d
+        assert record["verification"] in ("VERIFIED", "REFERENCED") and record["source"] and record["published"], d
+        assert dmb["review"][d] is None, d                                   # DMB: not a packet session
+        assert not trading_calendar.is_trading_day(date.fromisoformat(d))
+        assert trading_calendar.has_exchange_session(date.fromisoformat(d))
+        with pytest.raises(contract.BundleRejected) as e:                    # Kite: refused
+            nxt = trading_calendar.next_trading_day(date.fromisoformat(d))
+            contract.check_sessions(date.fromisoformat(d), nxt, datetime.combine(nxt, datetime.min.time(),
+                                                                                 trading_calendar.IST))
+        assert e.value.code == "INVALID_SESSION_DATE", d
+
+
+@needs_dmb
+def test_the_2026_budget_sunday_is_an_official_full_session_on_both_sides(dmb):
+    """NSE/CMTR/72349 (16-Jan-2026): live trading on Sunday 01-Feb-2026 at standard timings."""
+    from backend import trading_calendar
+    ours = trading_calendar.session_record(date(2026, 2, 1))
+    assert dmb["records"]["2026-02-01"] == ours
+    assert ours["session_type"] == "SPECIAL_FULL" and (ours["open"], ours["close"]) == ("09:15", "15:30")
+    assert ours["source"].startswith("NSE/CMTR/72349") and "NSE/FAOP/72352" in ours["source"]
+    assert ours["published"] == "2026-01-16" and ours["verification"] == "VERIFIED"
+    # The packet of Fri 2026-01-30 is reviewed on Mon 2026-02-02 on both sides (the owner rule walks
+    # REGULAR sessions; whether a special session should shorten it is an open owner decision).
+    assert dmb["review"]["2026-01-30"] == "2026-02-02" == trading_calendar.next_trading_day(date(2026, 1, 30)).isoformat()
 
 
 @needs_dmb
@@ -109,6 +157,7 @@ def test_special_sessions_differ_only_as_documented(dmb):
     from backend import trading_calendar
     kite = {d.isoformat() for d in trading_calendar.active_calendar().special_sessions if d.year in (2025, 2026)}
     theirs = {d for d in dmb["special"] if int(d[:4]) in (2025, 2026)}
+    assert sorted(kite) == sorted(theirs) == SPECIAL_SESSION_DATES
     assert sorted(kite - theirs) == KNOWN_SPECIAL_SESSION_DIFFERENCES["kite_only"]
     assert sorted(theirs - kite) == KNOWN_SPECIAL_SESSION_DIFFERENCES["dmb_only"]
 
@@ -118,6 +167,8 @@ def test_both_fail_closed_for_2027(dmb):
     from backend import dmb_inbox_contract as contract, trading_calendar
     assert 2027 not in dmb["years"] and trading_calendar.coverage(2027) != "COVERED"
     assert dmb["review"]["2026-12-31"] is None                    # DMB: the next session is unknowable
+    assert dmb["records"]["2027-01-04"]["session_type"] == "UNVERIFIED"
+    assert trading_calendar.session_record(date(2027, 1, 4))["session_type"] == "UNVERIFIED"
     with pytest.raises(contract.BundleRejected) as e:               # this terminal: refused, not guessed
         contract.check_sessions(date(2026, 12, 31), date(2027, 1, 1),
                                 datetime(2027, 1, 1, 8, 0, tzinfo=trading_calendar.IST))
