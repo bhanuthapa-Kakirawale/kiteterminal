@@ -2043,6 +2043,35 @@ def _m009_dmb_research_inbox(conn: sqlite3.Connection) -> None:
     _execute_script(conn, _DMB_INBOX_TABLES)
 
 
+# Post-claim tampering audit (backend/ticket_integrity.py): append-only, hash-chained claim
+# snapshots and tamper detections. No trading table is changed.
+_TICKET_INTEGRITY_TABLES = """
+CREATE TABLE IF NOT EXISTS ticket_integrity_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id      INTEGER NOT NULL REFERENCES accounts(id),
+    ticket_id       INTEGER NOT NULL,
+    event_type      TEXT NOT NULL CHECK (event_type IN ('CLAIM_SNAPSHOT', 'TAMPER_DETECTED')),
+    stage           TEXT NOT NULL CHECK (stage IN ('claim', 'post_claim', 'pre_broker', 'post_execution',
+                                                   'trailing')),
+    claimed_digest  TEXT NOT NULL,
+    current_digest  TEXT NOT NULL,
+    categories      TEXT NOT NULL,
+    detected_at     TEXT NOT NULL,
+    prev_hash       TEXT NOT NULL,
+    entry_hash      TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_ticket_integrity_ticket ON ticket_integrity_events(ticket_id, id);
+CREATE TRIGGER IF NOT EXISTS ticket_integrity_append_only_u BEFORE UPDATE ON ticket_integrity_events
+BEGIN SELECT RAISE(ABORT, 'ticket_integrity_events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS ticket_integrity_append_only_d BEFORE DELETE ON ticket_integrity_events
+BEGIN SELECT RAISE(ABORT, 'ticket_integrity_events is append-only'); END;
+"""
+
+
+def _m010_ticket_integrity_audit(conn: sqlite3.Connection) -> None:
+    _execute_script(conn, _TICKET_INTEGRITY_TABLES)
+
+
 # (version, name, function) — append only; never renumber or rename a
 # released migration: the name is checked against every database's history.
 MIGRATIONS: list[tuple[int, str, object]] = [
@@ -2055,6 +2084,7 @@ MIGRATIONS: list[tuple[int, str, object]] = [
     (7, "p1d_ticket_review", _m007_p1d_ticket_review),
     (8, "p1d_review_generation", _m008_p1d_review_generation),
     (9, "dmb_research_inbox", _m009_dmb_research_inbox),
+    (10, "ticket_integrity_audit", _m010_ticket_integrity_audit),
 ]
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
 

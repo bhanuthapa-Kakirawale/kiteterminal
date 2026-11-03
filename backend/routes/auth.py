@@ -16,8 +16,17 @@ router = APIRouter()
 
 
 @router.get("/login")
-def login():
-    return RedirectResponse(url=kite_client.build_login_url())
+def login(request: Request):
+    # P2-G: a login only THIS browser can finish (security.begin_login, cookie-bound).
+    response = RedirectResponse(url=kite_client.build_login_url())
+    security.set_login_state_cookie(response, security.begin_login(), secure=request.url.scheme == "https")
+    return response
+
+
+def _login_failed(request: Request) -> RedirectResponse:
+    response = RedirectResponse(url="/?login_error=1")
+    security.clear_login_state_cookie(response, secure=request.url.scheme == "https")
+    return response
 
 
 @router.get("/callback")
@@ -25,14 +34,20 @@ async def callback(request: Request):
     request_token = request.query_params.get("request_token")
     status = request.query_params.get("status")
 
+    # P2-G login CSRF: refused before any token exchange unless this browser started the login
+    # (GET /login) within the last 10 minutes. Single use: every callback consumes the state.
+    if not security.consume_login_state(request.cookies.get(security.LOGIN_STATE_COOKIE)):
+        logger.warning("Kite callback refused: no pending login started from this browser (login CSRF guard)")
+        return _login_failed(request)
+
     if not request_token or status != "success":
-        return RedirectResponse(url="/?login_error=1")
+        return _login_failed(request)
 
     try:
         await asyncio.to_thread(kite_client.exchange_request_token, request_token)
     except Exception:
         logger.exception("Kite login token exchange failed")
-        return RedirectResponse(url="/?login_error=1")
+        return _login_failed(request)
 
     workers.supervisor.spawn("after_login", _after_login())
     # SEC-1 P1-F: a completed Kite login (the user's password and 2FA) is
@@ -41,6 +56,7 @@ async def callback(request: Request):
     response = RedirectResponse(url="/")
     security.set_credential_cookie(response, security.issue_terminal_credential(),
                                    secure=request.url.scheme == "https")
+    security.clear_login_state_cookie(response, secure=request.url.scheme == "https")
     return response
 
 

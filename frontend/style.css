@@ -677,6 +677,9 @@ th.num, td.num { text-align: right; }
 .lc-exit.lc-sev-critical { padding: 2px 6px; border-radius: 6px; font-weight: 700; }
 .lc-muted { color: var(--text-muted); }
 .lc-qty-sub { font-size: 11px; color: var(--text-muted); font-weight: 500; }
+/* SEC-1 P1-E: broker acceptance and the actual fill, side by side in the positions list. */
+.lc-fill { display: inline-block; font-size: 12px; white-space: nowrap; }
+.lc-fill.lc-sev-critical, .lc-fill.lc-sev-warning { font-weight: 600; }
 /* PK-20: the paper order behind a dry-run position. */
 .lc-paper { margin-top: 2px; color: var(--accent); }
 .lc-chip { margin-left: 4px; }

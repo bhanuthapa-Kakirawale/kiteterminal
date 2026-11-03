@@ -784,6 +784,16 @@ def _try_ratchet(kite, conn: sqlite3.Connection, ticket: sqlite3.Row, ltp: float
 
     if not should_update:
         return
+    # The GTT below is rebuilt from the persisted row: never from content changed after the
+    # ticket's claim (backend/ticket_integrity.py). The existing protective GTT stays as it is.
+    from backend import ticket_integrity
+    changed = ticket_integrity.check(conn, ticket["account_id"], ticket, "trailing")
+    if changed:
+        conn.commit()
+        _log_event(conn, ticket["id"], "trailing_adjusted",
+                   f"NOT moving the stop: the ticket's {', '.join(changed)} changed after it was claimed for "
+                   f"execution ({ticket_integrity.TAMPER_CODE}). The existing protective GTT is unchanged.")
+        return
 
     exit_side = execution.resolve_exit_side(ticket["transaction_type"])
     # PK-13: the ratchet re-sends the whole GTT, quantity included — the

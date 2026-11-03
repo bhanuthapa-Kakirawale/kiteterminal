@@ -490,7 +490,11 @@ def check_live_armed(conn: sqlite3.Connection, account_id: int) -> SafetyFailure
     disarms it; should any path have skipped that, a live new entry is still
     refused while the armed session is not the active one."""
     try:
-        from backend import live_arming
+        from backend import integration_profile, live_arming
+        if integration_profile.synthetic_test_active():
+            return SafetyFailure(LIVE_NOT_ARMED_FOR_SESSION,
+                                 "This terminal runs the isolated synthetic test profile, which never executes live. "
+                                 "Nothing was executed.")
         if live_arming.live_armed_for_active_session(conn, account_id):
             return None
     except Exception as e:

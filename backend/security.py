@@ -65,6 +65,7 @@ import os
 import re
 import secrets
 import threading
+import time
 from http.cookies import CookieError, SimpleCookie
 from urllib.parse import urlsplit
 
@@ -419,6 +420,83 @@ class TerminalCredentialGuard:
             await send({"type": "websocket.close", "code": 1008})
             return
         await _send_json(send, 401, _CREDENTIAL_REJECTED_BODY)
+
+
+# ---------------------------------------------------------------- login CSRF (P2-G)
+#
+# GET /callback exchanges whatever request_token it is given. Before P2-G any web page could
+# navigate the browser there (a top-level GET is never Origin-checked) with a request token of
+# the ATTACKER's choosing: the terminal would replace the user's Kite session with that one and
+# hand this browser a fresh terminal credential for it ("login CSRF"). Now /login starts a login
+# that only this browser can finish: a single-use, 10-minute login state, held as a digest in
+# process memory and bound to the browser by an HttpOnly cookie. /callback refuses (before any
+# token exchange) unless the browser presents a pending state; every callback consumes it.
+# SameSite=Lax (not Strict): the callback is a top-level navigation FROM kite.zerodha.com, on
+# which a Strict cookie would not be sent. Path=/callback: no other route ever receives it.
+# Residual risk (docs/SECURITY_P2G_AUDIT.md): a forced callback that lands while a login the user
+# started is still pending would pass; binding it further needs Kite to echo a state parameter,
+# which cannot be validated without a real Kite login.
+
+LOGIN_STATE_COOKIE = "kt_login_state"
+LOGIN_STATE_TTL_SECONDS = 600
+_MAX_PENDING_LOGINS = 8
+
+
+class _LoginStates:
+    def __init__(self) -> None:
+        self._pending: dict[bytes, float] = {}
+        self._lock = threading.Lock()
+
+    def begin(self, now: float) -> str:
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._pending = {d: t for d, t in self._pending.items() if t > now}
+            while len(self._pending) >= _MAX_PENDING_LOGINS:
+                self._pending.pop(min(self._pending, key=self._pending.get))
+            self._pending[hashlib.sha256(token.encode("ascii")).digest()] = now + LOGIN_STATE_TTL_SECONDS
+        return token
+
+    def consume(self, presented: str | None, now: float) -> bool:
+        if not presented:
+            return False
+        try:
+            digest = hashlib.sha256(presented.encode("ascii")).digest()
+        except UnicodeEncodeError:
+            return False
+        with self._lock:
+            match = next((d for d in self._pending if hmac.compare_digest(d, digest)), None)
+            expires = self._pending.pop(match, None) if match is not None else None
+        return expires is not None and expires > now
+
+    def clear(self) -> None:
+        with self._lock:
+            self._pending.clear()
+
+
+_login_states = _LoginStates()
+
+
+def begin_login(now: float | None = None) -> str:
+    """A new pending login for the browser that asked (GET /login)."""
+    return _login_states.begin(time.time() if now is None else now)
+
+
+def consume_login_state(presented: str | None, now: float | None = None) -> bool:
+    """True once, for a pending, unexpired login state; the state is gone afterwards."""
+    return _login_states.consume(presented, time.time() if now is None else now)
+
+
+def clear_login_states() -> None:
+    _login_states.clear()
+
+
+def set_login_state_cookie(response, token: str, secure: bool) -> None:
+    response.set_cookie(LOGIN_STATE_COOKIE, token, max_age=LOGIN_STATE_TTL_SECONDS, httponly=True,
+                        samesite="lax", path="/callback", secure=secure)
+
+
+def clear_login_state_cookie(response, secure: bool) -> None:
+    response.delete_cookie(LOGIN_STATE_COOKIE, path="/callback", httponly=True, samesite="lax", secure=secure)
 
 
 # style-src keeps 'unsafe-inline' because app.js renders style="" attributes

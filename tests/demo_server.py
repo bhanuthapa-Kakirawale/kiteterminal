@@ -499,6 +499,8 @@ def install_review_controls(app, fake) -> None:
       after a logout there is no credential to send a POST with.
     - POST /api/demo/tamper/{ticket_id} changes a pending ticket's stored
       quantity behind the app's back, in this throwaway database.
+    - POST /api/demo/tamper-after-claim/{ticket_id} does the same right after
+      the ticket's next claim (the post-claim tampering audit).
     - POST /api/demo/holding-loss {"symbol": "ITC", "pct": 12} marks a
       FakeKite holding that far below its average cost, so the dashboard
       raises the per-stock loss alert whose Quick Action offers a BUY.
@@ -554,6 +556,29 @@ def install_review_controls(app, fake) -> None:
         security.set_credential_cookie(response, security.issue_terminal_credential(), secure=False)
         return response
 
+    @app.get("/api/demo/fake-kite/calls")
+    def demo_fake_kite_calls():
+        # The names of every call this demo's FakeKite received, in order (no arguments).
+        return {"data": [name for name, _ in fake.calls]}
+
+    @app.post("/api/demo/tamper-after-claim/{ticket_id}")
+    def demo_tamper_after_claim(ticket_id: int):
+        # Post-claim tampering audit: the NEXT confirmation of this ticket finds its quantity
+        # changed behind the app's back right after its claim (during revalidation, which reads
+        # FakeKite margins). One shot; this throwaway database only.
+        def once(_kwargs):
+            conn = db.get_connection()
+            try:
+                hit = conn.execute("UPDATE trade_tickets SET quantity = quantity + 1 WHERE id = ? AND status = "
+                                   "'confirmed'", (ticket_id,)).rowcount == 1
+                conn.commit()
+            finally:
+                conn.close()
+            if hit:
+                fake.on_call("margins", None)
+        fake.on_call("margins", once)
+        return {"data": {"armed": True, "ticket_id": ticket_id}}
+
     @app.post("/api/demo/holding-loss")
     def demo_holding_loss(body: dict = Body(...)):
         symbol, pct = str(body["symbol"]).upper(), float(body.get("pct", 12))
@@ -597,6 +622,26 @@ def install_demo_authorization(app) -> None:
         return response
 
 
+# The test profile's own cookie name, so the isolated instance can never overwrite (or be
+# mistaken for) the real terminal's `kt_session` cookie: cookies are scoped by host, not port.
+TEST_PROFILE_COOKIE = "kt_test_session"
+
+
+def install_synthetic_profile(handoff_dir: Path) -> None:
+    """DMB-Kite acceptance: the isolated synthetic test profile (backend/integration_profile.py),
+    opt-in (--dmb-synthetic-profile), demo server only. Activation is refused unless this process
+    runs on a throwaway database with FakeKite installed; LIVE can never be armed. Synthetic DMB
+    bundles in `handoff_dir` become importable and actionable here - and nowhere else."""
+    from backend import dmb_inbox, integration_profile, security
+    handoff_dir = handoff_dir.resolve()
+    handoff_dir.mkdir(parents=True, exist_ok=True)
+    os.environ[dmb_inbox.ENV_VAR] = str(handoff_dir)
+    security.CREDENTIAL_COOKIE = TEST_PROFILE_COOKIE
+    integration_profile.activate_synthetic_test_profile()
+    print(f"  SYNTHETIC TEST PROFILE active (FakeKite, throwaway DB, LIVE impossible); handoff dir: {handoff_dir}",
+          flush=True)
+
+
 def _serve_frontend_from(app, frontend_dir: Path) -> None:
     """Swap in a different frontend build (e.g. an older one, for a
     before/after comparison) without touching backend/main.py."""
@@ -620,6 +665,14 @@ def main() -> None:
                         help="PK-20: demo-only routes to set simulated LTPs and run paper cycles (off by default)")
     parser.add_argument("--market-open", action="store_true",
                         help="pin the NSE clock to 'open' (a deterministic paper rehearsal at any hour)")
+    parser.add_argument("--dmb-synthetic-profile", action="store_true",
+                        help="DMB-Kite acceptance: the isolated synthetic test profile (synthetic DMB bundles are "
+                             "actionable, LIVE is impossible); needs --dmb-handoff-dir")
+    parser.add_argument("--dmb-handoff-dir", default=None,
+                        help="the (temporary) DMB handoff directory the inbox may import from")
+    parser.add_argument("--keep-db", action="store_true",
+                        help="reuse an existing <workdir>/demo.db instead of re-creating it (simulates an app "
+                             "restart on the same database)")
     parser.add_argument("--review-controls", action="store_true",
                         help="SEC-1 P1-D: demo-only routes to pin the trading clock, simulate a new Kite login and "
                              "tamper with a ticket (off by default)")
@@ -632,8 +685,16 @@ def main() -> None:
     db.DB_PATH = workdir / "demo.db"
     crypto.ENV_PATH = workdir / ".env"
     ui_prefs.PREFS_PATH = workdir / "ui_prefs.json"
-    if db.DB_PATH.exists():
+    restarted = args.keep_db and db.DB_PATH.exists()
+    if db.DB_PATH.exists() and not restarted:
         db.DB_PATH.unlink()
+    if restarted:
+        # The encryption key is per process here; a restart must decrypt what the first run stored.
+        key_file = workdir / "demo.key"
+        if key_file.exists():
+            os.environ["KITE_TERMINAL_ENCRYPTION_KEY"] = key_file.read_text(encoding="ascii").strip()
+    else:
+        (workdir / "demo.key").write_text(os.environ["KITE_TERMINAL_ENCRYPTION_KEY"], encoding="ascii")
 
     if args.market_open:
         market.is_market_open = lambda at=None: True
@@ -645,9 +706,14 @@ def main() -> None:
     ticker_manager.start = lambda *a, **k: None
 
     db.init_db()
-    seed_database(db, fake, market)
-    if args.lifecycle_fixtures:
-        seed_lifecycle_fixtures(db, fake)
+    if not restarted:
+        seed_database(db, fake, market)
+        if args.lifecycle_fixtures:
+            seed_lifecycle_fixtures(db, fake)
+    if args.dmb_synthetic_profile:
+        if not args.dmb_handoff_dir:
+            parser.error("--dmb-synthetic-profile needs --dmb-handoff-dir")
+        install_synthetic_profile(Path(args.dmb_handoff_dir))
 
     import uvicorn
     from backend.main import app

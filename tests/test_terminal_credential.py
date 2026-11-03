@@ -18,7 +18,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from conftest import TERMINAL_HEADERS, TERMINAL_ORIGIN, approval_body, reauthorize, set_mode, terminal_credential
+from conftest import TERMINAL_HEADERS, TERMINAL_ORIGIN, approval_body, reauthorize, set_mode, terminal_credential, start_kite_login
 from test_baseline_api import _manual_ticket
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +26,12 @@ MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
 BROKER_WRITES = ("place_order", "modify_order", "cancel_order", "place_gtt", "modify_gtt", "delete_gtt")
 WS_URL = TERMINAL_ORIGIN.replace("http://", "ws://") + "/ws/ticks"
 COOKIE = "kt_session"
+
+def _logged_in(client):
+    """P2-G: the browser first went through GET /login (a pending, cookie-bound login state)."""
+    start_kite_login(client)
+    return client
+
 
 
 def _client(token: str | None = None, headers=TERMINAL_HEADERS, base_url=TERMINAL_ORIGIN):
@@ -158,7 +164,7 @@ def _cookie_header(response) -> str:
 
 
 def test_the_kite_callback_issues_an_httponly_strict_cookie(env, no_after_login):
-    r = _client(None).get("/callback?request_token=abc&status=success", follow_redirects=False,
+    r = _logged_in(_client(None)).get("/callback?request_token=abc&status=success", follow_redirects=False,
                           headers={"Referer": "https://kite.zerodha.com/connect/finish"})
     assert r.status_code in (302, 307) and r.headers["location"] == "/"
     header = _cookie_header(r)
@@ -173,7 +179,7 @@ def test_the_kite_callback_issues_an_httponly_strict_cookie(env, no_after_login)
 
 
 def test_over_https_the_cookie_is_also_secure(env, no_after_login):
-    r = _client(None, base_url="https://127.0.0.1:8000").get("/callback?request_token=abc&status=success",
+    r = _logged_in(_client(None, base_url="https://127.0.0.1:8000")).get("/callback?request_token=abc&status=success",
                                                             follow_redirects=False)
     assert "secure" in _cookie_header(r).lower()
 
@@ -181,7 +187,7 @@ def test_over_https_the_cookie_is_also_secure(env, no_after_login):
 @pytest.mark.parametrize("query", ["status=cancelled", "request_token=abc&status=failure", "status=success"],
                          ids=["cancelled", "failed", "no_token"])
 def test_a_failed_or_cancelled_login_issues_nothing(env, no_after_login, query):
-    r = _client(None).get(f"/callback?{query}", follow_redirects=False)
+    r = _logged_in(_client(None)).get(f"/callback?{query}", follow_redirects=False)
     assert r.headers["location"] == "/?login_error=1" and "kt_session" not in _cookie_header(r)
 
 
@@ -191,13 +197,13 @@ def test_a_token_exchange_failure_issues_nothing(env, monkeypatch):
     def boom(token):
         raise RuntimeError("exchange failed")
     monkeypatch.setattr(kite_client, "exchange_request_token", boom)
-    r = _client(None).get("/callback?request_token=abc&status=success", follow_redirects=False)
+    r = _logged_in(_client(None)).get("/callback?request_token=abc&status=success", follow_redirects=False)
     assert r.headers["location"] == "/?login_error=1" and "kt_session" not in _cookie_header(r)
 
 
 def test_a_new_login_rotates_the_credential(env, no_after_login):
     old = terminal_credential()
-    r = _client(None).get("/callback?request_token=abc&status=success", follow_redirects=False)
+    r = _logged_in(_client(None)).get("/callback?request_token=abc&status=success", follow_redirects=False)
     new = re.search(r"kt_session=([A-Za-z0-9_\-]+)", _cookie_header(r)).group(1)
     assert new != old
     assert _client(old).post("/api/ui-prefs", json={"x": 1}).status_code == 401
@@ -260,7 +266,7 @@ def test_reauthorizing_after_a_logout_restores_writes(env):
 
 def test_the_credential_never_leaks_into_logs_bodies_pages_or_assets(env, no_after_login, caplog):
     caplog.set_level(logging.DEBUG)
-    r = _client(None).get("/callback?request_token=abc&status=success", follow_redirects=False)
+    r = _logged_in(_client(None)).get("/callback?request_token=abc&status=success", follow_redirects=False)
     token = re.search(r"kt_session=([A-Za-z0-9_\-]+)", _cookie_header(r)).group(1)
     c, anonymous = _client(token), _client(None)
     bodies = [

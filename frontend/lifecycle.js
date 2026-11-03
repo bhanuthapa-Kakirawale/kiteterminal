@@ -156,6 +156,47 @@
     }
   }
 
+  // SEC-1 P1-E: the entry order's broker ACCEPTANCE and its actual FILL are two facts, both
+  // decided by the server (lifecycle.order_progress, from broker-reported fills only). An
+  // acknowledgement is never shown as a fill; a quantity or price the server does not report is
+  // shown as unavailable, never inferred.
+  const ACCEPTANCE_LABELS = {
+    NOT_SUBMITTED: "not sent", SUBMITTING: "sending…", UNKNOWN: "outcome UNKNOWN — do not resubmit",
+    NEEDS_REVIEW: "needs review in Kite", ACCEPTED: "accepted", REJECTED: "rejected",
+    NOT_FOUND: "never reached the broker", NOT_RECORDED: "not recorded",
+  };
+  const FILL_LABELS = {
+    NONE: "nothing filled", UNKNOWN: "fill unknown", AWAITING_FILL: "accepted, not filled", PARTIAL: "partly filled",
+    FILLED: "fully filled", CANCELLED: "cancelled", REJECTED: "rejected by the exchange",
+    UNCONFIRMED: "fill not confirmed — check Kite", NOT_RECORDED: "fill not recorded",
+  };
+  const FILL_SEVERITY = {
+    FILLED: "ok", PARTIAL: "info", AWAITING_FILL: "info", NONE: "muted", CANCELLED: "muted", REJECTED: "warning",
+    UNKNOWN: "critical", UNCONFIRMED: "warning", NOT_RECORDED: "warning",
+  };
+
+  function entryProgressCell(lc) {
+    const p = lc && lc.entry_progress;
+    if (!p || !p.acceptance || !p.fill) {
+      return `<span class="lc-fill lc-sev-warning" data-acceptance="UNAVAILABLE" data-fill="UNAVAILABLE">`
+        + `Fill information unavailable</span>`;
+    }
+    const broker = p.simulated ? "Paper broker" : "Broker";
+    const qty = p.filled_quantity != null && p.requested_quantity != null
+      ? ` · ${esc(p.filled_quantity)}/${esc(p.requested_quantity)}` : "";
+    const showPrice = ["PARTIAL", "FILLED", "UNCONFIRMED"].includes(p.fill) && (p.filled_quantity ?? 0) > 0;
+    const price = showPrice
+      ? (lc.entry_fill_price != null ? ` · avg ₹${num(lc.entry_fill_price)}` : " · avg price not reported")
+      : "";
+    const working = p.working ? `<div class="lc-qty-sub">order working</div>` : "";
+    const legacy = p.fill_evidence === "LEGACY_RECORD" ? `<div class="lc-qty-sub">legacy record, not broker-verified</div>` : "";
+    return `<div data-acceptance="${esc(p.acceptance)}">${broker}: `
+      + `<strong>${esc(ACCEPTANCE_LABELS[p.acceptance] || p.acceptance)}</strong></div>`
+      + `<div class="lc-fill lc-sev-${FILL_SEVERITY[p.fill] || "muted"}" data-fill="${esc(p.fill)}">`
+      + `Fill: ${esc(FILL_LABELS[p.fill] || p.fill)}<span data-fill-qty>${qty}</span>`
+      + `<span data-fill-price>${price}</span></div>${working}${legacy}`;
+  }
+
   function activeExitCell(lc) {
     if (!lc) return "—";
     const x = lc.active_exit;
@@ -238,6 +279,7 @@
       <td><strong>${esc(lc.symbol)}</strong>${lc.strategy_name
         ? `<div class="lc-qty-sub">${esc(lc.strategy_name.replace(/_/g, " "))}</div>` : ""}</td>
       <td>${lifecycleBadge(lc)}</td>
+      <td data-field="fill">${entryProgressCell(lc)}</td>
       <td>${modeChip(lc.mode)}${paperOrderLine(lc)}</td>
       <td class="num">${quantityCell(lc)}</td>
       <td class="num">${num(entry)}${lc.entry_fill_price == null ? `<div class="lc-qty-sub">ref.</div>` : ""}</td>
@@ -258,6 +300,7 @@
       <td><strong>${esc(lc.symbol)}</strong></td>
       <td>${esc((lc.strategy_name || "manual").replace(/_/g, " "))}</td>
       <td>${lifecycleBadge(lc)}</td>
+      <td data-field="fill">${entryProgressCell(lc)}</td>
       <td>${modeChip(lc.mode)}</td>
       <td class="num">${quantityCell(lc)}</td>
       <td class="num">${num(t ? t.entry_price : lc.entry_fill_price)}</td>
@@ -271,6 +314,7 @@
 
   const api = {
     esc, ticketStateBadge, lifecycleBadge, protectionBadge, modeChip, paperOrderLine, quantityCell, activeExitCell,
+    entryProgressCell, ACCEPTANCE_LABELS, FILL_LABELS,
     issueBadges, reviewCell, actionButtons, unrealisedPnl, pnlCell, activeRowCells, closedRowCells,
   };
   root.KTLifecycle = api;

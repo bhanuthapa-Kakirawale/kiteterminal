@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from backend import dmb_inbox_contract as contract
-from backend import trading_calendar
+from backend import integration_profile, trading_calendar
 from backend.db import get_connection
 
 ENV_VAR = "KITE_DMB_HANDOFF_DIR"
@@ -57,6 +57,14 @@ class InboxError(Exception):
 def now_ist() -> datetime:
     """The inbox's one clock (tests pin it)."""
     return trading_calendar.now_ist()
+
+
+def policy_problem(packet: dict):
+    """The integration profile's verdict on one packet (backend/integration_profile.py):
+    synthetic packets only in the isolated synthetic test profile, real DMB evidence only for
+    sources whose private-handoff right is confirmed in this terminal (none today)."""
+    return contract.handoff_policy_problem(packet, synthetic_allowed=integration_profile.synthetic_test_active(),
+                                           real_sources=integration_profile.permitted_real_sources())
 
 
 def _utc_now_sql() -> str:
@@ -224,6 +232,10 @@ def import_bundle(account_id: int, session_id: int | None, session_date: str, bu
         bundle, facts = contract.parse_and_validate(raw, now)
         if bundle["bundle_id"] != bundle_id or bundle["session_date"] != session_date:
             raise contract.BundleRejected("FILE_SUBSTITUTION", "the file name does not match the bundle it holds")
+        for p in bundle["packets"]:
+            problem = policy_problem(p)
+            if problem is not None:
+                raise contract.BundleRejected(*problem)
     except contract.BundleRejected as exc:
         import_id = _record_rejection(account_id, session_id, session_date, bundle_id, exc, sha, size)
         return {"status": "REJECTED", "import_id": import_id, "reason_code": exc.code, "reason": exc.detail}
@@ -331,6 +343,9 @@ def actionability(conn, item, packet: dict, state: dict, now: datetime) -> dict:
         reasons.append("INTEGRITY_MISMATCH")
     if not contract.rights_permitted(packet.get("rights") or {}):
         reasons.append("RIGHTS_NOT_APPROVED")
+    problem = policy_problem(packet)
+    if problem is not None and problem[0] not in reasons:
+        reasons.append(problem[0])
     session = contract.parse_date(item["session_date"], "session_date")
     review = contract.parse_date(item["review_session_date"], "review_session_date")
     try:
@@ -362,7 +377,9 @@ def _view(conn, item, now: datetime) -> dict:
         "session_date": item["session_date"], "review_session_date": item["review_session_date"],
         "evidence_as_of": item["evidence_as_of"], "generated_at": item["generated_at"],
         "imported_at": item["created_at"], "import_id": item["import_id"], "bundle_id": item["bundle_id"],
-        "data_origin": item["data_origin"], "synthetic": item["data_origin"] == "SYNTHETIC",
+        "data_origin": item["data_origin"],
+        "synthetic": item["data_origin"] == "SYNTHETIC" or bool(contract.synthetic_markers(packet)),
+        "integration_profile": integration_profile.current(),
         "superseded_by_item_id": item["superseded_by_item_id"], "superseded_at": item["superseded_at"],
         "company": packet.get("company"), "sector": packet.get("sector"),
         "rationale": list(packet.get("reasons") or []), "detector_ids": list(packet.get("detector_ids") or []),
@@ -494,6 +511,9 @@ def link_ticket(account_id: int, item_id: int, session_id, ticket_id: int, start
     conn = get_connection()
     try:
         item = _item_or_404(conn, account_id, item_id)
+        problem = policy_problem(json.loads(item["packet_json"]))
+        if problem is not None:
+            raise InboxError(409, problem[0], "This research item cannot be linked to a ticket here: " + problem[1] + ".")
         start = conn.execute(
             "SELECT * FROM dmb_inbox_events WHERE id = ? AND account_id = ? AND item_id = ? AND event_type = 'TICKET_STARTED'",
             (start_event_id, account_id, item_id)).fetchone()

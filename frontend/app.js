@@ -2171,7 +2171,7 @@ function renderAppPositions() {
   setBadge(el.navBadgePositions, summary?.needs_attention || 0);
 
   el.positionsActiveBody.innerHTML = active.length ? "" :
-    `<tr class="empty-row"><td colspan="13">No active positions opened by this terminal</td></tr>`;
+    `<tr class="empty-row"><td colspan="14">No active positions opened by this terminal</td></tr>`;
   for (const lc of active) {
     const tr = document.createElement("tr");
     tr.dataset.positionId = lc.position_id;
@@ -2182,7 +2182,7 @@ function renderAppPositions() {
     el.positionsActiveBody.appendChild(tr);
   }
   el.positionsClosedBody.innerHTML = closed.length ? "" :
-    `<tr class="empty-row"><td colspan="12">No closed positions yet</td></tr>`;
+    `<tr class="empty-row"><td colspan="13">No closed positions yet</td></tr>`;
   for (const lc of closed) {
     const tr = document.createElement("tr");
     tr.dataset.positionId = lc.position_id;

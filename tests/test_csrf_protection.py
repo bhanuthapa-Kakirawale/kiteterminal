@@ -392,14 +392,14 @@ def test_j_kite_callback_navigation_is_not_blocked(env, monkeypatch):
         return None
     monkeypatch.setattr(auth, "_after_login", _no_after_login)
     # A top-level redirect from Zerodha: cross-site Referer, no app header.
-    r = _bare().get("/callback?request_token=abc&status=success", follow_redirects=False,
+    r = _logged_in(_bare()).get("/callback?request_token=abc&status=success", follow_redirects=False,
                     headers={"Referer": "https://kite.zerodha.com/connect/finish"})
     assert r.status_code in (302, 307) and r.headers["location"] == "/"
     assert exchanged == ["abc"]
 
 
 def test_j_callback_failure_path_is_unchanged(env):
-    r = _bare().get("/callback?status=cancelled", follow_redirects=False)
+    r = _logged_in(_bare()).get("/callback?status=cancelled", follow_redirects=False)
     assert r.status_code in (302, 307) and r.headers["location"] == "/?login_error=1"
 
 
@@ -428,3 +428,10 @@ def test_frontend_mutations_send_the_application_header():
         raw.append(rest[m.start():i])
     assert raw and all("," not in call and "{" not in call for call in raw), raw
     assert "XMLHttpRequest" not in js and "sendBeacon" not in js
+
+
+def _logged_in(client):
+    """P2-G: the browser first went through GET /login (a pending, cookie-bound login state)."""
+    from conftest import start_kite_login
+    start_kite_login(client)
+    return client

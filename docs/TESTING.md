@@ -59,6 +59,28 @@ never exist in `backend/main.py`. Do not combine it with
 `--lifecycle-fixtures`: its ten open positions fill `max_open_positions`
 and block every new entry.
 
+The DMB–Kite integration has its own isolated runners. Each one starts its own
+demo server in the synthetic test profile (`--dmb-synthetic-profile`:
+FakeKite, a scratch database, LIVE impossible). It also runs DMB's real
+exporter on the committed synthetic fixture
+(`docs/DMB_KITE_ACCEPTANCE_TEST.md`):
+```
+.venv/Scripts/python.exe tests/acceptance_dmb_kite.py      # 20 stages / 42 checks, incl. a real process restart
+.venv/Scripts/python.exe tests/e2e_dmb_inbox.py            # headless Edge, 31 checks
+.venv/Scripts/python.exe tests/acceptance_dmb_kite.py --serve-only   # isolated UI for a manual walk-through
+```
+The demo flags used are:
+- `--dmb-handoff-dir`: the scratch handoff folder;
+- `--keep-db`: restart on the same scratch database;
+- `--paper-controls`: drive paper fills;
+- `--review-controls`: adds `POST /api/demo/tamper-after-claim/{id}` and
+  `GET /api/demo/fake-kite/calls`.
+
+In pytest, the `synthetic_profile` fixture enters the profile. Every other
+test runs in PRODUCTION, which refuses synthetic bundles.
+`start_kite_login(client)` stands in for `GET /login`; without it, `/callback`
+exchanges nothing (P2-G).
+
 ### 1.3 Test infrastructure
 
 - **Real account data is off limits.** `tests/real_data_guard.py`, installed

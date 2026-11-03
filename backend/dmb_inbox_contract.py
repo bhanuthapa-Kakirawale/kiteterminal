@@ -338,6 +338,61 @@ def rights_permitted(r: dict) -> bool:
     return True
 
 
+SYNTHETIC_ARTIFACT_PREFIX = SYNTHETIC_SOURCE + ":"
+
+
+def synthetic_markers(p: dict) -> list:
+    """Every sign in the packet's content that it is synthetic test data. Not the `data_origin`
+    label alone: the synthetic source, a synthetic artifact id, DMB's `SYNTHETIC` rationale prefix
+    or the synthetic regime reason each count, so relabelling `data_origin` does not hide it."""
+    found = []
+    r = p.get("rights") if isinstance(p.get("rights"), dict) else {}
+    if r.get("data_origin") == "SYNTHETIC":
+        found.append("data_origin")
+    if any(isinstance(s, dict) and s.get("source_name") == SYNTHETIC_SOURCE for s in (r.get("sources") or [])):
+        found.append("rights.sources")
+    if any(isinstance(a, str) and a.lower().startswith("synthetic") for a in (p.get("source_artifact_ids") or [])):
+        found.append("source_artifact_ids")
+    if any(isinstance(t, str) and t.upper().startswith("SYNTHETIC") for t in (p.get("reasons") or [])):
+        found.append("reasons")
+    mr = p.get("market_regime") if isinstance(p.get("market_regime"), dict) else {}
+    if isinstance(mr.get("reason_code"), str) and "SYNTHETIC" in mr["reason_code"].upper():
+        found.append("market_regime.reason_code")
+    return found
+
+
+def handoff_policy_problem(p: dict, *, synthetic_allowed: bool, real_sources: frozenset):
+    """`(code, detail)` when the integration profile forbids this packet, else None.
+
+    - synthetic content (any marker) is allowed only in the isolated synthetic test profile, only
+      when it is labelled SYNTHETIC, and only from DMB's synthetic fixture (every artifact id is
+      `synthetic_handoff_fixture:<fixture id>`);
+    - real DMB evidence is allowed only when every source is in `real_sources` (empty in
+      production until the owner confirms private-handoff rights)."""
+    markers = synthetic_markers(p)
+    r = p.get("rights") if isinstance(p.get("rights"), dict) else {}
+    if markers:
+        if r.get("data_origin") != "SYNTHETIC":
+            return ("SYNTHETIC_MISLABELLED",
+                    f"the packet carries synthetic content ({', '.join(markers)}) but is labelled "
+                    f"{r.get('data_origin')!r}")
+        if not synthetic_allowed:
+            return ("SYNTHETIC_NOT_PERMITTED",
+                    "synthetic test packets are actionable only in the isolated synthetic test profile, never in "
+                    "production")
+        ids = p.get("source_artifact_ids") or []
+        if not ids or not all(isinstance(a, str) and a.startswith(SYNTHETIC_ARTIFACT_PREFIX)
+                              and len(a) > len(SYNTHETIC_ARTIFACT_PREFIX) for a in ids):
+            return ("SYNTHETIC_NOT_PERMITTED", "the synthetic packet does not come from DMB's synthetic fixture")
+        return None
+    names = [s.get("source_name") for s in (r.get("sources") or []) if isinstance(s, dict)]
+    unconfirmed = sorted({str(n) for n in names if n not in real_sources})
+    if not names or unconfirmed:
+        return ("RIGHTS_NOT_APPROVED",
+                f"no private-handoff right is confirmed in this terminal for source(s) {unconfirmed[:5]}")
+    return None
+
+
 # ---------------------------------------------------------------- packet / bundle
 def validate_packet(p, now: datetime) -> dict:
     """Raises BundleRejected; returns the parsed facts the inbox stores."""
@@ -495,5 +550,5 @@ def parse_and_validate(raw: bytes, now: datetime) -> tuple:
 
 __all__ = ["BundleRejected", "parse_and_validate", "validate_bundle", "validate_packet",
            "forbidden_keys", "key_is_forbidden", "packet_id_for", "bundle_id_for", "logical_key",
-           "rights_permitted", "expires_at", "check_sessions", "utc_sql", "BUNDLE_SCHEMA",
+           "rights_permitted", "synthetic_markers", "handoff_policy_problem", "expires_at", "check_sessions", "utc_sql", "BUNDLE_SCHEMA",
            "PACKET_SCHEMA", "SYMBOL_RE", "HEX64_RE", "DATE_RE", "MAX_BUNDLE_BYTES"]

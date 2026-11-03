@@ -413,20 +413,22 @@ def test_a_new_login_during_revalidation_withdraws_the_claim(live, clock):
     assert ticket_row(live.db, t["id"])["status"] == "pending_confirmation"
 
 
-def test_tampering_after_the_claim_cannot_change_what_is_sent(live, clock):
-    # R6: the final gate verifies the row read right after the claim, and the
-    # broker is sent exactly that row. A write that lands later, outside the
-    # API (a claimed ticket is not editable), changes nothing that is sent:
-    # the order and its protective stop are the reviewed ones.
+def test_tampering_after_the_claim_never_reaches_the_broker(live, clock):
+    # R6, tightened by the post-claim tampering audit (backend/ticket_integrity.py):
+    # a write that lands after the claim, outside the API (a claimed ticket is
+    # not editable), is detected immediately before the broker call. It is
+    # recorded, the claim is withdrawn and the ticket rejected: neither the
+    # tampered values nor the verified ones are sent. (Before the audit the
+    # verified row was sent and the tampered row was left, unrecorded.)
     t = _create(live)
     live.kite.on_call("margins", lambda _kwargs: _sql(
         live, "UPDATE trade_tickets SET stop_loss = 2000.0, quantity = 500 WHERE id = ?", t["id"]))
     r = _confirm(live, t["id"])
-    assert r.status_code == 200, r.text
-    [order] = live.kite.calls_to("place_order")
-    [gtt] = live.kite.calls_to("place_gtt")
-    assert (order["quantity"], order["price"]) == (5, 3000.0)
-    assert 2900.0 in gtt["trigger_values"] and 2000.0 not in gtt["trigger_values"]
+    assert r.status_code == 409 and _code(r) == "TICKET_TAMPERED_AFTER_CLAIM", r.text
+    assert r.json()["detail"]["categories"] == ["prices", "quantity"]
+    assert live.kite.calls_to("place_order") == [] and live.kite.calls_to("place_gtt") == []
+    row = ticket_row(live.db, t["id"])
+    assert row["status"] == "rejected" and row["submission_state"] is None and row["kite_order_id"] is None
 
 
 def test_tampering_before_the_claim_is_rejected_before_any_broker_call(live, clock):

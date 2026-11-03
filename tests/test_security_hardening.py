@@ -281,7 +281,7 @@ def fake_login(monkeypatch):
 
 def test_callback_works_on_approved_host(env, fake_login):
     issued, seen = fake_login
-    r = _bare().get("/callback?request_token=reqTOKENsentinel42&status=success", follow_redirects=False,
+    r = _logged_in(_bare()).get("/callback?request_token=reqTOKENsentinel42&status=success", follow_redirects=False,
                     headers={"Referer": "https://kite.zerodha.com/connect/finish"})
     assert r.status_code in (302, 307) and r.headers["location"] == "/"
     assert seen["request_tokens"] == ["reqTOKENsentinel42"]
@@ -289,7 +289,7 @@ def test_callback_works_on_approved_host(env, fake_login):
 
 def test_callback_blocked_on_hostile_host(env, fake_login):
     issued, seen = fake_login
-    r = _bare(EVIL).get("/callback?request_token=reqTOKENsentinel42&status=success", follow_redirects=False)
+    r = _logged_in(_bare(EVIL)).get("/callback?request_token=reqTOKENsentinel42&status=success", follow_redirects=False)
     assert _is_host_reject(r)
     assert seen["request_tokens"] == []
 
@@ -560,7 +560,7 @@ def test_no_get_endpoint_returns_a_secret(env):
 def test_login_stores_token_only_encrypted(env, fake_login):
     from backend import crypto
     issued, _ = fake_login
-    r = _bare().get("/callback?request_token=reqTOKENsentinel42&status=success", follow_redirects=False)
+    r = _logged_in(_bare()).get("/callback?request_token=reqTOKENsentinel42&status=success", follow_redirects=False)
     assert r.headers["location"] == "/"
     conn = env.db.get_connection()
     try:
@@ -575,7 +575,7 @@ def test_login_stores_token_only_encrypted(env, fake_login):
 
 def test_get_kite_uses_the_encrypted_token(env, fake_login):
     issued, seen = fake_login
-    _bare().get("/callback?request_token=reqTOKENsentinel42&status=success", follow_redirects=False)
+    _logged_in(_bare()).get("/callback?request_token=reqTOKENsentinel42&status=success", follow_redirects=False)
     REAL_GET_KITE()
     assert seen["set_access_token"] == [issued["access_token"]]
 
@@ -876,7 +876,7 @@ def test_sensitive_api_responses_are_no_store(env, path):
 
 def test_auth_redirects_are_no_store(env, fake_login):
     assert _bare().get("/login", follow_redirects=False).headers["cache-control"] == "no-store"
-    r = _bare().get("/callback?status=cancelled", follow_redirects=False)
+    r = _logged_in(_bare()).get("/callback?status=cancelled", follow_redirects=False)
     assert r.headers["cache-control"] == "no-store"
 
 
@@ -965,3 +965,10 @@ def test_frontend_code_references_no_external_origin():
         text = (FRONTEND / name).read_text(encoding="utf-8")
         assert not re.search(r"https?://", text), name
         assert "@import" not in text and "import(" not in text, name
+
+
+def _logged_in(client):
+    """P2-G: the browser first went through GET /login (a pending, cookie-bound login state)."""
+    from conftest import start_kite_login
+    start_kite_login(client)
+    return client

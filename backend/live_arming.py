@@ -25,13 +25,14 @@ pre-SEC-1 setter, is no longer called by any backend code
 import logging
 import sqlite3
 
-from backend import obs, system_events
+from backend import integration_profile, obs, system_events
 from backend.db import get_connection
 from backend.ticker import ticker_manager
 
 logger = logging.getLogger(__name__)
 
 LIVE_READINESS_NOT_MET = "LIVE_READINESS_NOT_MET"
+SYNTHETIC_TEST_PROFILE = "SYNTHETIC_TEST_PROFILE"
 
 
 class LiveReadinessNotMet(RuntimeError):
@@ -104,9 +105,15 @@ def set_mode(mode: str, confirm_real_money: bool, account_id: int, readiness: di
     try:
         previous_mode = _mode_row(conn)["mode"]
         if mode == "live":
-            if live_armed_for_active_session(conn, account_id):
+            refusal = None
+            if integration_profile.synthetic_test_active():
+                # The isolated synthetic DMB test profile can never execute live, whatever the
+                # readiness (backend/integration_profile.py).
+                refusal = ("this terminal runs the isolated synthetic test profile, which never executes live",
+                           [SYNTHETIC_TEST_PROFILE])
+            elif live_armed_for_active_session(conn, account_id):
                 return mode  # already armed for this session: a no-op
-            refusal = _arming_refusal(readiness)
+            refusal = refusal or _arming_refusal(readiness)
             session_id = active_session_id(conn, account_id)
             if refusal is None and session_id is None:
                 refusal = "there is no active Kite session to arm", ["BROKER_SESSION"]

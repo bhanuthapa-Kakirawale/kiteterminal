@@ -160,6 +160,12 @@ def get_kite(account_id: int | None = None) -> KiteConnect:
     return kite
 
 
+# The real broker factory, kept by identity: the synthetic test profile
+# (backend/integration_profile.py) refuses to activate, and stops counting as
+# active, while get_kite is still this function (i.e. no FakeKite installed).
+PRODUCTION_GET_KITE = get_kite
+
+
 def require_kite() -> KiteConnect:
     # Parameterless by design: there is no account-selection UI yet, so this
     # always resolves to the single default account. Once multi-account UI

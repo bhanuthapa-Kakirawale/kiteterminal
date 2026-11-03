@@ -32,6 +32,24 @@ pass today are DMB's synthetic test fixtures; they are labelled **SYNTHETIC** ev
 rationale starts with `[SYNTHETIC TEST PACKET]`. This is an operating decision, not a legal
 conclusion.
 
+## Integration profile: synthetic bundles only in the isolated test profile
+
+Synthetic bundles are **refused in production**, at import (`SYNTHETIC_NOT_PERMITTED`) and for any ticket handoff. They are actionable only in the isolated synthetic test profile (`backend/integration_profile.py`):
+
+- **How it is entered:** only a test harness can enter it: `tests/demo_server.py --dmb-synthetic-profile`, and the test suite. There is no environment variable, setting or route for it.
+- **What it requires:** a throwaway database and FakeKite. Both are re-checked on every use.
+- **What it forbids:** arming LIVE.
+
+"Synthetic" is decided by the packet's content, not the `data_origin` label alone. The checks:
+
+- **Any marker counts:** the synthetic source, a `synthetic…` artifact id, a `SYNTHETIC` rationale prefix or the synthetic regime reason.
+- **Relabelling is refused:** a relabelled packet gets `SYNTHETIC_MISLABELLED` in every profile.
+- **Fixture origin is required:** a synthetic packet must come from DMB's fixture (`synthetic_handoff_fixture:<id>`).
+
+A packet claiming real DMB evidence is accepted only when every source is in `integration_profile.PRODUCTION_PERMITTED_SOURCES`. That list is **empty** until the owner confirms private-handoff rights.
+
+The isolated acceptance test is `docs/DMB_KITE_ACCEPTANCE_TEST.md`.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -129,8 +147,9 @@ never a broker call). Degraded items stay visible for research, marked "research
 ## Not done / limitations
 
 - Real-data handoff is blocked (see above). No source permission was changed by this work.
-- Symlink cases are tested with real symlinks only where the OS allows creating them; on this
-  Windows machine (no symlink privilege) they are skipped and the refusal branch is exercised
-  with a simulated `lstat` instead. Junctions and hard links are tested for real.
+- Symlink cases are tested with real symlinks only where the OS allows creating them. On this
+  Windows machine (no symlink privilege: WinError 1314, re-checked 2026-11-03 without elevating)
+  the 3 real-symlink tests are skipped and the refusal branch is exercised with a simulated
+  `lstat` instead. Junctions and hard links are tested for real.
 - An import reads the file once; a DMB-side bundle is immutable and read-only, so a later change
   on disk would be a different file and is refused by its ids.

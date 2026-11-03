@@ -56,7 +56,8 @@ def _snapshot(folder: Path) -> dict:
 
 
 @pytest.fixture
-def roundtrip(env, tmp_path, monkeypatch):
+def roundtrip(synthetic_profile, tmp_path, monkeypatch):
+    env = synthetic_profile          # the isolated synthetic test profile (backend/integration_profile.py)
     from backend import dmb_inbox
     handoff = tmp_path / "dmb_handoff"
     monkeypatch.setenv(dmb_inbox.ENV_VAR, str(handoff))

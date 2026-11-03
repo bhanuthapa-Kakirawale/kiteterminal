@@ -13,6 +13,7 @@ from backend import (
     risk_engine,
     signal_chart,
     system_events,
+    ticket_integrity,
 )
 from backend.accounts import get_trading_account
 from backend.db import get_connection
@@ -483,6 +484,22 @@ def _quantity_fields(ticket: sqlite3.Row, ctx: lifecycle.Context) -> dict:
     return fields
 
 
+@router.get("/api/tickets/{ticket_id}/integrity")
+def get_ticket_integrity(ticket_id: int, kite: KiteConnect = Depends(require_trading_account)):
+    """The ticket's post-claim integrity audit (backend/ticket_integrity.py): its claim
+    snapshots and any tamper detections (digests and category names only), and whether the
+    append-only, hash-chained log still verifies. Read-only."""
+    account = get_trading_account()
+    conn = get_connection()
+    try:
+        _get_ticket_or_404(conn, ticket_id, account["id"])
+        return {"data": {"ticket_id": ticket_id, "tampered": ticket_integrity.tampered(conn, ticket_id),
+                         "events": ticket_integrity.events(conn, account["id"], ticket_id),
+                         "chain": ticket_integrity.verify_chain(conn)}}
+    finally:
+        conn.close()
+
+
 @router.get("/api/tickets/{ticket_id}")
 def get_ticket(ticket_id: int, kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
@@ -576,6 +593,12 @@ def revert_rejection(ticket_id: int, kite: KiteConnect = Depends(require_trading
             raise HTTPException(409, {
                 "error_code": "CONFLICT_INVALID_STATE",
                 "message": f"Only a rejected ticket can be reverted (current status: '{ticket['status']}')",
+            })
+        if ticket_integrity.tampered(conn, ticket_id):
+            raise HTTPException(409, {
+                "error_code": ticket_integrity.TAMPER_CODE,
+                "message": "This ticket's details were changed after it was claimed for execution; it can never "
+                           "be reverted or approved. Create a new ticket.",
             })
         # Conditional (PK-4): a second revert, or any other change since the
         # read above, must not be overwritten.
@@ -1011,6 +1034,38 @@ def _refuse_unsupported_at_confirm(conn: sqlite3.Connection, ticket: sqlite3.Row
     })
 
 
+def _refuse_tampered_ticket(conn: sqlite3.Connection, ticket: sqlite3.Row, account_id: int) -> None:
+    """Post-claim tampering was detected for this ticket earlier (backend/ticket_integrity.py):
+    it can never be confirmed again - no new claim, no fresh review, nothing sent."""
+    if not ticket_integrity.tampered(conn, ticket["id"]):
+        return
+    message = (f"Ticket {ticket['id']}'s order details were changed after it was claimed for execution (see its "
+               f"integrity audit). It can never be approved; create a new ticket. Nothing was executed.")
+    if ticket["status"] in _CONFIRMABLE_STATUSES and _transition(conn, ticket["id"], account_id,
+                                                                 _CONFIRMABLE_STATUSES, "rejected"):
+        _log_event(conn, ticket["id"], "rejected", f"Refused at confirmation ({ticket_integrity.TAMPER_CODE}): "
+                                                   f"{message}")
+        conn.commit()
+        _notify("rejected", ticket_id=ticket["id"])
+    raise HTTPException(409, {"error_code": ticket_integrity.TAMPER_CODE, "message": message})
+
+
+def _verify_claimed_content(conn: sqlite3.Connection, account: sqlite3.Row, claimed: sqlite3.Row, stage: str) -> None:
+    """Post-claim tampering audit, before anything is sent: the persisted row must still be the
+    content this claim snapshotted. A change is recorded (append-only, committed first so it
+    survives), the claim is withdrawn and the ticket rejected for good; the broker is never called."""
+    current = conn.execute("SELECT * FROM trade_tickets WHERE id = ?", (claimed["id"],)).fetchone()
+    changed = ticket_integrity.check(conn, account["id"], current, stage)
+    if not changed:
+        return
+    conn.commit()
+    detail = (f"Refused ({ticket_integrity.TAMPER_CODE}): the ticket's {', '.join(changed)} changed after it was "
+              f"claimed for execution (detected {stage.replace('_', ' ')}). Nothing was sent to the broker; the "
+              f"ticket is rejected and can never be approved — create a new ticket.")
+    _end_claim(conn, claimed, account["id"], "rejected", "rejected", detail)
+    raise HTTPException(409, {"error_code": ticket_integrity.TAMPER_CODE, "message": detail, "categories": changed})
+
+
 def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, kite: KiteConnect, ticket_id: int,
                                expected_mode: str | None = None, allow_amo: bool = False,
                                expected_review_token: str | None = None) -> dict:
@@ -1034,6 +1089,8 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
         _raise_invalid_state(conn, ticket_id, account["id"], "confirm")
     # PK-17: only a supported NEW position may go further; exits pass.
     _refuse_unsupported_at_confirm(conn, ticket, account["id"])
+    # Post-claim tampering, once detected, refuses the ticket for good.
+    _refuse_tampered_ticket(conn, ticket, account["id"])
 
     mode, mode_note = _claim_mode(conn, ticket, account["id"])
     new_entry = not execution.is_closing_sell(ticket)
@@ -1094,6 +1151,9 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
             _refuse_daily_entry_limit(conn, account, ticket)
         _raise_invalid_state(conn, ticket_id, account["id"], "confirm")
     _log_event(conn, ticket_id, "confirmed", f"Confirmed in {mode} mode{mode_note}")
+    # The claim's snapshot of the content this confirmation was decided on (the row the
+    # pre-claim checks read), in the claim's own transaction (backend/ticket_integrity.py).
+    ticket_integrity.record_claim(conn, account["id"], ticket)
     conn.commit()
     # PK-22E: the claim, traceable by this request's cid, the ticket id and
     # the order tag the broker order will carry.
@@ -1102,6 +1162,7 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
               variety=variety)
 
     ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
+    _verify_claimed_content(conn, account, ticket, "post_claim")
     ctx = None
     if ticket["closes_ticket_id"] is None:
         # PK-4: this ticket won the claim; now re-check it against the
@@ -1110,6 +1171,9 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
     if new_entry:
         # PK-12: the account safety gate has the last word before the broker.
         _account_safety_final_gate(conn, account, kite, ticket, ctx)
+    # The last look at the database before the broker call: a write that landed during
+    # revalidation refuses the execution instead of leaving tampered content behind.
+    _verify_claimed_content(conn, account, ticket, "pre_broker")
     # PK-20: the broker of the ticket's own mode — Kite for live, the paper
     # broker (on this request's connection, so the paper order is written in
     # the same transaction as the ticket's outcome) for dry run.
@@ -1134,6 +1198,11 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
         log_event(logger, "approval.result_superseded", "warning", account_id=account["id"], ticket_id=ticket_id,
                   symbol=ticket["symbol"], mode=ticket["mode"], order_id=result.kite_order_id)
     _account_safety_bookkeeping(account, ticket, result, variety)
+    # After the broker call: the broker was sent the verified in-memory row; a change to the
+    # persisted row meanwhile is recorded (and reported), never silently left behind.
+    persisted = conn.execute("SELECT * FROM trade_tickets WHERE id = ?", (ticket_id,)).fetchone()
+    tampered_after_send = ticket_integrity.check(conn, account["id"], persisted, "post_execution")
+    conn.commit()
 
     # PK-8: an exit closes its position only once its fill is proven. An
     # exit the broker accepted is EXITING — the position stays open,
@@ -1144,6 +1213,11 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
 
     _notify("executed", ticket_id=ticket_id, status=ticket["status"], success=result.success)
     data = _with_lifecycle(conn, ticket)
+    if tampered_after_send:
+        data["integrity_warning"] = {
+            "error_code": ticket_integrity.TAMPER_CODE, "categories": tampered_after_send,
+            "message": "The ticket's stored details changed after the broker call; the broker was sent the "
+                       "verified values. The change is recorded in the ticket's integrity audit."}
     if won:
         data["execution_message"] = result.message
         data["success"] = result.success

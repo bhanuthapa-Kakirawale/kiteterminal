@@ -21,7 +21,10 @@ INBOX_TABLES = ("dmb_inbox_imports", "dmb_inbox_items", "dmb_inbox_events", "dmb
 
 
 @pytest.fixture
-def inbox(env, tmp_path, monkeypatch):
+def inbox(synthetic_profile, tmp_path, monkeypatch):
+    # Synthetic bundles are actionable only in the isolated synthetic test profile
+    # (tests/test_integration_profile.py proves production refuses them).
+    env = synthetic_profile
     from backend import dmb_inbox
     root = tmp_path / "dmb_handoff"
     root.mkdir()
@@ -76,8 +79,8 @@ TRADING_TABLES = ("trade_tickets", "ticket_events", "watchlist", "strategy_confi
 
 # ============================================================ migration v9
 def test_migration_v9_creates_the_inbox_tables(env):
-    assert env.db.LATEST_SCHEMA_VERSION == 9
-    assert env.db.MIGRATIONS[-1][:2] == (9, "dmb_research_inbox")
+    assert env.db.LATEST_SCHEMA_VERSION >= 9   # v10: ticket integrity audit
+    assert env.db.MIGRATIONS[8][:2] == (9, "dmb_research_inbox")
     for t in INBOX_TABLES:
         assert _rows(env, "SELECT name FROM sqlite_master WHERE type='table' AND name=?", t), t
     conn = env.db.get_connection()

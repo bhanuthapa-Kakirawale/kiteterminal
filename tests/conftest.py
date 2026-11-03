@@ -60,10 +60,33 @@ _TEST_CREDENTIAL: dict = {"token": None}
 def _fresh_terminal_credential():
     from backend import security
     security.revoke_terminal_credential()
+    security.clear_login_states()
     _TEST_CREDENTIAL["token"] = None
     yield
     security.revoke_terminal_credential()
+    security.clear_login_states()
     _TEST_CREDENTIAL["token"] = None
+
+
+@pytest.fixture(autouse=True)
+def _production_integration_profile():
+    """Every test starts in the PRODUCTION integration profile; the isolated synthetic DMB test
+    profile is entered only through the `synthetic_profile` fixture, and never outlives a test."""
+    from backend import integration_profile
+    integration_profile.deactivate()
+    yield
+    integration_profile.deactivate()
+
+
+@pytest.fixture
+def synthetic_profile(env):
+    """The isolated synthetic test profile (backend/integration_profile.py) on env's throwaway
+    database and FakeKite: synthetic DMB bundles are actionable, LIVE is impossible.
+    `approved_test_source` stands for a real source only inside this profile."""
+    from backend import integration_profile
+    integration_profile.activate_synthetic_test_profile(test_sources=("approved_test_source",))
+    assert integration_profile.synthetic_test_active()
+    return env
 
 
 def terminal_credential() -> str:
@@ -72,6 +95,15 @@ def terminal_credential() -> str:
     if _TEST_CREDENTIAL["token"] is None or not security.terminal_credential_valid(_TEST_CREDENTIAL["token"]):
         _TEST_CREDENTIAL["token"] = security.issue_terminal_credential()
     return _TEST_CREDENTIAL["token"]
+
+
+def start_kite_login(client) -> str:
+    """What GET /login leaves in the browser (P2-G login CSRF guard): a pending, single-use login
+    state, cookie-bound to this client, without which /callback exchanges nothing."""
+    from backend import security
+    token = security.begin_login()
+    client.cookies.set(security.LOGIN_STATE_COOKIE, token)
+    return token
 
 
 def reauthorize(client) -> str:
@@ -369,7 +401,7 @@ def ticket_row(db, ticket_id: int) -> dict:
 
 
 __all__ = ["FakeKite", "make_candles", "seed_ohlc", "add_watch", "account_id", "set_mode", "displayed_mode",
-           "approval_body", "ticket_row", "terminal_credential", "reauthorize",
+           "approval_body", "ticket_row", "terminal_credential", "reauthorize", "start_kite_login",
            "as_pre_pk22_database", "seed_live_prerequisites", "clear_live_prerequisites", "TEST_STATIC_IP",
            "seed_healthy_live_state", "clear_healthy_live_state", "make_live_ready",
            "last_weekday", "IST", "TERMINAL_ORIGIN", "TERMINAL_HEADERS", "terminal_client"]
