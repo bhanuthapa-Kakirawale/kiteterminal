@@ -1924,6 +1924,125 @@ def _m008_p1d_review_generation(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE trade_tickets ADD COLUMN review_generation TEXT")
 
 
+# DMB research inbox (backend/dmb_inbox.py): Daily Market Byte candidate
+# packets the user imported from local handoff files. Research context only:
+# nothing here is read by the strategy engine, the risk engine or execution,
+# and no row in these tables can create, change or delete a trade ticket.
+#   dmb_inbox_imports       every import attempt, accepted or refused;
+#   dmb_inbox_items         every packet version ever imported, verbatim, one
+#                           row per (account, packet_id); an older version of
+#                           the same logical candidate is marked superseded
+#                           (once) by a newer one, never removed;
+#   dmb_inbox_events        the user's actions (dismiss, note, research
+#                           watchlist, start ticket) and import facts;
+#   dmb_inbox_ticket_links  inbox item -> the manual ticket a "Start ticket"
+#                           led to. ticket_id deliberately has no foreign key:
+#                           a link never constrains, cascades into or changes
+#                           trade_tickets.
+# Imports and events are append-only and items are immutable apart from the
+# write-once supersession pointer; triggers refuse anything else.
+_DMB_INBOX_TABLES = """
+CREATE TABLE IF NOT EXISTS dmb_inbox_imports (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id             INTEGER NOT NULL REFERENCES accounts(id),
+    requested_session_date TEXT NOT NULL,
+    requested_bundle_id    TEXT NOT NULL,
+    status                 TEXT NOT NULL CHECK (status IN ('IMPORTED', 'DUPLICATE', 'REJECTED')),
+    reason_code            TEXT,
+    reason_detail          TEXT,
+    file_sha256            TEXT,
+    file_size              INTEGER,
+    bundle_schema          TEXT,
+    bundle_generated_at    TEXT,
+    packet_count           INTEGER,
+    new_item_count         INTEGER NOT NULL DEFAULT 0,
+    session_id             INTEGER,
+    imported_at            TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_dmb_inbox_imports_account ON dmb_inbox_imports(account_id, id);
+
+CREATE TABLE IF NOT EXISTS dmb_inbox_items (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id            INTEGER NOT NULL REFERENCES accounts(id),
+    packet_id             TEXT NOT NULL,
+    logical_key           TEXT NOT NULL,
+    symbol                TEXT NOT NULL,
+    listing_exchange      TEXT NOT NULL CHECK (listing_exchange = 'NSE'),
+    session_date          TEXT NOT NULL,
+    review_session_date   TEXT NOT NULL,
+    evidence_as_of        TEXT NOT NULL,
+    evidence_as_of_utc    TEXT NOT NULL,
+    generated_at          TEXT NOT NULL,
+    generated_at_utc      TEXT NOT NULL,
+    data_origin           TEXT NOT NULL,
+    rights_status         TEXT NOT NULL,
+    bundle_id             TEXT NOT NULL,
+    import_id             INTEGER NOT NULL REFERENCES dmb_inbox_imports(id),
+    packet_json           TEXT NOT NULL,
+    created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+    superseded_by_item_id INTEGER REFERENCES dmb_inbox_items(id),
+    superseded_at         TEXT,
+    UNIQUE (account_id, packet_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dmb_inbox_items_logical ON dmb_inbox_items(account_id, logical_key);
+
+CREATE TABLE IF NOT EXISTS dmb_inbox_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id  INTEGER NOT NULL REFERENCES accounts(id),
+    item_id     INTEGER REFERENCES dmb_inbox_items(id),
+    import_id   INTEGER REFERENCES dmb_inbox_imports(id),
+    event_type  TEXT NOT NULL CHECK (event_type IN (
+                    'IMPORTED', 'SUPERSEDED', 'DISMISSED', 'NOTE_ADDED', 'WATCHLIST_ADDED',
+                    'WATCHLIST_REMOVED', 'TICKET_STARTED', 'TICKET_LINKED'
+                )),
+    detail      TEXT,
+    session_id  INTEGER,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_dmb_inbox_events_item ON dmb_inbox_events(item_id, id);
+
+CREATE TABLE IF NOT EXISTS dmb_inbox_ticket_links (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id     INTEGER NOT NULL REFERENCES accounts(id),
+    item_id        INTEGER NOT NULL REFERENCES dmb_inbox_items(id),
+    ticket_id      INTEGER NOT NULL,
+    start_event_id INTEGER NOT NULL REFERENCES dmb_inbox_events(id),
+    linked_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (ticket_id),
+    UNIQUE (start_event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dmb_inbox_ticket_links_item ON dmb_inbox_ticket_links(item_id);
+
+CREATE TRIGGER IF NOT EXISTS dmb_inbox_imports_append_only_u BEFORE UPDATE ON dmb_inbox_imports
+BEGIN SELECT RAISE(ABORT, 'dmb_inbox_imports is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS dmb_inbox_imports_append_only_d BEFORE DELETE ON dmb_inbox_imports
+BEGIN SELECT RAISE(ABORT, 'dmb_inbox_imports is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS dmb_inbox_events_append_only_u BEFORE UPDATE ON dmb_inbox_events
+BEGIN SELECT RAISE(ABORT, 'dmb_inbox_events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS dmb_inbox_events_append_only_d BEFORE DELETE ON dmb_inbox_events
+BEGIN SELECT RAISE(ABORT, 'dmb_inbox_events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS dmb_inbox_items_keep_versions BEFORE DELETE ON dmb_inbox_items
+BEGIN SELECT RAISE(ABORT, 'dmb_inbox_items keeps every packet version'); END;
+CREATE TRIGGER IF NOT EXISTS dmb_inbox_items_immutable BEFORE UPDATE ON dmb_inbox_items
+WHEN OLD.superseded_by_item_id IS NOT NULL
+  OR NEW.superseded_by_item_id IS NULL
+  OR NEW.account_id IS NOT OLD.account_id OR NEW.packet_id IS NOT OLD.packet_id
+  OR NEW.logical_key IS NOT OLD.logical_key OR NEW.symbol IS NOT OLD.symbol
+  OR NEW.listing_exchange IS NOT OLD.listing_exchange OR NEW.session_date IS NOT OLD.session_date
+  OR NEW.review_session_date IS NOT OLD.review_session_date
+  OR NEW.evidence_as_of IS NOT OLD.evidence_as_of OR NEW.evidence_as_of_utc IS NOT OLD.evidence_as_of_utc
+  OR NEW.generated_at IS NOT OLD.generated_at OR NEW.generated_at_utc IS NOT OLD.generated_at_utc
+  OR NEW.data_origin IS NOT OLD.data_origin OR NEW.rights_status IS NOT OLD.rights_status
+  OR NEW.bundle_id IS NOT OLD.bundle_id OR NEW.import_id IS NOT OLD.import_id
+  OR NEW.packet_json IS NOT OLD.packet_json OR NEW.created_at IS NOT OLD.created_at
+BEGIN SELECT RAISE(ABORT, 'a dmb_inbox_items row is immutable apart from its supersession, set once'); END;
+"""
+
+
+def _m009_dmb_research_inbox(conn: sqlite3.Connection) -> None:
+    _execute_script(conn, _DMB_INBOX_TABLES)
+
+
 # (version, name, function) — append only; never renumber or rename a
 # released migration: the name is checked against every database's history.
 MIGRATIONS: list[tuple[int, str, object]] = [
@@ -1935,6 +2054,7 @@ MIGRATIONS: list[tuple[int, str, object]] = [
     (6, "sec1_live_safety", _m006_sec1_live_safety),
     (7, "p1d_ticket_review", _m007_p1d_ticket_review),
     (8, "p1d_review_generation", _m008_p1d_review_generation),
+    (9, "dmb_research_inbox", _m009_dmb_research_inbox),
 ]
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
 

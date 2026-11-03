@@ -879,7 +879,7 @@ def test_migration_v7_is_idempotent(env):
         conn.close()
     assert (columns["reviewed_at"], columns["reviewed_session_id"], columns["review_digest"]) == \
         ("TEXT", "INTEGER", "TEXT")
-    assert db.MIGRATIONS[-2][:2] == (7, "p1d_ticket_review")
+    assert {v: n for v, n, _ in db.MIGRATIONS}[7] == "p1d_ticket_review"
 
 
 def test_a_pending_manual_ticket_from_before_v7_needs_a_re_review(live):
