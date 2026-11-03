@@ -1,96 +1,149 @@
 # DMB → Kite: operational runbook
 
-**Status.** The local synthetic integration test is ready. **Real-data handoff is blocked** until private-handoff rights are confirmed.
+**Status (2026-11-03).** Software readiness work is complete for synthetic integration and dry-run operation. **Real-data handoff is BLOCKED** (source rights, `docs/DMB_KITE_SOURCE_RIGHTS_MATRIX.md`). **Live broker execution is NOT approved**: the real broker path, including Emergency Exit, has never been validated. Decisions: §7.
 
-This runbook covers the *isolated test* operation that is possible today, and the procedures that will apply to the real terminal. It changes no operating decision.
+This runbook changes no operating decision. It records how to run, restart, exit and recover, and what has and has not been tested.
 
 ## 0. Validation status
 
-| Area | Tested with FakeKite and scratch DBs (pytest) | Isolated local browser / process | Real broker |
+| Area | pytest (FakeKite, scratch DBs) | Isolated processes / headless Edge | Real broker / real login |
 |---|---|---|---|
-| DMB export → Kite import, inbox actions, Start ticket | yes | yes (acceptance A, browser C) | n/a (no broker) |
+| DMB export → Kite import, inbox actions, Start ticket | yes | yes (acceptance, browser) | n/a (no broker) |
 | Synthetic isolation (test profile vs production) | yes | yes | n/a |
 | P1-D review, token binding, dry-run approval | yes | yes | **not tested** |
 | Positions broker / fill display | yes | yes (paper broker) | **not tested** |
 | Post-claim tampering audit | yes | yes | **not tested** |
-| Restart / logout / fresh login | yes | yes (real process restart) | **not tested** (real Kite login) |
-| Emergency Exit | yes | yes (FakeKite) | **NOT VALIDATED** — the real broker path is outside this sprint |
-| Login CSRF guard (P2-G F1) | yes | n/a | **not tested** against a real Kite redirect |
-| Real DMB evidence handoff | — | — | **BLOCKED by source rights** (DMB: every real source UNRESOLVED; Kite: no confirmed source) |
-| 2027 sessions | fail-closed tested | — | **BLOCKED by the missing official NSE 2027 calendar** |
+| Restart / logout / fresh login, credential invalidation | yes | yes (real process restart) | **not tested** (real Kite login) |
+| P2-G R-F1 login binding (state via `redirect_params`) | yes | n/a | **one real login needed to confirm Kite echoes it** |
+| P2-G R-F2 / R-F3 / R-F4 (reads, port isolation, WS revocation) | yes | yes (incl. a real second server on another port) | n/a |
+| Emergency Exit | yes (6 scenarios) | yes (FakeKite) | **NOT VALIDATED** |
+| Calendar session semantics, DMB/Kite parity | yes (761 days, 0 differences) | — | n/a |
+| Real DMB evidence handoff | — | — | **BLOCKED by source rights** |
+| 2027 sessions | fail-closed tested | — | **BLOCKED: NSE 2027 circular not published** |
 
-## 1. Normal startup (isolated synthetic test)
+## 1. Normal startup
 
-1. **Start DMB's Private Desk (optional, read-only research view).** From `D:\Claude_WS\daily_byte`, follow DMB's own Private Desk instructions. For the integration test, DMB is used only through its exporter, which the acceptance runner calls on the synthetic fixture. **Do not run DMB production pipelines or scheduler jobs.**
-2. **Start the isolated Kite instance.** Run `.venv\Scripts\python.exe tests\acceptance_dmb_kite.py --serve-only` from `D:\Claude_WS\kite-terminal`. See `docs/DMB_KITE_ACCEPTANCE_TEST.md`.
-   - The console prints `SYNTHETIC TEST PROFILE active (FakeKite, throwaway DB, LIVE impossible)` and the scratch handoff directory.
-   - **Never** start the real terminal (`python -m backend.server`) for this test.
-3. **Check the handoff directory.** The inbox lists only `<dir>\<YYYY-MM-DD>\<64-hex>.json` entries.
-   - In the test, `<dir>` is `%TEMP%\dmb_kite_acceptance\handoff`.
-   - In the real terminal it is `KITE_DMB_HANDOFF_DIR`. When that is unset, import is off.
-4. **Check session and freshness.**
-   - The bundle's `session_date` must be a completed regular NSE session.
-   - `review_session_date` must be the next regular session.
-   - Packets expire at **15:30 IST on the review session**.
-   - The test instance pins its clock to 2026-11-03 11:00 IST, inside the review session.
-5. **Import and review.** Import the synthetic bundle, then open each packet: provenance, evidence time, quality, rights, and the SYNTHETIC label.
-6. **Use the inbox.**
-   - **Dismiss**, **Add note** and **research watchlist** are recorded inbox events.
-   - The research watchlist is **separate** from the strategy watchlist (the scan universe). It never changes what strategies scan.
-7. **Start a manual ticket.** Only **symbol, exchange and rationale** are prefilled. **Side, order type, product, quantity, entry, stop and targets must be typed in by you.** The form refuses to submit without them.
-8. **P1-D human review.** Creating the ticket stamps the review. The approval dialog shows the review and its state. Approve from that dialog; it echoes the token it showed. If the review is not current (after 09:15, after 15:30, or after a new login), use **Re-review**.
+### 1.1 DMB Private Desk (optional, read-only research)
+- From `D:\Claude_WS\daily_byte`: `scripts\run_private_desk.bat`, which serves `http://127.0.0.1:8765` (loopback only, GET only).
+- The desk never writes DMB stores and never uploads. **Do not run DMB production pipelines or scheduler jobs as part of Kite operation.**
+- Note: the desk is "another local web server on 127.0.0.1". The browser sends it Kite's cookie (cookies have no port), but since P2-G that cookie is useless without the terminal token, which the desk cannot read (§6).
+
+### 1.2 Kite Terminal (real terminal, dry run)
+1. From `D:\Claude_WS\kite-terminal`: `.venv\Scripts\python.exe -m backend.server`. It serves `127.0.0.1:8000` with one worker, no reload, loopback only. Check the startup "Security summary" line. The Host header must name port 8000 exactly.
+2. Open `http://127.0.0.1:8000/` in **your normal browser profile** (the one you will keep using; the terminal token lives in that profile's storage for this origin).
+3. Before login you see **"Log in to unlock this terminal"**. No account data is shown and nothing can be changed.
+4. Press **Log in to Zerodha** → Zerodha password and 2FA → back to the terminal.
+   - **First real login after this sprint (R-F1 confirmation):** check that you land on the dashboard. If you land on `/?login_error=1` and the log says *"Kite callback refused: not the pending login started from this browser"*, Kite did not echo the state. Stop the terminal, set `KITE_TERMINAL_LOGIN_STATE_ECHO=cookie-only` in `.env` (an explicit, logged downgrade; `docs/SECURITY_P2G_AUDIT.md` R-F1), restart, and log in again. Record the outcome in this runbook.
+5. Verify the session: the header shows connected, `GET /api/session/status` shows `terminal_authorized: true`, and execution mode is **DRY RUN**.
+
+### 1.3 Handoff directory
+- Kite imports only from `KITE_DMB_HANDOFF_DIR`, listing `<dir>\<YYYY-MM-DD>\<64-hex>.json`. Unset means import is off.
+- DMB writes bundles only on an explicit `python -m private_desk.handoff export --session D` into `output\private_desk\handoff\<D>\`. **For real data this is RIGHTS_BLOCKED (exit 20) and writes nothing.** Only the synthetic fixture can be exported today (§1.5).
+
+### 1.4 Freshness, import and the inbox (synthetic bundles today)
+1. **Freshness:** `session_date` is a completed **regular** NSE session; `review_session_date` is the next regular session; the packet expires at **15:30 IST on the review session**. Special sessions (Budget weekend, Muhurat) never describe a packet and never shorten the window (`docs/NSE_CALENDAR_MONITORING.md` §5). Packets needing 2027 are refused (`CALENDAR_UNCOVERED`).
+2. **Import:** DMB Research Inbox → pick the listed bundle → Import. The whole bundle is validated first. Result `IMPORTED`, `DUPLICATE` or `REJECTED <code>`.
+3. **Review each item:** provenance, evidence time, quality, rights, and the SYNTHETIC label.
+4. **Inbox actions:** Dismiss, Add note, Research watchlist. The research watchlist is separate from the strategy scan universe.
+5. **Manual ticket:** Start ticket prefills only symbol, exchange and rationale. Side, order type, product, quantity, entry, stop and targets are typed by you; the form refuses to submit without them.
+6. **P1-D review:** the approval dialog shows the review; approve from it (it echoes the token it showed). If the review is not current (after 09:15, after 15:30, or after a new login), use **Re-review**.
+7. **Dry-run verification:** the approved ticket shows mode `dry_run`. Positions shows "Paper broker / fill: accepted · awaiting fill", separately from the fill. Nothing reaches the broker.
+
+### 1.5 Isolated synthetic test instance (never the real terminal)
+`.venv\Scripts\python.exe tests\acceptance_dmb_kite.py --serve-only` → `http://localhost:8790/demo/authorize` in a **separate browser profile** (e.g. Edge InPrivate). FakeKite, throwaway DB, LIVE impossible, its own cookie name `kt_test_session`. See `docs/DMB_KITE_ACCEPTANCE_TEST.md`. **Do not run the automated acceptance runner while this instance is up**: the runner resets the scratch environment.
 
 ## 2. Restart and login behaviour (verified)
 
 | Event | What happens | How to verify |
 |---|---|---|
-| **Kite Terminal restarts** | The per-launch credential exists only in process memory, so it is gone. Reads keep working. **Every write is refused** with `TERMINAL_SESSION_REQUIRED` until a fresh login, Emergency Exit included. The worker and reconciliation state starts empty. | The banner "Changes are locked … log in to Zerodha again"; `GET /api/session/status` shows `terminal_authorized: false` |
-| **Logout** | The session is deactivated, the stored access token is cleared, LIVE goes back to dry run, the credential is revoked and the cookie cleared. The old cookie is refused afterwards. A credential alone is not enough without a Kite session (`NO_SESSION`). | `connected: false` |
-| **Fresh login** (`/login` → Zerodha → `/callback`) | P2-G: the callback must belong to a login this browser started within 10 minutes. A new credential is issued and the old one rotated. LIVE must be re-armed through Live Readiness. | `terminal_authorized: true`; the banner is gone |
-| **Why a fresh login is required before writes** | The credential rests on the user's Kite password and 2FA. Nothing else can prove to a restarted process that the browser is the user's (owner decision, SEC-1 P1-F). | — |
-| **Stale or expired inbox items** | They stay visible for research, marked "research only" with a reason (`EXPIRED`, `SUPERSEDED`, `DISMISSED`, `CALENDAR_UNCOVERED`, …). Start ticket is refused. A ticket already created is unaffected and follows its own P1-D review window. | Item reasons in the inbox |
+| **Kite Terminal restarts** | The per-launch credential (cookie digest + terminal token digest) exists only in memory, so it is gone. **Account data is hidden** (P2-G R-F2) and **every write is refused** (`TERMINAL_SESSION_REQUIRED`) until a fresh login, Emergency Exit included. Worker and reconciliation state start empty. | Screen "Log in to unlock this terminal"; `/api/session/status` → `terminal_authorized: false`, `user_name: null` |
+| **Logout** | Session deactivated, stored access token cleared, LIVE back to dry run, credential revoked, cookie cleared, terminal token dropped from the page, **open price WebSockets closed (4401)**. A credential alone is not enough without a Kite session (`NO_SESSION`). | Connect gate; `connected: false` |
+| **Fresh login** (`/login` → Zerodha → `/callback`) | The callback must carry this browser's pending state, echoed by Kite. A new cookie and terminal token are issued; the old ones die; sockets opened under the old credential are closed. LIVE must be re-armed through Live Readiness. | Dashboard; `terminal_authorized: true` |
+| **Login from another browser/tab** | It replaces this browser's credential: this page's socket closes (4401) and the "Changes are locked" banner appears. | Banner; feed shows stale |
+| **Existing inbox items after restart** | Unchanged in the database; visible again after the fresh login. Expired ones become "research only" (`EXPIRED`); Start ticket is refused for them. | Item reasons |
+| **Open tickets after restart** | Unchanged. A pending manual ticket's P1-D review is invalidated by the new login ("needs re-review"); approve only after **Re-review**. Executed tickets and their GTTs continue at the broker. | Approvals queue |
+
+Why a fresh login before any write: the credential rests on your Kite password and 2FA. Nothing else can prove to a restarted process that the browser is yours (owner decision SEC-1 P1-F, unchanged).
 
 ## 3. Emergency Exit
 
-The operating decision is unchanged: **after a restart or logout, a fresh Kite login is required before any write, including Emergency Exit.**
+**Decision unchanged:** after a restart or logout, a fresh Kite login is required before any write, including Emergency Exit.
 
-These results come from FakeKite and a scratch database (`tests/test_emergency_exit_restart.py`, acceptance stage 19):
+Tested with FakeKite and scratch databases (`tests/test_emergency_exit_restart.py`, `tests/test_emergency_exit_isolation.py`, acceptance stage 19, P1-F sweep):
 
-| Case | Expected result |
+| Case | Result (FakeKite) |
 |---|---|
-| While authenticated | One exit order per **live** open position, typed `EXIT ALL` required. Dry-run positions are not touched. Results are reported per position. |
-| After a restart, before re-login | **401 `TERMINAL_SESSION_REQUIRED`. Nothing is sent.** Use a fallback (§4). |
-| After logout, credential only | 401 `NO_SESSION`, nothing sent |
-| After a fresh login | Exits are submitted |
-| Reconciliation or worker health critical | **Not held back.** Exits are submitted; unresolved critical findings are attached as warnings. |
-| Calendar coverage missing (2027 clock) | **Not held back.** Exits are submitted. Only new entries fail closed. |
+| While authenticated | One exit per **live** open position; typed `EXIT ALL` required; dry-run positions untouched; per-position results |
+| After restart, before login | **401 `TERMINAL_SESSION_REQUIRED`, nothing sent.** The preview is refused too (reads locked). Use a fallback (§4). |
+| After logout, cookie only | 401 (`TERMINAL_SESSION_REQUIRED`; with a credential but no Kite session, `NO_SESSION`), nothing sent |
+| After a fresh login | Exits submitted |
+| Critical reconciliation findings (e.g. `GTT_MISSING`) | **Not held back**: exits submitted, findings reported |
+| Unhealthy / not-running workers | **Not held back** |
+| Calendar coverage missing (2027 clock) | **Not held back**: only new entries fail closed |
+| Cookie without the terminal token (e.g. collected by another port) | 401, nothing sent |
 | Wrong confirmation phrase | 400, nothing sent |
-| A post-claim tampered exit row | That exit is refused, not sent unverified (`TICKET_TAMPERED_AFTER_CLAIM`). The other positions continue. |
+| A post-claim tampered exit row | That exit refused (`TICKET_TAMPERED_AFTER_CLAIM`); the others continue |
 
-**The real broker Emergency Exit path has NOT been validated.** Real broker validation is outside this sprint.
+**Real-broker Emergency Exit behaviour has NOT been validated.** Real broker validation is outside this sprint and needs separate authorization.
 
-## 4. Fallback procedures (when the terminal cannot exit)
+## 4. Fallback (when the terminal cannot exit)
 
-1. **Broker-side stop orders.** A position opened with "Protective GTT" (`use_gtt`, the default) has a stop-loss GTT at Zerodha. It stays active at the broker whatever happens to the terminal, including a restart, a crash or a logout. The Positions page shows each position's protection status; a position without one needs a manual stop in Kite.
-2. **Kite web or app.**
-   - Log in at kite.zerodha.com.
-   - Go to Positions / Holdings → Exit, and Orders → cancel any open entry.
-   - Then check GTTs: delete or adjust the protective GTT of anything you exited by hand. Otherwise it can trigger against shares you no longer hold.
-3. **Terminal unavailable — manual emergency procedure:**
-   1. Exit in Kite web (step 2).
+1. **Broker-side stop orders.** A position opened with "Protective GTT" (the default) has a stop-loss GTT at Zerodha. It survives terminal restarts, crashes and logouts. Positions shows each position's protection status; a position without one needs a manual stop in Kite.
+2. **Kite web / app.** Log in at kite.zerodha.com → Positions/Holdings → Exit; Orders → cancel open entries. Then **GTTs**: delete or adjust the protective GTT of anything exited by hand, or it can trigger against shares you no longer hold.
+3. **Terminal unavailable: manual procedure.**
+   1. Exit in Kite web.
    2. Write down every order id.
    3. When the terminal is back, log in.
-   4. Reconciliation flags the positions closed outside the app. Review each finding.
+   4. Reconciliation flags positions closed outside the app; review each finding.
    5. Never resubmit an order whose outcome is UNKNOWN; check it in Kite first.
-4. **Calling the broker.** Zerodha's dealing desk (call-and-trade) is the last resort if both the terminal and Kite web are unavailable.
+4. **Zerodha dealing desk (call-and-trade)**: last resort if both the terminal and Kite web are unavailable.
 
-## 5. Operational verdict
+## 5. Recovery
 
-- **Tested with FakeKite:** import, inbox, Start ticket, P1-D, fill display, the tampering audit, restart and login, Emergency Exit.
-- **Tested in the isolated local browser environment:** headless Edge, 31 checks, and an automated 42-check acceptance run with a real process restart.
-- **Not tested with a real broker:** every broker write, including Emergency Exit, and the real Kite login redirect with the P2-G state.
-- **Blocked by source rights:** real DMB evidence handoff. Kite's `PRODUCTION_PERMITTED_SOURCES` is empty, and DMB marks every real source UNRESOLVED.
-- **Blocked by missing official calendar data:** any session or packet in 2027, until NSE publishes its circular (`docs/NSE_CALENDAR_MONITORING.md`).
-- **Open owner decisions before real live use:** P2-G R-F3 (cookie port scope) and R-F2 (Host-only reads). See `docs/SECURITY_P2G_AUDIT.md`.
+**Never use or modify the real account database (`backend\kite_terminal.db*`) for tests.** All tests and runners use throwaway databases, and the acceptance runner fingerprints the real files (size + mtime, never opened) before and after.
 
-**Verdict:** LOCAL SYNTHETIC INTEGRATION TEST READY — REAL-DATA HANDOFF BLOCKED PENDING RIGHTS CONFIRMATION. This is not a production-readiness statement.
+| Situation | Procedure |
+|---|---|
+| **Test scratch reset** | `.venv\Scripts\python.exe tests\acceptance_dmb_kite.py --reset`. It deletes only a folder carrying the `.dmb_kite_acceptance` marker (`%TEMP%\dmb_kite_acceptance`). The browser runner's folder is `%TEMP%\dmb_kite_browser`. Stop any `--serve-only` instance first. |
+| **Failed import** (`REJECTED <code>`) | Nothing was stored; the refusal is recorded with its code (`docs/DMB_RESEARCH_INBOX.md`). Calendar codes (`INVALID_SESSION_DATE`, `REVIEW_SESSION_MISMATCH`, `CALENDAR_UNCOVERED`) mean the bundle's sessions disagree with Kite's calendar: check both calendars (parity test), never edit the bundle. Integrity codes (`PACKET_ID_MISMATCH`, `BUNDLE_ID_MISMATCH`, `CORRUPT_JSON`, `FILE_SUBSTITUTION`, `PATH_REFUSED`) mean the file was altered or replaced: delete nothing in Kite, re-export from DMB into a clean folder. `RIGHTS_NOT_APPROVED` is expected for any real bundle (§7 C). |
+| **Duplicate bundle** | Importing the same packets again returns `DUPLICATE` and adds nothing. DMB's export is immutable: re-exporting the same session gives the same `bundle_id` (`ALREADY_EXISTS`); a different file at that name is `INTEGRITY_ERROR`. Never overwrite a bundle by hand. |
+| **Stale packet** | After 15:30 IST on its review session an item stays visible as "research only" (`EXPIRED`) and cannot start a ticket. An already-expired bundle is refused at import. Wait for the next session's export; never change dates. |
+| **Database backup** | App running: `.venv\Scripts\python.exe -m backend.db_maintenance backup` (online backup → `kite_terminal.db.manual_<time>_bak`). Check with `... integrity` and `... status`. Every migration also leaves a verified `pre_schema_v<N>_bak`. Backups are secret (older ones contain plaintext daily tokens). |
+| **Database restore** | Stop the terminal. Keep the current file aside (rename it, do not delete it). Copy the chosen `_bak` to `kite_terminal.db`. Run `... integrity`, then `... migrate` (idempotent; a second run must report no migrations and no row changes). Start, log in, and review reconciliation findings before any action. Restoring loses everything after the backup: check open orders and GTTs in Kite web first. |
+| **Application restart and authentication recovery** | Restart `python -m backend.server` → log in to Zerodha → verify `terminal_authorized: true` → Re-review pending manual tickets → re-arm LIVE only through Live Readiness (never in this sprint's scope). If login keeps failing with `login_error=1`, see §1.2 step 4 (R-F1). If the UI stays locked after login, clear this site's storage for `127.0.0.1:8000` and log in again (a stale terminal token is harmless but useless). |
+
+## 6. Security notes for operators
+
+- Use one browser profile for the real terminal and a **separate** profile for the isolated test instance.
+- Other local web apps (DMB's desk, dev servers) receive the terminal's cookie, because cookies have no port, but cannot read the terminal token. Optional hardening: serve the terminal under a dedicated host name, e.g. `KITE_TERMINAL_ALLOWED_HOSTS=kite-terminal.localhost` with the Kite redirect URL on that name (whether Kite Connect accepts a `.localhost` redirect URL is unverified). Then the generic `127.0.0.1:*` and `localhost:*` servers never even receive the cookie.
+- Not protected: malware running as your Windows user, browser extensions with access to the terminal's page, administrators/debuggers (`docs/SECURITY_P2G_AUDIT.md` §4).
+
+## 7. Operational use decisions
+
+| | Scenario | Decision | Conditions | Evidence | Remaining risks | Approvals required |
+|---|---|---|---|---|---|---|
+| **A** | Synthetic integration testing | **GO** | FakeKite, throwaway DBs, isolated test profile, separate browser profile; never with the interactive instance up during the runner | Acceptance 44/44; browser 42/42; P1-D browser 13/13; full suites (§8) | Synthetic success says nothing about real data or the real broker | None beyond this sprint |
+| **B** | DMB private research using real market data | **GO, limited (existing operating decision, rights basis unresolved)** | Private desk only; nothing exported, published or uploaded; production pipelines run only under DMB's own runbooks | DMB full suite (§8); rights registry unchanged | Source rights for even private automated collection/storage are **unresolved** (matrix Category 1); calendar for 2027 missing | Owner to record the Category-1 basis per source (matrix §3) |
+| **C** | Real-data DMB → Kite handoff | **NO-GO** | — | Every real source `UNRESOLVED`; real export `RIGHTS_BLOCKED`; Kite allowlist empty | — | Written permission per provider for private cross-app transfer (matrix §3), owner-recorded and reviewed, then a deliberate registry change |
+| **D** | Kite Terminal dry-run operation | **GO, limited** | DRY RUN only; LIVE not armed; real Kite login for read access and dry-run tickets; **first real login confirms R-F1** (§1.2) or uses the logged `cookie-only` fallback; operator accepts the §6 / audit §4 residual risks | P2-G closed/mitigated with tests; P1-D/P1-E/P1-F/P0 tests; restart/EE scenarios (FakeKite) | Real Kite login and broker reads not exercised in tests; same-user malware/extensions out of scope; Kite Connect data-use terms not reviewed | Owner's informed acceptance of the audit's residual risks; R-F1 confirmation on first login |
+| **E** | Live broker execution | **NO-GO** | — | **Real-broker order, GTT and Emergency Exit paths never validated**; out of this sprint | Every broker write path unproven against Zerodha | Separately authorized real-broker validation plan (small, supervised), then Live Readiness, then explicit owner approval. Passing software tests is not authorization. |
+
+## 8. Sprint verification results (2026-11-03)
+
+Run sequentially, FakeKite and throwaway databases only; no real broker request, real database, production pipeline or scheduler job.
+
+| Run | Result |
+|---|---|
+| DMB calendar / handoff / Private Desk / dependent suites | 729 passed |
+| DMB full suite | **3,360 passed, 4 skipped, 0 failed** (baseline 3,347 + 4; +13 calendar session-record tests) |
+| Kite P2-G (`test_security_p2g.py`) | 42 passed |
+| Kite P1-F / CSRF / hardening / restart / Emergency Exit / preflight | all passed |
+| Kite calendar parity + trading calendar + NSE monitor | all passed (parity: 761 days, 0 differences) |
+| Kite full suite | **2,571 passed, 3 skipped, 0 failed** (baseline 2,492 + 3) |
+| Synthetic acceptance runner (real processes, real restart) | **44/44** (the 42 earlier checks, stage 17 inverted per R-F2, + 2 R-F3) |
+| Browser integration runner `e2e_dmb_inbox.py` (headless Edge) | **42/42** (the 31 earlier checks + 11 P2-G) |
+| Browser P1-D runner `e2e_p1d.py` | 13/13, every refusal declared and observed, no other error |
+| Browser UI runner `e2e_ui.py --pin-clock` | 53/54, the one pre-existing demo-data failure ("risk-blocked signal listed separately") unchanged |
+| NSE 2027 monitor (live, read-only) | `NOT_PUBLISHED` at 2026-11-03T11:26Z |
+| Frozen PK-25 files (13 hash-pinned + `research/pk25/*`) | byte-identical |
+| DMB's 17 pre-existing modified/untracked paths | byte-identical, unstaged diff identical, nothing staged from them |
