@@ -3903,6 +3903,8 @@ el.ticketForm.addEventListener("submit", async (event) => {
 
   try {
     const ticket = await API.createTicket(body);
+    await linkDmbTicket(ticket);
+    clearDmbHandoff();
     state.tickets.unshift(ticket);
     renderTicketsTable();
     el.ticketForm.reset();
@@ -4244,6 +4246,7 @@ const SECTIONS = [
   { id: "orders-trades", el: document.getElementById("view-orders-trades") },
   { id: "watchlist", el: document.getElementById("view-watchlist") },
   { id: "volume-research", el: document.getElementById("view-volume-research") },
+  { id: "dmb-inbox", el: document.getElementById("view-dmb-inbox") },
   { id: "strategies", el: document.getElementById("view-strategies") },
   { id: "todays-actions", el: document.getElementById("view-todays-actions") },
   { id: "journal", el: document.getElementById("view-journal") },
@@ -4268,6 +4271,7 @@ function showSection(id) {
   if (id === "diagnostics") window.KTDiagnostics.load(document.getElementById("diagnostics-root"));
   if (id === "live-readiness") window.KTReadiness.load(document.getElementById("live-readiness-root"));
   if (id === "volume-research") window.KTResearch.load(document.getElementById("volume-research-root"));
+  if (id === "dmb-inbox") window.KTDmbInbox.load(document.getElementById("dmb-inbox-root"));
   window.scrollTo({ top: 0 });
 }
 
@@ -4278,6 +4282,78 @@ document.getElementById("vr-reload-btn").addEventListener("click", () => {
 document.getElementById("vr-detail-close-btn").addEventListener("click", () => {
   document.getElementById("vr-detail-dialog").close();
 });
+
+// DMB Research Inbox (frontend/dmb_inbox.js). Start ticket opens THIS form with
+// only the symbol, the exchange and a research rationale; direction, order type
+// and product start unselected (a placeholder the browser's `required` refuses),
+// quantity auto-fill is off, and every price is typed by the user. The ticket is
+// created by the unchanged POST /api/tickets path (risk checks, P1-D review); only
+// after that is it linked back to the research item.
+const DMB_PLACEHOLDER_FIELDS = ["transaction_type", "entry_order_type", "product_type"];
+
+function clearDmbHandoff() {
+  state.dmbHandoff = null;
+  document.getElementById("dmb-handoff-banner").hidden = true;
+  for (const name of DMB_PLACEHOLDER_FIELDS) {
+    const select = el.ticketForm.querySelector(`[name="${name}"]`);
+    select.querySelectorAll("option[data-dmb-placeholder]").forEach((o) => o.remove());
+    select.selectedIndex = 0;
+  }
+  state.quantityManuallyEdited = false;
+}
+
+async function openTicketFromDmb(start, itemId) {
+  showSection("new-ticket");
+  el.ticketForm.reset();
+  clearDmbHandoff();
+  el.ticketTrailingTrigger.disabled = true;
+  el.ticketTrailingDistance.disabled = true;
+  for (const name of DMB_PLACEHOLDER_FIELDS) {
+    const select = el.ticketForm.querySelector(`[name="${name}"]`);
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "— choose —";
+    placeholder.dataset.dmbPlaceholder = "1";
+    select.insertBefore(placeholder, select.firstChild);
+    select.value = "";
+  }
+  el.ticketSymbolInput.value = start.prefill.symbol;
+  el.ticketForm.querySelector('[name="rationale"]').value = start.prefill.rationale;
+  document.getElementById("dmb-handoff-exchange").textContent = start.prefill.exchange;
+  document.getElementById("dmb-handoff-banner").hidden = false;
+  state.dmbHandoff = { itemId, startEventId: start.start_event_id, nonce: start.handoff_nonce,
+                       symbol: start.prefill.symbol };
+  state.quantityManuallyEdited = true;   // no position-size auto-fill: the user enters the quantity
+  state.ticketDraftDirty = true;
+  try {
+    const matches = await API.searchInstruments(start.prefill.symbol);
+    state.lastSymbolMatches = matches;
+    el.symbolOptions.innerHTML = matches
+      .map((m) => `<option value="${m.tradingsymbol}">${m.name ?? ""}</option>`)
+      .join("");
+  } catch (e) {
+    // the user can retype the symbol to re-trigger the search
+  }
+  renderTicketPreview();
+  el.ticketForm.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function linkDmbTicket(ticket) {
+  const h = state.dmbHandoff;
+  if (!h || ticket.symbol !== h.symbol) return;
+  try {
+    await fetchJsonMutate(`/api/dmb-inbox/items/${h.itemId}/ticket-link`, "POST",
+      { ticket_id: ticket.id, start_event_id: h.startEventId, handoff_nonce: h.nonce });
+  } catch (e) {
+    toast(`The ticket was created, but linking it to the research item failed: ${e.message}`, { type: "warning" });
+  }
+}
+
+window.KTDmbInbox.configure({ mutate: fetchJsonMutate, toast, startTicket: openTicketFromDmb });
+document.getElementById("dmb-reload-btn").addEventListener("click", () => {
+  window.KTDmbInbox.load(document.getElementById("dmb-inbox-root"));
+});
+document.getElementById("dmb-handoff-cancel-btn").addEventListener("click", clearDmbHandoff);
 
 // PK-22H: re-check forces a fresh database integrity check.
 document.getElementById("diagnostics-refresh-btn").addEventListener("click", () => {
@@ -4298,7 +4374,7 @@ window.addEventListener("hashchange", () => {
 function revealTradingNavItems() {
   for (const id of [
     "approvals", "new-ticket", "ticket-history", "orders-trades", "settings", "watchlist", "strategies",
-    "trade-queue", "todays-actions", "journal", "positions", "volume-research",
+    "trade-queue", "todays-actions", "journal", "positions", "volume-research", "dmb-inbox",
   ]) {
     const btn = document.querySelector(`.nav-item[data-section-id="${id}"]`);
     if (btn) btn.hidden = false;

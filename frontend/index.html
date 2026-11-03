@@ -163,6 +163,10 @@
         <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9L12 3Z"/></svg></span>
         <span class="nav-label">Watchlist</span>
       </button>
+      <button class="nav-item" data-section-id="dmb-inbox" hidden>
+        <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 13h4l2 3h4l2-3h4"/><path d="M5 13 7 5h10l2 8v6H5v-6Z"/></svg></span>
+        <span class="nav-label">DMB Research Inbox</span>
+      </button>
       <button class="nav-item" data-section-id="volume-research" hidden>
         <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 20V10M9 20V4M14 20v-7M19 20v-4"/></svg></span>
         <span class="nav-label">Price-Volume Research</span>
@@ -425,6 +429,13 @@
       <details class="table-section" open>
         <summary><h2>Manual ticket</h2></summary>
         <p class="muted-note">Manual entries currently support CNC long positions only. Use Exit / Quick Sell to close holdings.</p>
+        <div id="dmb-handoff-banner" class="dmb-disclaimer" role="note" hidden>
+          <strong>Started from a DMB research item — PRIVATE RESEARCH CONTEXT, NOT A TRADE RECOMMENDATION OR ORDER INSTRUCTION.</strong>
+          <span>Only the symbol, the exchange (<span id="dmb-handoff-exchange">NSE</span>) and the research rationale were filled in.
+            Choose the direction, order type and product, and enter the quantity and every price yourself. The ticket then goes
+            through the normal risk checks, review and approval.</span>
+          <button id="dmb-handoff-cancel-btn" class="btn btn-ghost btn-small" type="button">Clear DMB prefill</button>
+        </div>
         <form id="ticket-form" class="ticket-form">
           <div class="field">
             <label for="ticket-symbol">Symbol</label>
@@ -882,6 +893,18 @@
           <button id="vr-detail-close-btn" class="btn" type="button">Close</button>
         </div>
       </dialog>
+    </div>
+    <div class="view" id="view-dmb-inbox" hidden>
+      <div class="page-head">
+        <div>
+          <h1>DMB Research Inbox</h1>
+          <p class="page-sub">Daily Market Byte candidates you imported, with their evidence and provenance. Research context only.</p>
+        </div>
+        <div class="page-actions">
+          <button id="dmb-reload-btn" class="btn btn-ghost btn-small" type="button">Reload</button>
+        </div>
+      </div>
+      <div id="dmb-inbox-root"></div>
     </div>
     <div class="view" id="view-strategies" hidden>
       <div class="page-head">
@@ -1612,6 +1635,7 @@
   <script src="/static/diagnostics.js"></script>
   <script src="/static/readiness.js"></script>
   <script src="/static/research.js"></script>
+  <script src="/static/dmb_inbox.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
