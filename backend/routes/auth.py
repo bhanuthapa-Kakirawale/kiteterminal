@@ -17,9 +17,11 @@ router = APIRouter()
 
 @router.get("/login")
 def login(request: Request):
-    # P2-G: a login only THIS browser can finish (security.begin_login, cookie-bound).
-    response = RedirectResponse(url=kite_client.build_login_url())
-    security.set_login_state_cookie(response, security.begin_login(), secure=request.url.scheme == "https")
+    # P2-G: a login only THIS browser can finish: the state is cookie-bound AND sent through Kite
+    # (redirect_params), which must echo it on the callback (R-F1). Supersedes any earlier login.
+    state = security.begin_login()
+    response = RedirectResponse(url=kite_client.build_login_url(state=state))
+    security.set_login_state_cookie(response, state, secure=request.url.scheme == "https")
     return response
 
 
@@ -34,10 +36,12 @@ async def callback(request: Request):
     request_token = request.query_params.get("request_token")
     status = request.query_params.get("status")
 
-    # P2-G login CSRF: refused before any token exchange unless this browser started the login
-    # (GET /login) within the last 10 minutes. Single use: every callback consumes the state.
-    if not security.consume_login_state(request.cookies.get(security.LOGIN_STATE_COOKIE)):
-        logger.warning("Kite callback refused: no pending login started from this browser (login CSRF guard)")
+    # P2-G login CSRF: refused before any token exchange unless this browser started the pending
+    # login (GET /login) within the last 10 minutes and Kite echoed its state back unchanged (R-F1).
+    # Single use: every callback consumes the state.
+    if not security.consume_login_state(request.cookies.get(security.LOGIN_STATE_COOKIE),
+                                        request.query_params.get(security.LOGIN_STATE_PARAM)):
+        logger.warning("Kite callback refused: not the pending login started from this browser (login CSRF guard)")
         return _login_failed(request)
 
     if not request_token or status != "success":
@@ -51,11 +55,12 @@ async def callback(request: Request):
 
     workers.supervisor.spawn("after_login", _after_login())
     # SEC-1 P1-F: a completed Kite login (the user's password and 2FA) is
-    # what authorizes this browser to make changes during this launch. The
-    # credential travels only in this HttpOnly, SameSite=Strict cookie.
-    response = RedirectResponse(url="/")
-    security.set_credential_cookie(response, security.issue_terminal_credential(),
-                                   secure=request.url.scheme == "https")
+    # what authorizes this browser during this launch. The cookie travels only
+    # in this HttpOnly, SameSite=Strict cookie; P2-G R-F3: the port-isolated
+    # terminal token only in this redirect's fragment, to this browser.
+    cookie, terminal_token = security.issue_terminal_credentials()
+    response = RedirectResponse(url=security.authorized_landing_url(terminal_token))
+    security.set_credential_cookie(response, cookie, secure=request.url.scheme == "https")
     security.clear_login_state_cookie(response, secure=request.url.scheme == "https")
     return response
 
@@ -86,22 +91,23 @@ async def _after_login() -> None:
 
 @router.get("/api/session/status")
 def session_status(request: Request):
+    """Public (P2-G R-F2): tells any caller only whether a session exists and whether IT is
+    authorized; the user's name and login time go to an authorized browser only."""
     account = get_default_account()
     row = kite_client.get_active_session()
-    # SEC-1 P1-F: whether THIS browser carries this launch's credential (it
-    # does not after an app restart until the next Kite login). The value
-    # itself is never returned.
-    authorized = security.terminal_credential_valid(request.cookies.get(security.CREDENTIAL_COOKIE))
-    if row is not None and kite_client.is_session_fresh(row):
-        return {
-            "connected": True,
-            "user_name": row["user_name"],
-            "login_time": row["login_time"],
-            "account_type": account["account_type"],
-            "terminal_authorized": authorized,
-        }
-    return {"connected": False, "user_name": None, "login_time": None, "account_type": account["account_type"],
-            "terminal_authorized": authorized}
+    # SEC-1 P1-F + P2-G R-F3: whether THIS browser carries both factors of this launch's
+    # credential (it does not after an app restart until the next Kite login). No value is
+    # ever returned here.
+    authorized = security.request_authorized(request.cookies.get(security.CREDENTIAL_COOKIE),
+                                             request.headers.get(security.TOKEN_HEADER))
+    connected = row is not None and kite_client.is_session_fresh(row)
+    return {
+        "connected": connected,
+        "user_name": row["user_name"] if connected and authorized else None,
+        "login_time": row["login_time"] if connected and authorized else None,
+        "account_type": account["account_type"],
+        "terminal_authorized": authorized,
+    }
 
 
 @router.post("/api/logout")

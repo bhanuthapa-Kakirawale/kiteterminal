@@ -25,7 +25,8 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from backend import kite_client as _kite_client_module
-from conftest import approval_body, TERMINAL_ORIGIN, displayed_mode, set_mode, ticket_row, terminal_credential
+from conftest import approval_body, TERMINAL_ORIGIN, displayed_mode, set_mode, ticket_row, terminal_credential, \
+    terminal_token
 from test_baseline_api import _manual_ticket
 
 # Captured at import, before the env fixture replaces it with the FakeKite factory.
@@ -60,8 +61,13 @@ def _ticket_count(env):
 @pytest.mark.parametrize("base", ["http://127.0.0.1:8000", "http://localhost:8000", "http://127.0.0.1:8765",
                                   "http://LOCALHOST:8000", "http://127.0.0.1"])
 def test_local_host_read_allowed(env, base):
-    r = _bare(base).get("/api/holdings")
+    # The Host layer accepts every loopback form. (/api/health: the public read; account reads
+    # also need the credential since P2-G R-F2, which the Host check does not replace.)
+    r = _bare(base).get("/api/health")
     assert r.status_code == 200, (base, r.text[:200])
+    authorized = _bare(base, headers={"Cookie": f"kt_session={terminal_credential()}",
+                                      "X-Kite-Terminal-Token": terminal_token()})
+    assert authorized.get("/api/holdings").status_code == 200, base
 
 
 @pytest.mark.parametrize("value,expected", [
@@ -211,11 +217,12 @@ def test_configured_allowed_host(env, monkeypatch):
     base = "http://terminal.lan:8000"
     assert _is_host_reject(_bare(base).get("/api/holdings"))
     monkeypatch.setenv("KITE_TERMINAL_ALLOWED_HOSTS", " terminal.lan , 10.8.0.2 ")
-    assert _bare(base).get("/api/holdings").status_code == 200
-    assert _bare("http://10.8.0.2:8000").get("/api/holdings").status_code == 200
+    assert _bare(base).get("/api/health").status_code == 200
+    assert _bare("http://10.8.0.2:8000").get("/api/health").status_code == 200
     # The configured name is also a terminal origin for writes (same port).
     ok = _bare(base).post("/api/ui-prefs", json={"theme": "dark"},
-                          headers={**APP_HEADER, "Origin": base, "Cookie": f"kt_session={terminal_credential()}"})
+                          headers={**APP_HEADER, "Origin": base, "Cookie": f"kt_session={terminal_credential()}",
+                                   "X-Kite-Terminal-Token": terminal_token()})
     assert ok.status_code == 200, ok.text
     # Other names stay rejected.
     assert _is_host_reject(_bare(EVIL).get("/api/holdings"))
@@ -283,7 +290,7 @@ def test_callback_works_on_approved_host(env, fake_login):
     issued, seen = fake_login
     r = _logged_in(_bare()).get("/callback?request_token=reqTOKENsentinel42&status=success", follow_redirects=False,
                     headers={"Referer": "https://kite.zerodha.com/connect/finish"})
-    assert r.status_code in (302, 307) and r.headers["location"] == "/"
+    assert r.status_code in (302, 307) and r.headers["location"].startswith("/#kt_token=")
     assert seen["request_tokens"] == ["reqTOKENsentinel42"]
 
 
@@ -313,7 +320,8 @@ WS_EVIL = EVIL.replace("http://", "ws://") + "/ws/ticks"
 ])
 def test_ws_approved_host_and_origin_connects(env, one_tick, url, headers):
     headers = {**headers, "Cookie": f"kt_session={terminal_credential()}"}   # SEC-1 P1-F
-    with _bare().websocket_connect(url, headers=headers) as ws:
+    with _bare().websocket_connect(url, headers=headers,
+                                   subprotocols=["kt.v1", f"kt-token.{terminal_token()}"]) as ws:   # P2-G R-F3
         assert ws.receive_json() == {"type": "tick", "n": 1}
 
 
@@ -354,8 +362,9 @@ def test_ws_hostile_origin_refused(env, one_tick, origin):
 
 def test_ws_url_carries_no_credentials():
     js = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    sockets = re.findall(r"new WebSocket\(([^)]*)\)", js)
-    assert sockets == ["`${protocol}//${location.host}/ws/ticks`"], sockets
+    sockets = re.findall(r"new WebSocket\(([^,)]*)(?:, ([^)]*\)))?\)", js)
+    # The URL carries nothing secret; P2-G R-F3's terminal token is an offered subprotocol.
+    assert sockets == [("`${protocol}//${location.host}/ws/ticks`", "window.KTAuth.wsProtocols()")], sockets
 
 
 # ==================================================================== PK-18B runtime
@@ -561,7 +570,7 @@ def test_login_stores_token_only_encrypted(env, fake_login):
     from backend import crypto
     issued, _ = fake_login
     r = _logged_in(_bare()).get("/callback?request_token=reqTOKENsentinel42&status=success", follow_redirects=False)
-    assert r.headers["location"] == "/"
+    assert r.headers["location"].startswith("/#kt_token=")
     conn = env.db.get_connection()
     try:
         session = conn.execute("SELECT * FROM sessions ORDER BY id DESC LIMIT 1").fetchone()
@@ -968,7 +977,14 @@ def test_frontend_code_references_no_external_origin():
 
 
 def _logged_in(client):
-    """P2-G: the browser first went through GET /login (a pending, cookie-bound login state)."""
+    """P2-G: the browser first went through GET /login (a pending, cookie-bound login state), and
+    Kite echoes that state on the callback (R-F1): this client's /callback requests carry it."""
     from conftest import start_kite_login
-    start_kite_login(client)
+    state, get = start_kite_login(client), client.get
+
+    def _get(url, **kw):
+        if url.startswith("/callback"):
+            url += ("&" if "?" in url else "?") + f"kt_state={state}"
+        return get(url, **kw)
+    client.get = _get
     return client

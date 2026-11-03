@@ -2,8 +2,11 @@
 
 Owner decision (SEC-1 P1-F), unchanged: after an application restart or a logout NO write is
 accepted - Emergency Exit included - until a fresh Kite login in the browser issues this launch's
-terminal credential. Reads keep working. Once authorised, Emergency Exit is never held back by
-reconciliation findings, worker health or missing calendar coverage: it exits, and reports.
+terminal credential. Since P2-G R-F2 the account READS are locked too (only the public session
+status, health and config answer), and the credential has two factors (R-F3: the cookie and the
+port-isolated terminal token the login hands the page). Once authorised, Emergency Exit is never
+held back by reconciliation findings, worker health or missing calendar coverage: it exits, and
+reports.
 FakeKite, throwaway database; a "restart" is the loss of all process memory (the in-memory
 credential, the worker and reconciliation state), exactly what a new process starts with.
 """
@@ -44,19 +47,22 @@ def test_emergency_exit_while_authenticated_exits_every_live_position(env, marke
     assert r.json()["data"]["count"] == 2
 
 
-def test_after_a_restart_reads_work_but_emergency_exit_is_refused_until_a_fresh_login(env, market_open,
-                                                                                       monkeypatch):
+def test_after_a_restart_reads_and_emergency_exit_are_refused_until_a_fresh_login(env, market_open,
+                                                                                    monkeypatch):
     _positions(env, "TCS")
     mark = len(env.kite.calls)
     _restart(monkeypatch)
     status = env.client.get("/api/session/status").json()
     assert status["connected"] is True and status["terminal_authorized"] is False   # Kite session row, no credential
-    assert env.client.get("/api/kill-switch/emergency-exit-preview").status_code == 200    # reads work
-    r = _emergency_exit(env.client)                                                   # the old cookie
+    assert status["user_name"] is None
+    preview = env.client.get("/api/kill-switch/emergency-exit-preview")             # P2-G R-F2: reads locked
+    assert preview.status_code == 401 and _code(preview) == "TERMINAL_SESSION_REQUIRED"
+    r = _emergency_exit(env.client)                                                   # the old cookie + token
     assert r.status_code == 401 and _code(r) == "TERMINAL_SESSION_REQUIRED"
     assert _writes(env, mark) == []
     reauthorize(env.client)                                                           # the fresh login
     assert env.client.get("/api/session/status").json()["terminal_authorized"] is True
+    assert env.client.get("/api/kill-switch/emergency-exit-preview").status_code == 200
     r = _emergency_exit(env.client)
     assert r.status_code == 200 and _sold(env) == ["TCS"]
 
@@ -101,9 +107,14 @@ def test_after_logout_the_old_credential_is_dead_and_a_new_kite_login_is_needed(
         return None
     monkeypatch.setattr(auth, "_after_login", _no_after_login)
     env.client.cookies.delete("kt_session")
-    start_kite_login(env.client)
-    login = env.client.get("/callback?request_token=fresh&status=success", follow_redirects=False)
-    assert login.headers["location"] == "/" and env.client.cookies.get("kt_session") not in (None, old_cookie)
+    old_token = env.client.headers["X-Kite-Terminal-Token"]
+    state = start_kite_login(env.client)
+    login = env.client.get(f"/callback?request_token=fresh&status=success&kt_state={state}", follow_redirects=False)
+    assert login.headers["location"].startswith("/#kt_token=")
+    assert env.client.cookies.get("kt_session") not in (None, old_cookie)
+    # What frontend/terminal_auth.js does with the landing fragment (P2-G R-F3).
+    env.client.headers["X-Kite-Terminal-Token"] = login.headers["location"].removeprefix("/#kt_token=")
+    assert env.client.headers["X-Kite-Terminal-Token"] != old_token
     r = _emergency_exit(env.client)
     assert r.status_code == 200 and _sold(env) == ["TCS"]
 

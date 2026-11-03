@@ -776,9 +776,16 @@ def test_the_tick_handler_ends_on_disconnect_while_no_tick_flows():
     from backend.routes import ws
     from backend.ticker import ticker_manager
     before = ticker_manager.listener_count()
+    from conftest import terminal_credential, terminal_token
 
     class ClosedTab:
-        async def accept(self):
+        # P2-G R-F4: the handler re-checks the credential it was opened under, so the fake carries
+        # an authorized handshake (the cookie, and the terminal token as a subprotocol).
+        scope = {"type": "websocket", "path": "/ws/ticks",
+                 "headers": [(b"cookie", f"kt_session={terminal_credential()}".encode())],
+                 "subprotocols": ["kt.v1", f"kt-token.{terminal_token()}"]}
+
+        async def accept(self, subprotocol=None):
             pass
 
         async def receive(self):

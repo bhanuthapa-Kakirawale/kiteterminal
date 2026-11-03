@@ -40,7 +40,7 @@ CHECKS = {
     10: "Quick-Action SELL, ordinary exit and Emergency Exit remain available",
     11: "trading lock and dry-run behaviour remain correct",
     12: "market-window transition invalidates an old review",
-    13: "P1-F: writes need the per-launch terminal credential (HttpOnly cookie)",
+    13: "P1-F / P2-G: reads and writes need the per-launch credential (HttpOnly cookie + terminal token)",
 }
 
 
@@ -88,14 +88,18 @@ def main() -> None:
             pg.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
             pg.on("response", on_response)
 
+        def auth() -> dict:
+            """The terminal token the page keeps in localStorage (P2-G R-F3), for the harness's own calls."""
+            return {"X-Kite-Terminal-Token": page.evaluate("() => localStorage.getItem('kt.terminalToken')") or ""}
+
         def demo(path: str, body: dict | None = None) -> dict:
             r = context.request.post(base + path, data=json.dumps(body or {}),
-                                     headers={**write_headers, "Content-Type": "application/json"})
+                                     headers={**write_headers, **auth(), "Content-Type": "application/json"})
             assert r.ok, f"{path}: {r.status} {r.text()}"
             return r.json()["data"]
 
         def api_get(path: str) -> dict:
-            return context.request.get(base + path).json()
+            return context.request.get(base + path, headers=auth()).json()
 
         def set_clock(pages, **body) -> datetime:
             now = datetime.fromisoformat(demo("/api/demo/clock", body)["now_ist"])
@@ -175,12 +179,13 @@ def main() -> None:
 
         # ---------------------------------------------------------------- P1-F: before authorization
         # The demo seeds a Kite session, but this browser has no terminal
-        # credential yet (as after an app restart): reads work, writes do not.
+        # credential yet (as after an app restart): since P2-G R-F2 the UI is
+        # locked - no account data - and writes are refused.
         page.goto(base + "/")
-        page.wait_for_selector("#app-shell:not([hidden])", timeout=20000)
+        page.wait_for_selector("#terminal-locked-gate:not([hidden])", timeout=20000)
         page.wait_for_timeout(800)
-        check(13, "unauthorized: the UI loads read-only and shows the authorize banner",
-              page.is_visible("#authorize-banner"))
+        check(13, "unauthorized: the UI is locked, shows no account data and offers only the login",
+              page.is_visible("#unlock-btn") and not page.is_visible("#app-shell"))
         expect_409("TERMINAL_SESSION_REQUIRED")
         status, code = page.evaluate("""async () => {
             const r = await fetch('/api/ui-prefs', {method: 'POST',
@@ -191,11 +196,18 @@ def main() -> None:
         page_read_codes.append(("/api/ui-prefs", code))
         check(13, "unauthorized: a same-origin write with the right headers is refused (401 TERMINAL_SESSION_REQUIRED)",
               (status, code) == (401, "TERMINAL_SESSION_REQUIRED"), (status, code))
-        authorized = context.request.get(base + "/demo/authorize", max_redirects=0)
+        authorized = context.request.get(base + "/demo/authorize", max_redirects=0, headers={"Accept": "text/html"})
         set_cookie = authorized.headers.get("set-cookie", "")
         check(13, "the authorization response sets an HttpOnly, SameSite=Strict credential cookie",
               "kt_session=" in set_cookie and "httponly" in set_cookie.lower()
               and "samesite=strict" in set_cookie.lower(), set_cookie[:0])
+        landing = authorized.headers.get("location", "")
+        check(13, "it lands on the UI with the terminal token in the fragment only (P2-G R-F3)",
+              landing.startswith("/#kt_token=") and "kt_token" not in set_cookie, landing[:12])
+        page.goto(base + landing)
+        page.wait_for_timeout(300)
+        check(13, "the page moved the token into its storage and out of the address bar",
+              "kt_token" not in page.url and bool(page.evaluate("() => localStorage.getItem('kt.terminalToken')")))
         page.goto(base + "/")
         page.wait_for_selector("#app-shell:not([hidden])", timeout=20000)
         page.wait_for_timeout(800)
@@ -265,8 +277,8 @@ def main() -> None:
             page.click("#app-confirm-ok")
         page.wait_for_selector("#connect-gate:not([hidden])", timeout=10000)
         check(9, "logout shows the connect gate", True)
-        login = context.request.get(base + "/demo/kite-login")   # real session replacement + new credential
-        assert login.ok, login.text()
+        page.goto(base + "/demo/kite-login")   # real session replacement + new credential, as a navigation
+        page.wait_for_timeout(500)
         boot(page, "approvals")
         card = page.locator(f'.approval-card[data-ticket-id="{tid9}"]')
         check(9, "after a new Kite login the ticket's card says 'needs re-review'",

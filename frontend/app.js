@@ -20,9 +20,19 @@ class ApiError extends Error {
 // wholeBody: return the whole response body rather than its `data` (a
 // payload that also carries e.g. summary counts).
 async function fetchJson(url, wholeBody = false) {
+  // P2-G R-F2: once this browser is known to hold no credential (locked, logged out, or a login
+  // elsewhere replaced it) account reads are not even attempted: the server would refuse them.
+  if (state.terminalAuthorized === false) {
+    throw new TerminalAuthorizationError("This terminal session is not authorized: log in to Zerodha again.");
+  }
   const res = await fetch(url);
   if (res.status === 401) {
     const body = await res.json();
+    // P2-G R-F2: account data is readable only with this launch's credential.
+    if (body?.detail?.error_code === "TERMINAL_SESSION_REQUIRED") {
+      showTerminalLocked();
+      throw new TerminalAuthorizationError(body.detail.message);
+    }
     throw new SessionExpiredError(body.detail.message);
   }
   if (!res.ok) {
@@ -190,6 +200,8 @@ const API = {
 
 const el = {
   connectGate: document.getElementById("connect-gate"),
+  lockedGate: document.getElementById("terminal-locked-gate"),
+  unlockBtn: document.getElementById("unlock-btn"),
   authorizeBanner: document.getElementById("authorize-banner"),
   authorizeBtn: document.getElementById("authorize-btn"),
   connectBtn: document.getElementById("connect-btn"),
@@ -580,6 +592,7 @@ function showAuthorizeBanner(show) {
 
 function hideAllStates() {
   el.connectGate.hidden = true;
+  el.lockedGate.hidden = true;
   el.sessionExpiredBanner.hidden = true;
   el.genericError.hidden = true;
   el.appShell.hidden = true;
@@ -592,6 +605,24 @@ function showConnectGate() {
   el.connectionStatus.classList.remove("status-connected", "status-reconnecting");
   el.connectionStatus.classList.add("status-disconnected");
   el.connectionStatus.title = "Disconnected";
+}
+
+// P2-G R-F2: Kite is connected but this browser holds no credential for this launch: nothing
+// account-related is shown, and the only action is the Zerodha login that issues a new one.
+function showTerminalLocked() {
+  // After a logout the connect gate is the right screen (no Kite session at all); a read that
+  // was still in flight must not replace it.
+  if (!el.connectGate.hidden) return;
+  hideAllStates();
+  state.terminalAuthorized = false;
+  if (window.KTAuth) window.KTAuth.clear();
+  wsIntentionallyClosed = true;
+  if (ws) ws.close();
+  el.lockedGate.hidden = false;
+  el.refreshBtn.hidden = true;
+  el.connectionStatus.classList.remove("status-connected", "status-reconnecting");
+  el.connectionStatus.classList.add("status-disconnected");
+  el.connectionStatus.title = "Locked: log in to Zerodha";
 }
 
 function showSessionExpired() {
@@ -3009,7 +3040,8 @@ function connectTickWs() {
   if (state.terminalAuthorized === false) return;
   wsIntentionallyClosed = false;
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  ws = new WebSocket(`${protocol}//${location.host}/ws/ticks`);
+  // P2-G R-F3: the terminal token travels as an offered subprotocol (no headers on a WebSocket).
+  ws = new WebSocket(`${protocol}//${location.host}/ws/ticks`, window.KTAuth.wsProtocols());
 
   ws.onopen = () => {
     console.log("[ws] connected");
@@ -3100,6 +3132,14 @@ function connectTickWs() {
   ws.onclose = (event) => {
     console.warn("[ws] closed", event.code, event.reason);
     if (wsIntentionallyClosed) return;
+    // P2-G R-F4: the server closed it because this launch's credential was revoked or replaced
+    // (logout, or a login elsewhere). Reconnecting would be refused: say why instead.
+    if (event.code === 4401) {
+      wsIntentionallyClosed = true;
+      setFeedStatus(true);
+      showAuthorizeBanner(true);
+      return;
+    }
     setFeedStatus(true);
     markStale(true);
     const openDuration = Date.now() - wsOpenedAt;
@@ -3978,6 +4018,8 @@ el.logoutBtn.addEventListener("click", async () => {
   }
   wsIntentionallyClosed = true;
   if (ws) ws.close();
+  window.KTAuth.clear();
+  state.terminalAuthorized = false;   // no further account reads from this page
   el.logoutBtn.hidden = true;
   showConnectGate();
 });
@@ -6009,6 +6051,10 @@ async function init() {
   setInterval(renderMarketStatus, 30000);
   setInterval(renderTrailingIndicator, 15000);
 
+  // P2-G R-F2: whether this browser is authorized decides what may be read at all.
+  const status = await API.status();
+  state.terminalAuthorized = status.terminal_authorized;
+
   try {
     const prefs = await API.getUiPrefs();
     el.sidebar.classList.toggle("collapsed", !!prefs.sidebar_collapsed);
@@ -6019,7 +6065,6 @@ async function init() {
     // default expanded/flat; theme stays as restored from localStorage
   }
 
-  const status = await API.status();
   state.sessionStatus = status;
   state.accountType = status.account_type;
   el.logoutBtn.hidden = !status.connected;
@@ -6027,7 +6072,11 @@ async function init() {
     showConnectGate();
     return;
   }
-  showAuthorizeBanner(!status.terminal_authorized);
+  if (!status.terminal_authorized) {
+    showTerminalLocked();
+    return;
+  }
+  showAuthorizeBanner(false);
   await loadDashboard();
   await loadDashboardPanels();
   const requestedSection = location.hash.slice(1);
@@ -6050,6 +6099,7 @@ async function init() {
 el.connectBtn.addEventListener("click", () => { location.href = "/login"; });
 el.reconnectBtn.addEventListener("click", () => { location.href = "/login"; });
 el.authorizeBtn.addEventListener("click", () => { location.href = "/login"; });
+el.unlockBtn.addEventListener("click", () => { location.href = "/login"; });
 el.refreshBtn.addEventListener("click", () => {
   loadDashboard();
   refreshTicketViews();

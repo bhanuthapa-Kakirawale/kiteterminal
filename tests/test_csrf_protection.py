@@ -8,7 +8,8 @@ Policy under test (backend/security.py):
   header alone is never enough (browsers always send Origin on writes);
 - the /ws/ticks handshake gets the same Origin check, header not required,
   and (SEC-1) an absent Origin is refused;
-- GET routes, including /login and the Kite /callback, are never checked.
+- GET routes, including /login and the Kite /callback, need no header; an /api/ read that a
+  browser makes from another origin (Origin, or Fetch Metadata) is refused (P2-G R-F2).
 
 The ordinary ``env.client`` sends the header and a same-origin Origin (see
 conftest.terminal_client). Tests here build bare clients so they can omit or
@@ -23,7 +24,8 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from conftest import approval_body, displayed_mode, TERMINAL_ORIGIN, set_mode, ticket_row, terminal_credential
+from conftest import approval_body, displayed_mode, TERMINAL_ORIGIN, set_mode, ticket_row, terminal_credential, \
+    terminal_token
 from test_baseline_api import _insert_ticket, _manual_ticket
 from test_review_changes import _breakeven_proposal
 
@@ -46,9 +48,11 @@ def _bare(base_url=TERMINAL_ORIGIN, **kwargs):
 
 def _authorized(base_url=TERMINAL_ORIGIN, headers=None, **kwargs):
     """A bare client that also holds this launch's terminal credential
-    (SEC-1 P1-F), as the browser has after its Kite login. The Origin and
-    header checks under test here are unaffected by it: they run first."""
-    return _bare(base_url, headers={**(headers or {}), "Cookie": f"kt_session={terminal_credential()}"}, **kwargs)
+    (SEC-1 P1-F; both factors since P2-G R-F3), as the browser has after its
+    Kite login. The Origin and header checks under test here are unaffected
+    by it: they run first."""
+    return _bare(base_url, headers={**(headers or {}), "Cookie": f"kt_session={terminal_credential()}",
+                                    "X-Kite-Terminal-Token": terminal_token()}, **kwargs)
 
 
 def _is_csrf_reject(r):
@@ -327,12 +331,14 @@ def test_g_origin_takes_precedence_over_referer(env):
 
 # ---------------------------------------------------------------- safe methods, preflight
 
-def test_reads_are_not_blocked_by_the_guard(env):
-    # Reads are left to the browser same-origin policy (no CORS headers are
-    # ever sent, so a foreign page cannot read the response).
-    r = _bare().get("/api/tickets", headers={"Origin": FOREIGN})
-    assert r.status_code == 200
+def test_reads_from_a_foreign_origin_are_refused(env):
+    # P2-G R-F2: no longer left to the browser's same-origin policy alone. Even
+    # with the credential, a read whose Origin is foreign is refused, and no
+    # CORS header is ever sent.
+    r = _authorized().get("/api/tickets", headers={"Origin": FOREIGN})
+    assert _is_csrf_reject(r)
     assert "access-control-allow-origin" not in r.headers
+    assert _authorized().get("/api/tickets", headers={"Origin": TERMINAL_ORIGIN}).status_code == 200
 
 
 def test_preflight_gets_no_cors_grant(env):
@@ -370,7 +376,8 @@ def test_h_websocket_foreign_origin_is_refused(env, one_tick, origin):
                          ids=["same_origin", "localhost_alias"])
 def test_i_websocket_terminal_origin_is_accepted(env, one_tick, headers):
     headers = {**headers, "Cookie": f"kt_session={terminal_credential()}"}   # SEC-1 P1-F
-    with _bare().websocket_connect(WS_URL, headers=headers) as ws:
+    with _bare().websocket_connect(WS_URL, headers=headers,
+                                   subprotocols=["kt.v1", f"kt-token.{terminal_token()}"]) as ws:   # P2-G R-F3
         assert ws.receive_json() == {"type": "tick", "n": 1}
 
 
@@ -394,7 +401,7 @@ def test_j_kite_callback_navigation_is_not_blocked(env, monkeypatch):
     # A top-level redirect from Zerodha: cross-site Referer, no app header.
     r = _logged_in(_bare()).get("/callback?request_token=abc&status=success", follow_redirects=False,
                     headers={"Referer": "https://kite.zerodha.com/connect/finish"})
-    assert r.status_code in (302, 307) and r.headers["location"] == "/"
+    assert r.status_code in (302, 307) and r.headers["location"].startswith("/#kt_token=")
     assert exchanged == ["abc"]
 
 
@@ -431,7 +438,14 @@ def test_frontend_mutations_send_the_application_header():
 
 
 def _logged_in(client):
-    """P2-G: the browser first went through GET /login (a pending, cookie-bound login state)."""
+    """P2-G: the browser first went through GET /login (a pending, cookie-bound login state), and
+    Kite echoes that state on the callback (R-F1): this client's /callback requests carry it."""
     from conftest import start_kite_login
-    start_kite_login(client)
+    state, get = start_kite_login(client), client.get
+
+    def _get(url, **kw):
+        if url.startswith("/callback"):
+            url += ("&" if "?" in url else "?") + f"kt_state={state}"
+        return get(url, **kw)
+    client.get = _get
     return client

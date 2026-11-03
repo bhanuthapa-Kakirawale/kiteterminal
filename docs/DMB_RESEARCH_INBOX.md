@@ -65,7 +65,8 @@ The folder itself, and each `<YYYY-MM-DD>` session folder inside it, must be rea
   inbox write — import, dismiss, note, research watchlist, Start ticket, ticket link — is a
   normal write: Host, Origin, `X-Kite-Terminal` and the per-launch credential are checked by the
   global middleware before the route runs, and the route then requires the trading account and
-  a fresh Kite session. Reads need the trading account only. No route builds a Kite client.
+  a fresh Kite session. Reads need the trading account and, since P2-G R-F2, this launch's
+  credential (both factors) too. No route builds a Kite client.
 - The user picks one listed bundle; the request names a session date and a bundle id, both
   pattern-checked, never a path. The file read is `<dir>/<session>/<bundle_id>.json`.
 - Path safety: a symlink, junction or other reparse point at the folder, the session folder or

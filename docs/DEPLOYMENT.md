@@ -49,13 +49,22 @@ WebSocket, a refused handshake). Nothing is changed.
 | App restart | The credential lived only in process memory, as a SHA-256 digest. Every old cookie is now refused. |
 
 - **After a restart you must log in to Zerodha again before any change**:
-  approvals, the trading lock, switching to dry run, Emergency Exit. The UI
-  shows a "Changes are locked … log in to Zerodha again" banner, and reading
-  still works. Until then, Kite web and the protective GTTs at the broker
-  remain your fallback.
-- **Where the credential never appears:** in a URL, a page, a static file,
-  a JSON body or a GET response. It is registered with the log redactor, and
-  the guard logs only the reason for a refusal. JavaScript cannot read it.
+  approvals, the trading lock, switching to dry run, Emergency Exit. Since
+  P2-G R-F2 the account data is hidden too: the UI shows "Log in to unlock
+  this terminal" and no position, order, ticket or inbox data until the fresh
+  login. Until then, Kite web and the protective GTTs at the broker remain
+  your fallback.
+- **Two factors (P2-G R-F3).** Cookies are scoped by host, not by port, so a
+  server on another port of `127.0.0.1` also receives the cookie. The cookie
+  is therefore not enough on its own: each login also issues a *terminal
+  token*, handed to the page in the login's landing URL fragment
+  (`/#kt_token=…`, removed from the address bar at once) and kept in the
+  page's own origin storage, which no other port can read. Every write, every
+  non-public `/api/` read and the tick WebSocket need both.
+- **Where the cookie never appears:** in a URL, a page, a static file, a JSON
+  body or a GET response. Both factors are registered with the log redactor,
+  and the guard logs only the reason for a refusal. JavaScript cannot read
+  the cookie.
 - **Cookie host.** The cookie belongs to the host of the Kite redirect URL
   (`127.0.0.1:8000`). A UI opened on `localhost` is asked to log in again,
   and the login lands back on `127.0.0.1`.
@@ -74,16 +83,22 @@ profile. That covers:
 - a browser extension allowed on this host;
 - anything with debugger or administrator rights.
 
-Reads (GET) stay protected by the Host check only, as before. Login CSRF
-(no `state` on the callback, P2-G) stays open: a forced callback could
-rotate the credential, but never hands it to the attacker.
+Reads (P2-G R-F2): every `/api/` GET except `/api/session/status`,
+`/api/health` and `/api/config` needs both factors, and an `/api/` read a
+browser makes from another origin or port (`Origin`, `Sec-Fetch-Site`) is
+refused. Login (P2-G F1/R-F1): `/login` sends a one-time state through Kite
+Connect's documented `redirect_params`, and `/callback` exchanges nothing
+unless Kite echoes exactly this browser's state. That echo is not yet
+confirmed with a real login; if the first real login is refused with
+`?login_error=1`, see `docs/SECURITY_P2G_AUDIT.md` (R-F1) for the logged
+`KITE_TERMINAL_LOGIN_STATE_ECHO=cookie-only` fallback.
 
 ## What the app enforces (PK-18)
 
 | Protection | Behaviour |
 |---|---|
 | Bind address | `python -m backend.server` binds `127.0.0.1` by default. A non-loopback bind (`0.0.0.0`, `::`, a LAN/VM address or a hostname) is **refused** unless `KITE_TERMINAL_ALLOW_REMOTE_BIND=1`. |
-| Host header | Every request and WebSocket must carry `Host: localhost`, `127.0.0.1` or `[::1]` (any port), or a name listed in `KITE_TERMINAL_ALLOWED_HOSTS`. Anything else gets `400 INVALID_HOST` before any route runs. This blocks DNS-rebinding pages from *reading* account data. |
+| Host header | Every request and WebSocket must carry `Host: localhost`, `127.0.0.1` or `[::1]`, or a name listed in `KITE_TERMINAL_ALLOWED_HOSTS` (exact names; wildcards are refused). Started through `python -m backend.server`, the Host must also name exactly the port the terminal serves on (P2-G R-F3). Anything else gets `400 INVALID_HOST` before any route runs. This blocks DNS-rebinding pages from *reading* account data. |
 | Cross-origin writes | Every POST/PUT/DELETE needs `X-Kite-Terminal: 1` **and** a terminal Origin (or, without an Origin, a terminal Referer); a write with neither is refused (PK-5, tightened by SEC-1). The `/ws/ticks` handshake needs a terminal Origin too. This check runs after the Host check. It stops browser-borne attacks only: the header is static and a non-browser local process can forge an Origin, so it is not authentication. |
 | WebSocket | `/ws/ticks` needs an allowed Host and a terminal Origin (an absent Origin is refused since SEC-1). It carries no credentials in the URL. |
 | Proxy headers | `X-Forwarded-Host` and `Forwarded` are never used. uvicorn honours `X-Forwarded-Proto`/`-For` only when `KITE_TERMINAL_TRUSTED_PROXY_IPS` names the proxy. |

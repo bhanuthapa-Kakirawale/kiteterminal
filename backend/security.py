@@ -52,7 +52,10 @@ absent Origin is refused (SEC-1).
 
 GET routes are not subject to the write policy, which is what keeps
 ``/login`` and the Kite ``/callback`` redirect (a top-level navigation from
-kite.zerodha.com) working. They are still subject to the Host check.
+kite.zerodha.com) working. They are still subject to the Host check, and an
+``/api/`` read is refused when Fetch Metadata or Origin shows another origin
+asked for it (P2-G R-F2). Every ``/api/`` read except a short public list also
+needs the terminal credential, like a write (``read_requires_credential``).
 """
 
 import functools
@@ -158,6 +161,16 @@ def _host_values(scope) -> list[bytes]:
     return [v for k, v in scope.get("headers", []) if k.lower() == b"host"]
 
 
+RUNTIME_PORT_ENV = "KITE_TERMINAL_RUNTIME_PORT"   # exported by backend.server's launcher
+
+
+def expected_port() -> int | None:
+    """The port this process serves on, when the supported launcher (or the demo server) said so.
+    P2-G R-F3: the Host authority must then name exactly that port, not just an allowed name."""
+    raw = os.environ.get(RUNTIME_PORT_ENV, "")
+    return int(raw) if raw.isdigit() else None
+
+
 def host_rejection_reason(scope) -> str | None:
     """None if the request's Host header is an allowed terminal address."""
     values = _host_values(scope)
@@ -171,6 +184,10 @@ def host_rejection_reason(scope) -> str | None:
         return f"malformed Host {value[:100]!r}"
     if parsed[0] not in allowed_hostnames():
         return f"untrusted Host {value[:100]!r}"
+    port = expected_port()
+    scheme = _HTTP_SCHEME.get(scope.get("scheme", "http"), "http")
+    if port is not None and (parsed[1] or _DEFAULT_PORT[scheme]) != port:
+        return f"Host {value[:100]!r} does not name this terminal's port {port}"
     return None
 
 
@@ -208,12 +225,33 @@ def _headers(scope) -> dict[str, str]:
     return {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
 
 
+_SAME_ORIGIN_FETCH_SITES = frozenset({"same-origin", "none"})
+
+
+def _read_rejection_reason(scope, headers: dict) -> str | None:
+    """P2-G R-F2: an /api/ read a browser makes from any other origin is refused before it runs.
+    Fetch Metadata names the requesting site: another port on 127.0.0.1 is `same-site`, a foreign
+    page `cross-site`; only `same-origin` (the UI) and `none` (typed by the user) pass. A present
+    Origin must be a terminal origin. Non-browser clients send neither; they still need both
+    credential factors (TerminalCredentialGuard). Other paths (the page, assets, /login and the
+    /callback navigation that arrives from kite.zerodha.com) are not judged here."""
+    if not scope.get("path", "").startswith("/api/"):
+        return None
+    site = headers.get("sec-fetch-site")
+    if site is not None and site.lower() not in _SAME_ORIGIN_FETCH_SITES:
+        return f"{site[:20]!r} read"
+    origin = headers.get("origin")
+    if origin is not None and not is_terminal_origin(origin, scope["scheme"], headers.get("host", "")):
+        return f"foreign origin {origin[:100]!r}"
+    return None
+
+
 def rejection_reason(scope) -> str | None:
     """None if the request may proceed, else a short reason for the log."""
     headers = _headers(scope)
     if scope["type"] == "http":
         if scope["method"].upper() in SAFE_METHODS:
-            return None
+            return _read_rejection_reason(scope, headers)
         if headers.get(APP_HEADER) != APP_HEADER_VALUE:
             return "missing application header"
         # A present-but-empty Origin is judged, not treated as absent.
@@ -311,47 +349,124 @@ CREDENTIAL_COOKIE = "kt_session"
 CREDENTIAL_ERROR_CODE = "TERMINAL_SESSION_REQUIRED"
 _CREDENTIAL_REJECTED_BODY = json.dumps({"detail": {
     "error_code": CREDENTIAL_ERROR_CODE,
-    "message": "This terminal session is not authorized for changes: log in to Zerodha again from this browser. "
+    "message": "This terminal session is not authorized: log in to Zerodha again from this browser. "
                "Nothing was changed.",
 }}).encode()
+
+# ---- the port-isolated second factor (P2-G R-F3) ---------------------------------------------
+#
+# Cookies are scoped by host, never by port: `kt_session`, set by 127.0.0.1:8000, is sent by the
+# browser to EVERY server on 127.0.0.1 (demonstrated in a real browser, tests/e2e_dmb_inbox.py).
+# No cookie attribute changes that - not HttpOnly, SameSite, a prefix or a different port. A page
+# served by another local process on another port can therefore collect the cookie and replay it.
+#
+# So the cookie is no longer sufficient on its own. Each login also mints a TERMINAL TOKEN. The
+# /callback redirect that completes the login hands it to the page in the URL FRAGMENT
+# (`/#kt_token=...`): the response goes only to the browser that passed the login-state check, a
+# fragment is never sent to any server nor put in a Referer, and another origin cannot read this
+# page's URL. frontend/terminal_auth.js (loaded first) moves it into localStorage, strips it from
+# the address bar, and sends it as the `X-Kite-Terminal-Token` header (WebSocket: the
+# `kt-token.<token>` subprotocol). Web storage is scoped by ORIGIN - scheme, host AND port - so a
+# page on any other port cannot read it. A write, a sensitive read and a WebSocket handshake each
+# need both factors; the server holds both only as digests. A cookie collected by another port is
+# useless on its own. (A pickup endpoint was rejected: a page on another port polling its own
+# server receives the cookie the moment it is set, and could race the real page to the pickup.)
+#
+# Still outside this boundary (docs/SECURITY_P2G_AUDIT.md): malware running as the same Windows
+# user (it can read the browser profile, including web storage, or drive the browser), browser
+# extensions with access to this origin, and administrators/debuggers.
+TOKEN_HEADER = "x-kite-terminal-token"
+TOKEN_FRAGMENT = "kt_token"
+WS_SUBPROTOCOL = "kt.v1"
+WS_TOKEN_PREFIX = "kt-token."
+WS_REVOKED_CLOSE_CODE = 4401
+
+
+def _digest(value: str | None) -> bytes | None:
+    if not value:
+        return None
+    try:
+        return hashlib.sha256(value.encode("ascii")).digest()
+    except UnicodeEncodeError:
+        return None
 
 
 class _TerminalCredential:
     def __init__(self) -> None:
-        self._digest: bytes | None = None
+        self._digest: bytes | None = None          # the cookie
+        self._token_digest: bytes | None = None    # the port-isolated terminal token
+        self._generation = 0
+        self._listeners: set = set()
         self._lock = threading.Lock()
 
-    def issue(self) -> str:
-        token = secrets.token_urlsafe(32)
+    def issue(self) -> tuple[str, str]:
+        token, terminal_token = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         from backend.redaction import register_secret
         register_secret(token)
+        register_secret(terminal_token)
         with self._lock:
-            self._digest = hashlib.sha256(token.encode("ascii")).digest()
-        return token
+            self._digest = _digest(token)
+            self._token_digest = _digest(terminal_token)
+            self._generation += 1
+        self._notify()
+        return token, terminal_token
 
     def revoke(self) -> None:
         with self._lock:
-            self._digest = None
+            self._digest = self._token_digest = None
+            self._generation += 1
+        self._notify()
+
+    @staticmethod
+    def _matches(expected: bytes | None, presented: str | None) -> bool:
+        candidate = _digest(presented)
+        return expected is not None and candidate is not None and hmac.compare_digest(candidate, expected)
 
     def valid(self, presented: str | None) -> bool:
         with self._lock:
             expected = self._digest
-        if expected is None or not presented:
-            return False
-        try:
-            candidate = hashlib.sha256(presented.encode("ascii")).digest()
-        except UnicodeEncodeError:
-            return False
-        return hmac.compare_digest(candidate, expected)
+        return self._matches(expected, presented)
+
+    def token_valid(self, presented: str | None) -> bool:
+        with self._lock:
+            expected = self._token_digest
+        return self._matches(expected, presented)
+
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def add_listener(self, callback) -> None:
+        with self._lock:
+            self._listeners.add(callback)
+
+    def remove_listener(self, callback) -> None:
+        with self._lock:
+            self._listeners.discard(callback)
+
+    def _notify(self) -> None:
+        with self._lock:
+            listeners = list(self._listeners)
+        for callback in listeners:
+            try:
+                callback()
+            except Exception:
+                logger.exception("terminal credential listener failed")
 
 
 _credential = _TerminalCredential()
 
 
-def issue_terminal_credential() -> str:
-    """A new credential for this launch, replacing any previous one. Called by
-    the Kite login callback only (and by tests / the demo server)."""
+def issue_terminal_credentials() -> tuple[str, str]:
+    """A new credential for this launch, replacing any previous one (and closing every WebSocket
+    opened under it): (cookie value, terminal token). Called by the Kite login callback only (and
+    by tests / the demo server), which hands both to the browser that completed the login."""
     return _credential.issue()
+
+
+def issue_terminal_credential() -> str:
+    """issue_terminal_credentials, for a caller that needs only the cookie value (tests)."""
+    return _credential.issue()[0]
 
 
 def revoke_terminal_credential() -> None:
@@ -360,6 +475,33 @@ def revoke_terminal_credential() -> None:
 
 def terminal_credential_valid(presented: str | None) -> bool:
     return _credential.valid(presented)
+
+
+def terminal_token_valid(presented: str | None) -> bool:
+    return _credential.token_valid(presented)
+
+
+def authorized_landing_url(terminal_token: str) -> str:
+    """Where a completed login sends the browser: the UI, with the terminal token in the fragment."""
+    return f"/#{TOKEN_FRAGMENT}={terminal_token}"
+
+
+def credential_generation() -> int:
+    return _credential.generation()
+
+
+def add_credential_listener(callback) -> None:
+    """`callback()` runs (in the revoking thread) whenever the credential is issued or revoked."""
+    _credential.add_listener(callback)
+
+
+def remove_credential_listener(callback) -> None:
+    _credential.remove_listener(callback)
+
+
+def request_authorized(cookie: str | None, token: str | None) -> bool:
+    """Both factors of the current launch: the cookie and the port-isolated terminal token."""
+    return terminal_credential_valid(cookie) and terminal_token_valid(token)
 
 
 def set_credential_cookie(response, token: str, secure: bool) -> None:
@@ -387,15 +529,50 @@ def request_cookie(scope, name: str) -> str | None:
     return None
 
 
+# ---- sensitive reads (P2-G R-F2) -------------------------------------------------------------
+#
+# Every /api/ GET carries account, trading, session or research data except these three, so reads
+# are DEFAULT-DENY: a new route is protected without anyone remembering to list it. Public:
+#   /api/session/status  - whether a session exists and whether THIS browser is authorized; the
+#                          user's name and login time only to an authorized browser;
+#   /api/health          - liveness (status, database ok, version);
+#   /api/config          - static alert thresholds from config.py.
+# Outside /api/: the page and its static assets, /login, /callback (each guarded on its own) and
+# FastAPI's schema. Classification: docs/SECURITY_P2G_AUDIT.md, R-F2.
+PUBLIC_API_READS = frozenset({"/api/session/status", "/api/health", "/api/config"})
+
+
+def read_requires_credential(path: str) -> bool:
+    return path.startswith("/api/") and path not in PUBLIC_API_READS
+
+
+def _presented_token(scope) -> str | None:
+    """The terminal token: the header, or on a WebSocket (a browser cannot set headers there) the
+    offered `kt-token.<token>` subprotocol."""
+    if scope["type"] == "websocket":
+        for protocol in scope.get("subprotocols") or ():
+            if protocol.startswith(WS_TOKEN_PREFIX):
+                return protocol[len(WS_TOKEN_PREFIX):]
+    return _headers(scope).get(TOKEN_HEADER)
+
+
 def credential_rejection_reason(scope) -> str | None:
-    """None if the request needs no credential or carries the current one."""
-    if scope["type"] == "http" and scope["method"].upper() in SAFE_METHODS:
-        return None
+    """None if the request needs no credential or carries both current factors."""
+    path = scope.get("path", "")
+    if scope["type"] == "http":
+        method = scope["method"].upper()
+        if method == "OPTIONS" or (method in SAFE_METHODS and not read_requires_credential(path)):
+            return None
     presented = request_cookie(scope, CREDENTIAL_COOKIE)
     if presented is None:
         return "missing terminal credential"
     if not terminal_credential_valid(presented):
         return "invalid or expired terminal credential"
+    token = _presented_token(scope)
+    if token is None:
+        return "missing terminal token"
+    if not terminal_token_valid(token):
+        return "invalid or expired terminal token"
     return None
 
 
@@ -433,57 +610,81 @@ class TerminalCredentialGuard:
 # token exchange) unless the browser presents a pending state; every callback consumes it.
 # SameSite=Lax (not Strict): the callback is a top-level navigation FROM kite.zerodha.com, on
 # which a Strict cookie would not be sent. Path=/callback: no other route ever receives it.
-# Residual risk (docs/SECURITY_P2G_AUDIT.md): a forced callback that lands while a login the user
-# started is still pending would pass; binding it further needs Kite to echo a state parameter,
-# which cannot be validated without a real Kite login.
+#
+# R-F1 (closed): the cookie alone binds a callback to "a login this browser started", so a forced
+# callback landing while the user's own login was pending passed. Now the state ALSO travels
+# through Kite: /login sends it in Kite Connect's documented `redirect_params`, which Kite returns
+# on the redirect URL ("An optional redirect_params param can be appended to public Kite login
+# endpoint, that will be sent back to the redirect URL", kite.trade/docs/connect/v3/user). The
+# callback must echo exactly the state in this browser's cookie. An attacker's forced callback
+# cannot (the value is in an HttpOnly cookie and in a URL only the user's browser and Kite see).
+# Only ONE login is pending at a time: starting a new one supersedes every earlier one, so a stale
+# Kite tab from an older attempt can never complete. Single use, 10 minutes.
+#
+# Real-login validation is outstanding (no real Kite login in this sprint): if a real login shows
+# that Kite does not echo the parameter, set KITE_TERMINAL_LOGIN_STATE_ECHO=cookie-only. That is
+# an explicit, logged downgrade to the earlier cookie-only binding - never a silent one.
 
 LOGIN_STATE_COOKIE = "kt_login_state"
+LOGIN_STATE_PARAM = "kt_state"
 LOGIN_STATE_TTL_SECONDS = 600
-_MAX_PENDING_LOGINS = 8
+LOGIN_STATE_ECHO_ENV = "KITE_TERMINAL_LOGIN_STATE_ECHO"
+
+
+def login_state_echo_required() -> bool:
+    mode = os.environ.get(LOGIN_STATE_ECHO_ENV, "required").strip().lower()
+    if mode == "cookie-only":
+        logger.warning("%s=cookie-only: the Kite callback is bound to this browser's cookie only, not to "
+                       "the state echoed by Kite (P2-G R-F1 downgrade)", LOGIN_STATE_ECHO_ENV)
+        return False
+    return True
 
 
 class _LoginStates:
     def __init__(self) -> None:
-        self._pending: dict[bytes, float] = {}
+        self._pending: tuple[bytes, float] | None = None
         self._lock = threading.Lock()
 
     def begin(self, now: float) -> str:
         token = secrets.token_urlsafe(32)
         with self._lock:
-            self._pending = {d: t for d, t in self._pending.items() if t > now}
-            while len(self._pending) >= _MAX_PENDING_LOGINS:
-                self._pending.pop(min(self._pending, key=self._pending.get))
-            self._pending[hashlib.sha256(token.encode("ascii")).digest()] = now + LOGIN_STATE_TTL_SECONDS
+            self._pending = (_digest(token), now + LOGIN_STATE_TTL_SECONDS)   # supersedes any earlier one
         return token
 
-    def consume(self, presented: str | None, now: float) -> bool:
-        if not presented:
-            return False
-        try:
-            digest = hashlib.sha256(presented.encode("ascii")).digest()
-        except UnicodeEncodeError:
+    def consume(self, presented: str | None, echoed: str | None, require_echo: bool, now: float) -> bool:
+        """Consumes the pending login whatever the outcome, if `presented` is it."""
+        digest = _digest(presented)
+        if digest is None:
             return False
         with self._lock:
-            match = next((d for d in self._pending if hmac.compare_digest(d, digest)), None)
-            expires = self._pending.pop(match, None) if match is not None else None
-        return expires is not None and expires > now
+            if self._pending is None or not hmac.compare_digest(self._pending[0], digest):
+                return False
+            expires, self._pending = self._pending[1], None
+        if expires <= now:
+            return False
+        if require_echo:
+            echoed_digest = _digest(echoed)
+            return echoed_digest is not None and hmac.compare_digest(echoed_digest, digest)
+        return True
 
     def clear(self) -> None:
         with self._lock:
-            self._pending.clear()
+            self._pending = None
 
 
 _login_states = _LoginStates()
 
 
 def begin_login(now: float | None = None) -> str:
-    """A new pending login for the browser that asked (GET /login)."""
+    """A new pending login for the browser that asked (GET /login); any earlier one is void."""
     return _login_states.begin(time.time() if now is None else now)
 
 
-def consume_login_state(presented: str | None, now: float | None = None) -> bool:
-    """True once, for a pending, unexpired login state; the state is gone afterwards."""
-    return _login_states.consume(presented, time.time() if now is None else now)
+def consume_login_state(presented: str | None, echoed: str | None = None, now: float | None = None) -> bool:
+    """True once, for the pending, unexpired login whose state is in this browser's cookie
+    (`presented`) and, unless downgraded, was echoed back by Kite unchanged (`echoed`)."""
+    return _login_states.consume(presented, echoed, login_state_echo_required(),
+                                 time.time() if now is None else now)
 
 
 def clear_login_states() -> None:

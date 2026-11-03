@@ -12,6 +12,12 @@ importing and opening items made no broker call at all, and that no broker WRITE
 the user approved. No credential is hard-coded (the demo login issues one), no personal path is
 assumed (DMB is the sibling checkout or DMB_REPO). Exit code 0 only if every check passed.
 Not part of the pytest run (it needs Edge and starts processes); see docs/TESTING.md.
+
+P2-G (docs/SECURITY_P2G_AUDIT.md), in a real browser: the login lands on /#kt_token=..., the page
+keeps the terminal token in its own origin's storage; a real server on ANOTHER PORT receives the
+credential cookie (cookies have no port) but cannot read the token, and replaying the cookie it
+captured is refused; another local hostname gets neither factor; an unexpected Host is refused;
+and a logout closes the page's open tick WebSocket (4401), which the page reports.
 """
 from __future__ import annotations
 
@@ -19,6 +25,8 @@ import argparse
 import json
 import sys
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,6 +34,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import acceptance_dmb_kite as A  # noqa: E402
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def other_port_server(port: int) -> tuple[ThreadingHTTPServer, list]:
+    """Another local web server on the SAME host, different port - what R-F3 is about. It records
+    the Cookie header every request brings it and serves a blank page."""
+    seen: list = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.headers.get("Cookie") or "")
+            body = b"<!doctype html><title>other local app</title><p>another port</p>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, seen
 
 
 def main() -> int:
@@ -60,29 +91,77 @@ def main() -> int:
             page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
 
             def calls():
-                return ctx.request.get(base + "/api/demo/fake-kite/calls").json()["data"]
+                return ctx.request.get(base + "/demo/fake-kite/calls").json()["data"]
+
+            def auth() -> dict:
+                """The terminal token the page holds (P2-G R-F3), for this harness's own API calls."""
+                return {"X-Kite-Terminal-Token": page.evaluate("() => localStorage.getItem('kt.terminalToken')") or ""}
 
             def api(path):
-                return ctx.request.get(base + path).json()
+                return ctx.request.get(base + path, headers=auth()).json()
 
-            # Read-only without the credential; a write is refused (SEC-1 P1-F).
+            # Before the test login: the page is locked and shows no account data (P2-G R-F2), and a
+            # write is refused (SEC-1 P1-F).
             page.goto(base + "/#dmb-inbox")
             page.wait_for_timeout(1200)
+            R.check("F", "before login the terminal is locked: no account data shown (P2-G R-F2)",
+                    page.is_visible("#terminal-locked-gate") and not page.is_visible("#app-shell"))
             r = ctx.request.post(base + "/api/dmb-inbox/imports", headers=writes,
                                  data={"session_date": A.SESSION, "bundle_id": export["bundle_id"]})
             R.check("F", "import without the test login is refused (401)", r.status == 401, r.status)
             errors.clear()                              # the refusal above is an expected 401
 
-            ctx.request.get(base + "/demo/kite-login")  # the test profile's Kite login stand-in
+            page.goto(base + "/demo/kite-login")        # the test profile's Kite login stand-in, as a navigation
+            page.wait_for_timeout(800)
             cookies = {c["name"]: c for c in ctx.cookies(base)}
             R.check("F", "test login sets an HttpOnly, SameSite=Strict kt_test_session cookie",
                     cookies.get("kt_test_session", {}).get("httpOnly") is True
                     and cookies["kt_test_session"].get("sameSite") == "Strict")
+            token = page.evaluate("() => localStorage.getItem('kt.terminalToken')")
+            R.check("F", "P2-G R-F3: the login hands the page a terminal token, stripped from the address bar",
+                    bool(token) and "kt_token" not in page.url and token not in page.url, page.url)
             # P2-G R-F3 evidence: the browser sends a 127.0.0.1 cookie to EVERY port on that host.
             other = {c["name"] for c in ctx.cookies(f"http://127.0.0.1:{args.port + 1}")}
             R.check("F", "evidence R-F3: the credential cookie is visible to another port on 127.0.0.1",
                     "kt_test_session" in other, other)
-            assert ctx.request.post(base + "/api/demo/clock", headers=writes, data={"ist": A.IMPORT_AT}).ok
+            server, seen = other_port_server(args.port + 1)
+            try:
+                foreign = ctx.new_page()
+                foreign.goto(f"http://127.0.0.1:{args.port + 1}/")
+                leaked = next((c for c in seen if "kt_test_session=" in c), "")
+                R.check("F", "R-F3: a real server on another port RECEIVES the credential cookie (cookies have no port)",
+                        bool(leaked))
+                R.check("F", "R-F3: ...but a page on that port cannot read the terminal token (origin-scoped storage)",
+                        foreign.evaluate("() => localStorage.getItem('kt.terminalToken')") is None)
+                stolen = leaked.split("kt_test_session=", 1)[1].split(";", 1)[0]
+                replay = A.client(args.port)
+                replay.cookies.set("kt_test_session", stolen, domain="127.0.0.1")
+                rr, rw = replay.get("/api/dmb-inbox/items"), replay.post(
+                    "/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "EXIT ALL"})
+                R.check("F", "R-F3: replaying the captured cookie (forged Host/Origin, no token) reads and writes nothing",
+                        rr.status_code == 401 and rw.status_code == 401, (rr.status_code, rw.status_code))
+                fetched = foreign.evaluate("""async (url) => {
+                    try { const r = await fetch(url, {credentials: 'include'}); return 'read:' + r.status; }
+                    catch (e) { return 'blocked'; } }""", base + "/api/dmb-inbox/items")
+                R.check("F", "R-F2: a cross-origin fetch from that page cannot read account data", fetched == "blocked",
+                        fetched)
+                foreign.close()
+            finally:
+                server.shutdown()
+            alias = ctx.new_page()                      # another local hostname for the same server
+            alias.goto(f"http://localhost:{args.port}/")
+            alias.wait_for_timeout(1000)
+            R.check("F", "R-F3: another local hostname (localhost) gets neither factor: the terminal stays locked",
+                    alias.is_visible("#terminal-locked-gate")
+                    and alias.evaluate("() => localStorage.getItem('kt.terminalToken')") is None
+                    and "kt_test_session" not in {c["name"] for c in ctx.cookies(f"http://localhost:{args.port}")})
+            alias.close()
+            rebound = A.client(args.port)
+            rebound.headers["Host"] = f"evil.example:{args.port}"
+            R.check("F", "an unexpected Host header is refused (400)",
+                    rebound.get("/api/health").status_code == 400)
+            errors.clear()                              # the locked alias page's expected refusals
+            assert ctx.request.post(base + "/api/demo/clock", headers={**writes, **auth()}, data={"ist": A.IMPORT_AT}).ok
 
             page.goto(base + "/#dmb-inbox")
             page.wait_for_selector("#dmb-items", timeout=15000)
@@ -139,14 +218,15 @@ def main() -> int:
                     api(f"/api/dmb-inbox/items/{tcs}")["data"]["dismissed"])
 
             # Start ticket during the review session: three fields only
-            assert ctx.request.post(base + "/api/demo/clock", headers=writes, data={"ist": A.DURING_REVIEW}).ok
+            assert ctx.request.post(base + "/api/demo/clock", headers={**writes, **auth()}, data={"ist": A.DURING_REVIEW}).ok
             page.clock.set_fixed_time(datetime(2026, 11, 3, 11, 0, tzinfo=IST))
-            assert ctx.request.post(base + "/api/demo/paper/ltp", headers=writes, data={"symbol": "INFY", "price": 1180.0}).ok
+            assert ctx.request.post(base + "/api/demo/paper/ltp", headers={**writes, **auth()},
+                                    data={"symbol": "INFY", "price": 1180.0}).ok
             settings = api("/api/risk/settings")["data"]
             keep = ("max_risk_per_trade_pct", "max_capital_per_trade_pct", "max_open_positions",
                     "max_single_stock_exposure_pct", "max_total_portfolio_risk_pct", "min_risk_reward", "starting_capital")
             # The demo portfolio is ~64% IT by design; scratch instance only (see the acceptance test).
-            assert ctx.request.post(base + "/api/risk/settings", headers=writes,
+            assert ctx.request.post(base + "/api/risk/settings", headers={**writes, **auth()},
                                     data={**{k: settings[k] for k in keep}, "max_sector_exposure_pct": 100.0}).ok
             page.goto(base + "/#dmb-inbox")
             page.wait_for_selector(f'[data-dmb-open="{infy}"]', timeout=10000)
@@ -207,6 +287,20 @@ def main() -> int:
                     and cell.locator('[data-fill="AWAITING_FILL"]').count() == 1, cell.inner_text() if row.count() else "no row")
             page.screenshot(path=str(shots / "5_positions.png"), full_page=True)
             R.check("F", "no console or page errors", not errors, "; ".join(errors[:5]))
+
+            # P2-G R-F4: a logout (here from another client of the same browser) closes the page's
+            # open tick WebSocket at once; the page says the session is no longer authorised.
+            closes: list = []
+            page.on("console", lambda m: closes.append(m.text) if "[ws] closed" in m.text else None)
+            R.check("F", "R-F4: the page's tick WebSocket is open before the logout",
+                    page.evaluate("() => typeof ws !== 'undefined' && ws && ws.readyState === WebSocket.OPEN"))
+            assert ctx.request.post(base + "/api/logout", headers={**writes, **auth()}).ok
+            page.wait_for_timeout(1500)
+            R.check("F", "R-F4: logout closed the open tick WebSocket with 4401 and the page shows why",
+                    any("4401" in c for c in closes) and page.is_visible("#authorize-banner"), closes)
+            R.check("F", "R-F4: the old terminal token no longer reads anything",
+                    ctx.request.get(base + "/api/dmb-inbox/items", headers=auth()).status == 401)
+            page.screenshot(path=str(shots / "6_after_logout.png"), full_page=True)
             browser.close()
     except Exception as e:
         R.check("!", f"browser run aborted: {type(e).__name__}", False, e)

@@ -3,6 +3,7 @@ import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from backend import security
 from backend.tick_queue import ClientQueue, QueueOverflow
 from backend.ticker import ticker_manager
 
@@ -26,7 +27,31 @@ async def _until_disconnect(websocket: WebSocket):
 
 @router.websocket("/ws/ticks")
 async def ticks_ws(websocket: WebSocket):
-    await websocket.accept()
+    # P2-G R-F4: a socket lives only as long as the credential it was opened under. The listener is
+    # registered BEFORE the credential is re-checked here, so a logout or a new login that lands
+    # between the handshake guard and this point is never missed: any issue or revoke closes it.
+    loop = asyncio.get_running_loop()
+    revoked = asyncio.Event()
+
+    def _on_credential_change():
+        try:
+            loop.call_soon_threadsafe(revoked.set)
+        except RuntimeError:        # the loop is already closed: the socket is gone with it
+            pass
+
+    security.add_credential_listener(_on_credential_change)
+    try:
+        offered = websocket.scope.get("subprotocols") or []
+        await websocket.accept(subprotocol=security.WS_SUBPROTOCOL if security.WS_SUBPROTOCOL in offered else None)
+        if revoked.is_set() or security.credential_rejection_reason(websocket.scope) is not None:
+            await websocket.close(code=security.WS_REVOKED_CLOSE_CODE, reason="Terminal session revoked")
+            return
+        await _serve_ticks(websocket, revoked)
+    finally:
+        security.remove_credential_listener(_on_credential_change)
+
+
+async def _serve_ticks(websocket: WebSocket, revoked: asyncio.Event):
     logger.info("Tick WS client connected")
     # PK-22F: bounded — ticks coalesce to the latest per instrument; events
     # are never dropped silently (see backend/tick_queue.py).
@@ -38,16 +63,26 @@ async def ticks_ws(websocket: WebSocket):
     # waited on this handler until the browser went away, and a second
     # Ctrl+C then force-quit it mid-await.
     disconnected = asyncio.ensure_future(_until_disconnect(websocket))
+    revocation = asyncio.ensure_future(revoked.wait())
     try:
         while True:
             next_message = asyncio.ensure_future(queue.get())
-            await asyncio.wait({next_message, disconnected}, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait({next_message, disconnected, revocation}, return_when=asyncio.FIRST_COMPLETED)
             if disconnected.done():
                 if next_message.done():
                     next_message.exception()   # retrieved: the client is gone, nothing is sent
                 else:
                     next_message.cancel()
                 logger.info("Tick WS client disconnected: code=%s", disconnected.result())
+                break
+            if revocation.done():
+                # Logout, restart-equivalent revoke or a new login: nothing more is sent on this socket.
+                if next_message.done():
+                    next_message.exception()
+                else:
+                    next_message.cancel()
+                logger.info("event=ws.credential_revoked: closing the tick socket")
+                await websocket.close(code=security.WS_REVOKED_CLOSE_CODE, reason="Terminal session revoked")
                 break
             try:
                 message = next_message.result()
@@ -63,4 +98,5 @@ async def ticks_ws(websocket: WebSocket):
         logger.exception("Tick WS error")
     finally:
         disconnected.cancel()
+        revocation.cancel()
         ticker_manager.remove_listener(queue)

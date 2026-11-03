@@ -67,10 +67,16 @@ def _resolve_account(account_id: int | None):
     return get_account(account_id)
 
 
-def build_login_url(account_id: int | None = None) -> str:
+def build_login_url(account_id: int | None = None, state: str | None = None) -> str:
+    """Kite's login URL. `state` (P2-G R-F1) travels in Kite Connect's documented `redirect_params`
+    (a URL-encoded query string Kite sends back to the redirect URL) as `kt_state=<state>`."""
     account = _resolve_account(account_id)
     kite = create_kite_connect(_api_key(account))
-    return kite.login_url()
+    url = kite.login_url()
+    if state:
+        from urllib.parse import quote
+        url += "&redirect_params=" + quote(f"kt_state={state}", safe="")
+    return url
 
 
 def exchange_request_token(request_token: str, account_id: int | None = None) -> dict:

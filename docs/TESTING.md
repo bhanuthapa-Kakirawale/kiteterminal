@@ -39,10 +39,16 @@ demo's seeded session. Without it, on a weekend or after hours the browser
 says "market closed" and the first approval opens the AMO dialog instead.
 
 Since SEC-1 P1-F every write needs the terminal credential that a Kite
-login issues. The demo has no Kite login, so both scripts first open the
-demo-only `GET /demo/authorize`, which sets the same HttpOnly cookie. In
-pytest, `conftest.terminal_client` carries the test's credential, and
-`conftest.reauthorize(client)` stands in for a fresh login after a logout.
+login issues; since P2-G it has two factors (the HttpOnly cookie and the
+terminal token the login lands on the page as `/#kt_token=…`) and account
+reads need it too. The demo has no Kite login, so the browser scripts first
+*navigate* to the demo-only `GET /demo/authorize` (or `/demo/kite-login`),
+which answers a navigation exactly like `/callback` and an API client with
+the token in JSON. In pytest, `conftest.terminal_client` carries both factors
+of the test's credential, and `conftest.reauthorize(client)` stands in for a
+fresh login after a logout. The FakeKite call log is at the demo-only
+`GET /demo/fake-kite/calls` (outside `/api/`, so a runner can read it before
+any login).
 
 The SEC-1 P1-D review flows (manual / Quick Action buy review, two tabs,
 tampering, Kite re-login, the trading lock, exits, the market window) have

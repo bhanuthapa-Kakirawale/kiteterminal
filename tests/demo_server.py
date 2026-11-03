@@ -495,8 +495,11 @@ def install_review_controls(app, fake) -> None:
     - GET /demo/kite-login runs the REAL kite_client.exchange_request_token
       with a fake KiteConnect: the real session replacement (and the P0-C
       LIVE disarm) happens, without a Kite round trip. Like /callback it then
-      issues the terminal credential cookie (SEC-1 P1-F). A GET, because
-      after a logout there is no credential to send a POST with.
+      issues the terminal credential cookie (SEC-1 P1-F) and the port-isolated
+      terminal token (P2-G R-F3): a browser navigation lands on
+      /#kt_token=<token>, exactly as after /callback; an API client gets the
+      token in the JSON answer. A GET, because after a logout there is no
+      credential to send a POST with.
     - POST /api/demo/tamper/{ticket_id} changes a pending ticket's stored
       quantity behind the app's back, in this throwaway database.
     - POST /api/demo/tamper-after-claim/{ticket_id} does the same right after
@@ -549,14 +552,14 @@ def install_review_controls(app, fake) -> None:
     @app.get("/demo/kite-login")
     def demo_kite_login(request: Request):
         # Mirrors /callback: the session replacement, then this launch's
-        # terminal credential (SEC-1 P1-F) for the browser that "logged in".
+        # terminal credential (SEC-1 P1-F, P2-G R-F3) for the browser that "logged in".
         kite_client.KiteConnect = _FakeKiteConnect
         kite_client.exchange_request_token("demo-request-token")
-        response = JSONResponse({"data": {"logged_in": True}})
-        security.set_credential_cookie(response, security.issue_terminal_credential(), secure=False)
-        return response
+        return demo_credential_response(request)
 
-    @app.get("/api/demo/fake-kite/calls")
+    # The test harness's own observation channel (what FakeKite received), not terminal data: outside
+    # /api/, so a runner can prove "no broker write" before any login too (P2-G R-F2 gates /api/ reads).
+    @app.get("/demo/fake-kite/calls")
     def demo_fake_kite_calls():
         # The names of every call this demo's FakeKite received, in order (no arguments).
         return {"data": [name for name, _ in fake.calls]}
@@ -604,6 +607,21 @@ def install_review_controls(app, fake) -> None:
         return {"data": {"tampered": changed == 1}}
 
 
+def demo_credential_response(request):
+    """What /callback answers a completed login with (SEC-1 P1-F, P2-G R-F3): the credential cookie,
+    and the terminal token in the landing URL's fragment for a browser navigation. A non-browser
+    client (Playwright's request API, httpx), which cannot see a fragment, gets the token in JSON."""
+    from fastapi.responses import JSONResponse, RedirectResponse
+    from backend import security
+    cookie, token = security.issue_terminal_credentials()
+    if "text/html" in request.headers.get("accept", ""):
+        response = RedirectResponse(url=security.authorized_landing_url(token))
+    else:
+        response = JSONResponse({"data": {"logged_in": True, "terminal_token": token}})
+    security.set_credential_cookie(response, cookie, secure=False)
+    return response
+
+
 def install_demo_authorization(app) -> None:
     """SEC-1 P1-F, demo server only (never in backend/main.py): the demo has
     no Kite login, so GET /demo/authorize stands in for the /callback that
@@ -612,14 +630,11 @@ def install_demo_authorization(app) -> None:
     a restarted terminal needs a fresh Zerodha login. It hands the
     credential to whatever asks — acceptable only because this process holds
     synthetic data and a FakeKite."""
-    from fastapi.responses import RedirectResponse
-    from backend import security
+    from fastapi import Request
 
     @app.get("/demo/authorize")
-    def demo_authorize():
-        response = RedirectResponse(url="/")
-        security.set_credential_cookie(response, security.issue_terminal_credential(), secure=False)
-        return response
+    def demo_authorize(request: Request):
+        return demo_credential_response(request)
 
 
 # The test profile's own cookie name, so the isolated instance can never overwrite (or be
@@ -725,6 +740,8 @@ def main() -> None:
     if args.paper_controls:
         install_paper_controls(app, fake)
     print(f"Demo server on http://127.0.0.1:{args.port}  (db: {db.DB_PATH})", flush=True)
+    # As backend.server's launcher does: the Host authority must name exactly this port (P2-G R-F3).
+    os.environ["KITE_TERMINAL_RUNTIME_PORT"] = str(args.port)
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
 
 

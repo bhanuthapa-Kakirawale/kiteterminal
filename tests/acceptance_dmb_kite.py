@@ -163,11 +163,17 @@ def client(port: int):
     return httpx.Client(base_url=base, headers={"X-Kite-Terminal": "1", "Origin": base}, timeout=60)
 
 
+TOKEN_HEADER = "X-Kite-Terminal-Token"
+
+
 def login(c) -> None:
     """The test profile's stand-in for a Kite login: a real session replacement with a fake
-    KiteConnect, then this launch's credential cookie (kt_test_session)."""
+    KiteConnect, then this launch's credential cookie (kt_test_session) and - P2-G R-F3 - the
+    port-isolated terminal token, which a browser keeps in localStorage and this client sends as
+    the X-Kite-Terminal-Token header."""
     r = c.get("/demo/kite-login")
     r.raise_for_status()
+    c.headers[TOKEN_HEADER] = r.json()["data"]["terminal_token"]
 
 
 def cookie(c, name: str = "kt_test_session") -> str | None:
@@ -342,16 +348,21 @@ def run(workdir: Path, port: int, keep_running: bool) -> int:
                 revert.status_code == 409 and revert.json()["detail"]["error_code"] == "TICKET_TAMPERED_AFTER_CLAIM")
 
         # 17-18. restart on the same database: old credential dead, fresh login required
-        old_cookie = cookie(c)
+        old_cookie, old_token = cookie(c), c.headers[TOKEN_HEADER]
         stop_server(proc)
         procs.remove(proc)
         proc = start_server(workdir, port, keep_db=True)
         procs.append(proc)
         c2 = client(port)
         c2.cookies.set("kt_test_session", old_cookie, domain="127.0.0.1")
+        c2.headers[TOKEN_HEADER] = old_token
         status = c2.get("/api/session/status").json()
-        R.check("17", "after the restart: reads work, terminal not authorised",
-                status["terminal_authorized"] is False and c2.get("/api/dmb-inbox/items").status_code == 200, status)
+        # P2-G R-F2 (deliberate change): account reads, like writes, now need this launch's credential.
+        stale_read = c2.get("/api/dmb-inbox/items")
+        R.check("17", "after the restart: terminal not authorised, account reads refused (P2-G R-F2)",
+                status["terminal_authorized"] is False and status["user_name"] is None
+                and stale_read.status_code == 401
+                and stale_read.json()["detail"]["error_code"] == "TERMINAL_SESSION_REQUIRED", status)
         r = c2.post(f"/api/dmb-inbox/items/{infy['id']}/notes", json={"text": "after restart"})
         R.check("18", "old credential refused for writes (401 TERMINAL_SESSION_REQUIRED)",
                 r.status_code == 401 and r.json()["detail"]["error_code"] == "TERMINAL_SESSION_REQUIRED", r.text)
@@ -363,6 +374,16 @@ def run(workdir: Path, port: int, keep_running: bool) -> int:
                 ee.status_code == 401 and _broker_calls(c2)[mark:] == [], ee.text)
         login(c2)
         R.check("18", "fresh login issues a new credential", cookie(c2) not in (None, old_cookie))
+        R.check("18", "fresh login issues a new terminal token; the old one is dead (P2-G R-F3)",
+                c2.headers[TOKEN_HEADER] != old_token
+                and c2.get("/api/dmb-inbox/items", headers={TOKEN_HEADER: old_token}).status_code == 401)
+        replay = client(port)                                # the cookie alone, as another port would collect it
+        replay.cookies.set("kt_test_session", cookie(c2), domain="127.0.0.1")
+        r_read, r_write = replay.get("/api/dmb-inbox/items"), replay.post(
+            "/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "EXIT ALL"})
+        R.check("18", "the current cookie WITHOUT the terminal token reads and writes nothing (P2-G R-F3)",
+                r_read.status_code == 401 and r_write.status_code == 401 and _broker_calls(c2)[mark:] == [],
+                (r_read.status_code, r_write.status_code))
         ee = c2.post("/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "EXIT ALL"})
         data = ee.json().get("data", {})
         R.check("19", "Emergency Exit after fresh login submits an exit for every live position (FakeKite)",
@@ -438,7 +459,7 @@ Ctrl+C here stops the instance.""", flush=True)
 
 def _broker_calls(c) -> list:
     """The broker write calls the test server's FakeKite has received so far (demo-only read)."""
-    r = c.get("/api/demo/fake-kite/calls")
+    r = c.get("/demo/fake-kite/calls")
     r.raise_for_status()
     return [n for n in r.json()["data"] if n in BROKER_WRITES]
 

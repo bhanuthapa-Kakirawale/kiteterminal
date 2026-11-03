@@ -59,7 +59,7 @@ The runner manages its own processes:
 | 14 | P1-D | Review stamped and current. Approval without the shown token is refused (`TICKET_REVIEW_CHANGED`). The ticket is linked. LIVE arming is refused (`SYNTHETIC_TEST_PROFILE`). Approval with the token runs in **dry run** on the paper broker. |
 | 15 | Positions fill status | `ACCEPTED / AWAITING_FILL 0` → `PARTIAL 1/2` → `FILLED 2/2` with an average price |
 | 16 | Post-claim tampering | `TICKET_TAMPERED_AFTER_CLAIM`, nothing sent; audit = snapshot + `TAMPER_DETECTED(quantity)`; chain verifies; revert refused |
-| 17–18 | Restart on the same database | Reads work, `terminal_authorized=false`; the old cookie is refused (401); a fresh login issues a new credential |
+| 17–18 | Restart on the same database | `terminal_authorized=false` and account reads refused (401, P2-G R-F2 - before P2-G this check expected reads to work); the old credential is refused for writes (401); a fresh login issues a new cookie and a new terminal token, the old token is dead, and the current cookie *without* the token reads and writes nothing (P2-G R-F3) |
 | 19 | Emergency Exit (FakeKite) | Before re-login: 401, no broker write. After a fresh login: an exit submitted for every live demo position. |
 | 20 | Nothing real touched | DMB's handoff files are byte-identical; the server ran on the scratch database with the profile active; the real `kite_terminal.db*` files are unchanged in size and mtime (only `stat()`-ed, never opened) |
 

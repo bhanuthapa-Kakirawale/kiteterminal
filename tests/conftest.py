@@ -53,7 +53,7 @@ def _no_kite_rest_proxy(monkeypatch):
 # in the same test reuses it — issuing again would rotate the first client's
 # cookie away. Security tests that need to omit or alter it build a bare
 # TestClient.
-_TEST_CREDENTIAL: dict = {"token": None}
+_TEST_CREDENTIAL: dict = {"token": None, "terminal_token": None}
 
 
 @pytest.fixture(autouse=True)
@@ -61,11 +61,11 @@ def _fresh_terminal_credential():
     from backend import security
     security.revoke_terminal_credential()
     security.clear_login_states()
-    _TEST_CREDENTIAL["token"] = None
+    _TEST_CREDENTIAL.update(token=None, terminal_token=None)
     yield
     security.revoke_terminal_credential()
     security.clear_login_states()
-    _TEST_CREDENTIAL["token"] = None
+    _TEST_CREDENTIAL.update(token=None, terminal_token=None)
 
 
 @pytest.fixture(autouse=True)
@@ -90,11 +90,26 @@ def synthetic_profile(env):
 
 
 def terminal_credential() -> str:
-    """This test's current terminal credential, issued on first use."""
+    """This test's current terminal credential (the cookie value), issued on first use together
+    with its port-isolated terminal token (P2-G R-F3, `terminal_token()`)."""
     from backend import security
     if _TEST_CREDENTIAL["token"] is None or not security.terminal_credential_valid(_TEST_CREDENTIAL["token"]):
-        _TEST_CREDENTIAL["token"] = security.issue_terminal_credential()
+        _TEST_CREDENTIAL["token"], _TEST_CREDENTIAL["terminal_token"] = security.issue_terminal_credentials()
     return _TEST_CREDENTIAL["token"]
+
+
+def terminal_token() -> str:
+    """The terminal token paired with this test's credential: what the page keeps in localStorage
+    and sends as X-Kite-Terminal-Token (P2-G R-F3)."""
+    terminal_credential()
+    return _TEST_CREDENTIAL["terminal_token"]
+
+
+def authorize_client(client, cookie: str, token: str) -> None:
+    """Both factors of a credential on a client, as the browser holds them after a login."""
+    from backend import security
+    client.cookies.set(security.CREDENTIAL_COOKIE, cookie)
+    client.headers[security.TOKEN_HEADER] = token
 
 
 def start_kite_login(client) -> str:
@@ -110,8 +125,8 @@ def reauthorize(client) -> str:
     """What a fresh Kite login in the browser does for the terminal: a new
     credential for this client (after a logout or a simulated restart)."""
     from backend import security
-    _TEST_CREDENTIAL["token"] = security.issue_terminal_credential()
-    client.cookies.set(security.CREDENTIAL_COOKIE, _TEST_CREDENTIAL["token"])
+    _TEST_CREDENTIAL["token"], _TEST_CREDENTIAL["terminal_token"] = security.issue_terminal_credentials()
+    authorize_client(client, _TEST_CREDENTIAL["token"], _TEST_CREDENTIAL["terminal_token"])
     return _TEST_CREDENTIAL["token"]
 
 
@@ -119,7 +134,7 @@ def terminal_client(app, **kwargs):
     from fastapi.testclient import TestClient
     from backend import security
     client = TestClient(app, base_url=TERMINAL_ORIGIN, headers=TERMINAL_HEADERS, **kwargs)
-    client.cookies.set(security.CREDENTIAL_COOKIE, terminal_credential())
+    authorize_client(client, terminal_credential(), terminal_token())
     return client
 
 
@@ -401,7 +416,8 @@ def ticket_row(db, ticket_id: int) -> dict:
 
 
 __all__ = ["FakeKite", "make_candles", "seed_ohlc", "add_watch", "account_id", "set_mode", "displayed_mode",
-           "approval_body", "ticket_row", "terminal_credential", "reauthorize", "start_kite_login",
+           "approval_body", "ticket_row", "terminal_credential", "terminal_token", "authorize_client", "reauthorize",
+           "start_kite_login",
            "as_pre_pk22_database", "seed_live_prerequisites", "clear_live_prerequisites", "TEST_STATIC_IP",
            "seed_healthy_live_state", "clear_healthy_live_state", "make_live_ready",
            "last_weekday", "IST", "TERMINAL_ORIGIN", "TERMINAL_HEADERS", "terminal_client"]

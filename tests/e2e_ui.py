@@ -40,13 +40,17 @@ def main() -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch(channel="msedge", headless=True)
         page = browser.new_page(viewport={"width": 1440, "height": 900})
-        # SEC-1 P1-F: writes need this launch's terminal credential, issued by
-        # a Kite login; the demo's stand-in sets the same HttpOnly cookie.
-        assert page.request.get(args.base + "/demo/authorize").ok
+        # SEC-1 P1-F / P2-G: reads and writes need this launch's terminal credential, issued by
+        # a Kite login; the demo's stand-in sets the same HttpOnly cookie and lands the page on
+        # /#kt_token=..., which the page keeps in its own storage.
+        page.goto(args.base + "/demo/authorize")
+        page.wait_for_timeout(500)
+        token = page.evaluate("() => localStorage.getItem('kt.terminalToken')")
+        assert token, "the demo login handed the page no terminal token"
         if args.pin_clock:
             from datetime import datetime
             r = page.request.post(args.base + "/api/demo/clock", data=json.dumps({"time": "11:00"}),
-                                  headers={"Origin": args.base, "X-Kite-Terminal": "1",
+                                  headers={"Origin": args.base, "X-Kite-Terminal": "1", "X-Kite-Terminal-Token": token,
                                            "Content-Type": "application/json"})
             assert r.ok, r.text()
             pinned = datetime.fromisoformat(r.json()["data"]["now_ist"])
