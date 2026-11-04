@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kite Terminal Blueprint</title>
-<meta name="description" content="Training path, daily routine, document map, verification checklists and best practices for getting the most out of Kite Terminal.">
+<meta name="description" content="Architecture, security, network, order path, current GO/NO-GO status, training path, daily routine, document map and verification checklists for Kite Terminal. Last reviewed 4 November 2026.">
 <style>
 :root {
   --bg: #f7f6f2;
@@ -295,6 +295,13 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
     <nav class="toc" aria-label="Sections">
       <a href="#rules">Rules</a>
       <a href="#how">How it works</a>
+      <a href="#status">Status</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#security">Security</a>
+      <a href="#network">Network</a>
+      <a href="#orderpath">Order path</a>
+      <a href="#dmb">DMB</a>
+      <a href="#assurance">Assurance</a>
       <a href="#training">Training</a>
       <a href="#daily">Daily routine</a>
       <a href="#docs">Which .md</a>
@@ -311,7 +318,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
 
 <!-- ================= HERO ================= -->
 <div class="hero" id="rules">
-  <div class="pill accent" style="white-space:normal">docs/KITE_TERMINAL_BLUEPRINT.html · written for the LIVE-0 build (commit ef6ac53)</div>
+  <div class="pill accent" style="white-space:normal">docs/KITE_TERMINAL_BLUEPRINT.html · last reviewed 4 November 2026 · branch feature/signal-detail-and-strategy-revision</div>
   <h1 style="margin-top:14px">How to learn, run and get the most out of Kite Terminal</h1>
   <p class="lede">
     Kite Terminal is a semi-automated trading assistant. It scans your NSE watchlist after the close,
@@ -319,6 +326,10 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
     the protective stop, trails it and reconciles with Zerodha. You decide what gets traded. This page
     gives you a training path, a daily routine, the doc to read for each job, what to verify, and how to use the app well.
   </p>
+  <div class="callout bad">
+    <strong>Status, 4 November 2026: live execution is NO-GO.</strong>
+    Use the terminal in DRY RUN, with <code>KITE_TERMINAL_BROKER_WRITES=disabled</code>. The real broker order path has never been accepted by Zerodha and cannot be validated by any non-executing method today. See <a href="#status">Status</a>.
+  </div>
   <p class="small muted">Ticks on this page are saved only in this browser. The daily-routine ticks clear themselves each new day.</p>
 
   <div class="rules">
@@ -328,6 +339,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
     <div class="rule"><div class="n">RULE 4</div><b>Lock first, investigate second</b><span>The trading lock blocks only new entries. Exits, stops and monitoring keep running.</span></div>
     <div class="rule"><div class="n">RULE 5</div><b>Never resubmit an UNKNOWN order</b><span>A duplicate real order is worse than a delayed one. Wait for the order monitor's verdict.</span></div>
     <div class="rule"><div class="n">RULE 6</div><b>Never edit the database by hand</b><span>Every state has a supported path in the UI. Back up before any code change.</span></div>
+    <div class="rule"><div class="n">RULE 7</div><b>No real order to test the app</b><span>A live order is never a connectivity or software test. Live stays NO-GO until a real-broker validation is separately authorized.</span></div>
   </div>
 </div>
 
@@ -344,7 +356,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
     <div class="stage"><div class="who auto">Automatic</div><h4>Strategy scan</h4><p>Momentum Breakout and Trend Pullback look for entries. Exit and breakeven checks run on open positions.</p></div>
     <div class="stage"><div class="who auto">Automatic</div><h4>Risk engine</h4><p>Runs six checks: R:R, capital per trade, stock and sector exposure, open positions, portfolio risk. Signals that fail go to "Blocked by risk".</p></div>
     <div class="stage you-stage"><div class="who you">You</div><h4>Approvals</h4><p>Open Signal Detail, read the evidence, then Approve and place, or Reject.</p></div>
-    <div class="stage"><div class="who auto">Automatic</div><h4>Execution</h4><p>Places a LIMIT entry (or AMO). In Dry Run this is a <code>PAPER-O-…</code> paper order. When it fills, the app places a protective GTT.</p></div>
+    <div class="stage"><div class="who auto">Automatic</div><h4>Execution</h4><p>Places a LIMIT or MARKET entry (or an AMO, with your consent). As soon as the broker accepts it, the app places the protective GTT. In Dry Run both are paper (<code>PAPER-O-…</code>, <code>PAPER-G-…</code>).</p></div>
     <div class="stage"><div class="who auto">Automatic · every 20–180 s</div><h4>Guard</h4><p>The order monitor checks every 20 s, the trailing stop every 45 s and reconciliation every 3 min.</p></div>
     <div class="stage"><div class="who auto">Automatic</div><h4>Journal</h4><p>A position closes only after the broker confirms the exit. Results land in the Journal, with Dry Run and Live kept separate.</p></div>
   </div>
@@ -365,7 +377,282 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
     <div class="card screen"><h4>Ticket History</h4><p>Full audit log you can filter by status, source, symbol and date.</p></div>
     <div class="card screen"><h4>Settings</h4><p>Risk limits, account safety (max order value, ₹ daily loss, entries per day), and sector mappings.</p></div>
     <div class="card screen"><h4>Live Readiness <span class="pill warn">Before live</span></h4><p>Read-only pre-flight with 30+ checks. Answers READY or NOT READY for a live entry.</p></div>
+    <div class="card screen"><h4>DMB Research Inbox <span class="pill">Research</span></h4><p>Imported DMB research bundles. Research context only: Start ticket pre-fills symbol, exchange and rationale, nothing else. Real-data bundles are blocked (rights).</p></div>
     <div class="card screen"><h4>Diagnostics <span class="pill accent">Daily</span></h4><p>Schema, integrity, worker health, session, flagged price history (with Rebuild history).</p></div>
+  </div>
+</section>
+
+<!-- ================= STATUS (reviewed 2026-11-04) ================= -->
+<section id="status">
+  <div class="section-head">
+    <div class="kicker">Current status · last reviewed 4 November 2026</div>
+    <h2>What is approved today, and what is not</h2>
+    <p>Each mode has its own decision. A GO for one never implies a GO for another. The source of record is <code>DMB_KITE_OPERATIONAL_RUNBOOK.md</code> §7; this table repeats it and adds the 4 November order-path audit.</p>
+  </div>
+
+  <div class="callout bad">
+    <strong>Live execution is NO-GO. Do not place a first live order through Kite Terminal.</strong>
+    The real broker write path (entry order, protective GTT, exit, Emergency Exit) has never been accepted by Zerodha from this terminal, and no documented, non-executing, broker-approved method exists to validate it (runbook §7.2). FakeKite and synthetic tests do not prove real broker order acceptance or execution.
+  </div>
+
+  <p class="small muted">Status labels used on this page: <span class="pill ok">IMPLEMENTED</span> in code and tested · <span class="pill warn">PARTIAL</span> implemented with a documented gap · <span class="pill accent">PLANNED</span> not built · <span class="pill bad">BLOCKED</span> deliberately not allowed until a named condition is met.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Mode</th><th>Decision</th><th>Basis</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>DMB synthetic operation</td><td><span class="pill ok">GO</span></td><td>Synthetic fixture and scratch outputs only; DMB full suite.</td></tr>
+        <tr><td>2</td><td>DMB private real-data research</td><td><span class="pill bad">NO-GO (rights)</span></td><td>Yahoo and NSE terms prohibit automated collection without permission (rights matrix §5). The software works; the rights basis does not.</td></tr>
+        <tr><td>3</td><td>DMB → Kite synthetic handoff</td><td><span class="pill ok">GO</span></td><td>Only inside the isolated synthetic test profile (acceptance and browser runners).</td></tr>
+        <tr><td>4</td><td>DMB → Kite real-data handoff</td><td><span class="pill bad">NO-GO</span></td><td>No real source is PERMITTED for cross-application transfer: DMB refuses to export (<code>RIGHTS_BLOCKED</code>), Kite refuses to import (<code>RIGHTS_NOT_APPROVED</code>).</td></tr>
+        <tr><td>5</td><td>Kite Terminal local operation (FakeKite)</td><td><span class="pill ok">GO</span></td><td>Full suite, security, P1-D/E/F, restart, logout and Emergency Exit scenarios.</td></tr>
+        <tr><td>6</td><td>Kite real login and read-only operation</td><td><span class="pill warn">GO, limited</span></td><td>Runbook §1.6 passed on 2026-11-04 (R-F1 confirmed). DRY RUN only, LIVE not armed, bind 127.0.0.1, <code>KITE_TERMINAL_BROKER_WRITES=disabled</code>, the NET-1 proxy route up before login.</td></tr>
+        <tr><td>7</td><td>Kite dry-run operation (paper broker, real login)</td><td><span class="pill warn">GO, limited</span></td><td>Same conditions as 6. Paper orders never reach Kite (mode isolation, PK-20). Paper P&amp;L is gross of costs.</td></tr>
+        <tr><td>8</td><td>Kite order-path validation with FakeKite / mocks</td><td><span class="pill ok">GO (validated)</span></td><td>The order-path assurance suite and the existing order, proxy and writes-switch suites pass (see <a href="#assurance">Assurance</a>). This validates the terminal's own logic only.</td></tr>
+        <tr><td>9</td><td>Kite live broker order acceptance</td><td><span class="pill bad">NO-GO · UNVERIFIED</span></td><td>Real broker order acceptance remains unverified. Zerodha's sandbox supports LIMIT orders only (no GTT, margins or MARKET orders) and the terminal has no sandbox mode.</td></tr>
+        <tr><td>10</td><td>One manually initiated live trade through Kite Terminal</td><td><span class="pill bad">NO-GO</span></td><td>Follows from 9. Whether to trade through Zerodha's own Kite web or app is the owner's separate decision; this terminal makes no trade recommendation.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 style="margin:26px 0 10px">Known limitations and open items</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Item</th><th>Status</th><th>What it means</th></tr></thead>
+      <tbody>
+        <tr><td>Real broker order, GTT, exit and Emergency Exit paths</td><td><span class="pill bad">BLOCKED</span></td><td>Never accepted by Zerodha from this terminal. Earlier live attempts (Sep 2026) were rejected with "No IPs configured for this app". Unblocking needs a separately authorized, supervised validation plan (runbook §7.2).</td></tr>
+        <tr><td>Order REST through the GCP proxy</td><td><span class="pill warn">PARTIAL</span></td><td>Proven in code and on a recorded wire (same client, same proxy, sent once). Not proven on the real network, because no real order has been sent through the proxy.</td></tr>
+        <tr><td>Proxy is optional at Live Readiness</td><td><span class="pill warn">PARTIAL</span></td><td>With <code>KITE_REST_PROXY</code> unset, REST goes direct and Live Readiness shows only a WARN. Kite would then reject orders from the non-whitelisted IP (safe at the broker, but not refused locally). Making the proxy mandatory for LIVE is <span class="pill accent">PLANNED</span>, an owner decision.</td></tr>
+        <tr><td>Static IP check</td><td><span class="pill warn">PARTIAL</span></td><td>Kite does not expose the whitelisted IP. The check rests on your attestation, upgraded to VERIFIED only by a manual outbound-IP check through the proxy (observed <code>35.184.97.233</code> on 2026-11-04).</td></tr>
+        <tr><td>Available cash vs order value</td><td><span class="pill warn">PARTIAL</span></td><td>No local "order value ≤ available cash" check. Sizing is a % of portfolio value (holdings + cash from <code>margins()</code>); the absolute ₹ cap and Kite's RMS are the backstops. An RMS rejection is followed to the end and never becomes a position.</td></tr>
+        <tr><td>Kite Connect local storage of candles and quotes</td><td><span class="pill warn">PARTIAL</span></td><td>Terms ambiguous (rights matrix §5.2); ask Zerodha.</td></tr>
+        <tr><td>Same-user malware, browser extensions, local packet capture</td><td>Accepted risk</td><td>Outside a local web app's boundary (SECURITY_P2G_AUDIT §4).</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ================= ARCHITECTURE ================= -->
+<section id="architecture">
+  <div class="section-head">
+    <div class="kicker">Architecture</div>
+    <h2>Components and boundaries</h2>
+    <p>One local Python process on this PC serves the UI, the API and the background workers. Nothing in it listens beyond 127.0.0.1.</p>
+  </div>
+
+  <div class="grid g3">
+    <div class="card"><h4>Launcher <span class="pill ok">IMPLEMENTED</span></h4><p class="small"><code>backend/server.py</code>: binds <code>127.0.0.1:8000</code>, one worker, no reload. Refuses a non-loopback bind unless remote access is explicitly allowed, and refuses a malformed <code>KITE_REST_PROXY</code> before anything else starts. Logs one <code>Security summary:</code> line ending in <code>broker_writes=enabled|DISABLED</code>.</p></div>
+    <div class="card"><h4>API and UI <span class="pill ok">IMPLEMENTED</span></h4><p class="small"><code>backend/main.py</code> (FastAPI) + <code>backend/routes/</code>; static UI in <code>frontend/</code>, served by the same process under a strict Content-Security-Policy. Every order-affecting check is server-side; the UI only displays it.</p></div>
+    <div class="card"><h4>Database <span class="pill ok">IMPLEMENTED</span></h4><p class="small">SQLite <code>backend/kite_terminal.db</code> with versioned migrations (<code>backend/db.py</code>). The Kite access token is stored only Fernet-encrypted (<code>KITE_TERMINAL_ENCRYPTION_KEY</code> in <code>.env</code>). Event tables are append-only.</p></div>
+    <div class="card"><h4>Broker client factory <span class="pill ok">IMPLEMENTED</span></h4><p class="small"><code>backend/kite_client.py</code> <code>create_kite_connect()</code> is the only place a KiteConnect REST client is built (test-enforced). It attaches the NET-1 proxy, ignores environment proxy settings, and narrows the client to read-only when broker writes are disabled.</p></div>
+    <div class="card"><h4>Execution engine <span class="pill ok">IMPLEMENTED · FROZEN</span></h4><p class="small"><code>backend/execution.py</code> places the entry and its protective GTT. Hash-pinned by the PK-25 manifest; not changed without separate authorization. Dry run runs the same code against <code>backend/paper_broker.py</code>.</p></div>
+    <div class="card"><h4>Background workers <span class="pill ok">IMPLEMENTED</span></h4><p class="small">Order monitor (20 s), trailing engine (45 s), reconciliation (3 min), Autopilot data jobs (16:00 IST). Health is tracked per worker; a dead or stale worker blocks live new entries.</p></div>
+    <div class="card"><h4>Market-data ticker <span class="pill ok">IMPLEMENTED</span></h4><p class="small"><code>backend/ticker.py</code> (KiteTicker WebSocket) connects <b>directly</b> to Kite, not through the proxy. Read-only price stream; it never places orders.</p></div>
+    <div class="card"><h4>DMB Research Inbox <span class="pill ok">IMPLEMENTED</span></h4><p class="small"><code>backend/dmb_inbox.py</code> + <code>dmb_inbox_contract.py</code>: file-based, user-initiated import of DMB bundles. No network link to DMB. Real bundles are refused until rights are approved.</p></div>
+    <div class="card"><h4>Live Readiness <span class="pill ok">IMPLEMENTED</span></h4><p class="small"><code>backend/live_preflight.py</code> + <code>live_arming.py</code>: read-only pre-flight; LIVE is armed for one Kite session only and a new login disarms it.</p></div>
+  </div>
+
+  <h3 style="margin:26px 0 10px">Localhost deployment and access model</h3>
+  <ul>
+    <li><b>Bind:</b> 127.0.0.1 only. Exposing port 8000 to a network is not supported (DEPLOYMENT.md).</li>
+    <li><b>Host guard</b> (<code>TrustedHostGuard</code>): only <code>127.0.0.1</code>, <code>localhost</code>, <code>::1</code> on the served port; anything else is <code>INVALID_HOST</code>.</li>
+    <li><b>Origin guard</b> (<code>TerminalOriginGuard</code>): API reads refused for cross-site or same-site (another port) fetches; writes need the <code>X-Kite-Terminal</code> header and a terminal Origin (CSRF).</li>
+    <li><b>Credential guard</b> (<code>TerminalCredentialGuard</code>): every write, every non-public API read and the WebSocket need this launch's two-factor terminal credential, issued only by a completed Kite login.</li>
+  </ul>
+</section>
+
+<!-- ================= SECURITY ================= -->
+<section id="security">
+  <div class="section-head">
+    <div class="kicker">Authentication and sessions</div>
+    <h2>Login, terminal credential and session expiry</h2>
+    <p>Two different sessions exist: the <b>Kite session</b> (your Zerodha login, one trading day) and the <b>terminal credential</b> (this browser's right to use this launch). Both are enforced on the server.</p>
+  </div>
+
+  <div class="pipeline">
+    <div class="stage you-stage"><div class="who you">You</div><h4>Login</h4><p><code>GET /login</code> creates one pending, single-use, 10-minute state, bound to a cookie and sent to Kite in <code>redirect_params</code>.</p></div>
+    <div class="stage"><div class="who auto">Kite</div><h4>Callback</h4><p><code>/callback</code> completes only if Kite echoes the same state from the same browser (R-F1). No fallback.</p></div>
+    <div class="stage"><div class="who auto">Through GCP</div><h4>Token exchange</h4><p><code>generate_session</code> runs on the proxied client. The access token is stored encrypted; LIVE is disarmed; outstanding P1-D reviews become not current.</p></div>
+    <div class="stage"><div class="who auto">Automatic</div><h4>Credential</h4><p>A new <code>kt_session</code> cookie (HttpOnly, SameSite=Strict) plus a terminal token. Both held in memory as SHA-256 digests.</p></div>
+    <div class="stage"><div class="who auto">Automatic</div><h4>Expiry</h4><p>Idle 30 min (max 120), absolute 8 h (max 12 h). Expiry revokes at once and closes every socket (code 4401).</p></div>
+  </div>
+
+  <div class="table-wrap" style="margin-top:16px">
+    <table>
+      <thead><tr><th>Control</th><th>Status</th><th>Implementation</th><th>Evidence</th></tr></thead>
+      <tbody>
+        <tr><td>R-F1 one-time login state, callback binding</td><td><span class="pill ok">IMPLEMENTED</span></td><td><code>security.begin_login</code> / <code>consume_login_state</code>; <code>kite_client.build_login_url</code></td><td>9 tests; confirmed by the owner's read-only real login, 2026-11-04 (runbook §1.6)</td></tr>
+        <tr><td>R-F2 authentication on sensitive reads</td><td><span class="pill ok">IMPLEMENTED</span></td><td><code>TerminalCredentialGuard</code> + <code>TerminalOriginGuard</code>; only <code>/api/session/status</code>, <code>/api/health</code>, <code>/api/config</code> are public</td><td>Route-inventory sweep of every sensitive GET</td></tr>
+        <tr><td>R-F3 origin-specific credential</td><td><span class="pill warn">MITIGATED</span></td><td>Two factors: the cookie alone (visible to other ports on 127.0.0.1) can neither read, write nor stream</td><td>Backend tests + a real second server in headless Edge; residual documented</td></tr>
+        <tr><td>R-F4 WebSocket closure on logout, restart, expiry</td><td><span class="pill ok">IMPLEMENTED</span></td><td><code>backend/routes/ws.py</code>: closed 4401 on revoke, replacement or expiry (per-socket deadline)</td><td>5 tests + browser check; expiry socket tests</td></tr>
+        <tr><td>Idle and absolute expiry, server-side</td><td><span class="pill ok">IMPLEMENTED</span></td><td><code>security._TerminalCredential</code>; only requests marked <code>X-Kite-Terminal-Activity: user</code> extend idle; nothing extends the absolute lifetime; settings changed after login never lengthen it</td><td><code>test_session_expiry.py</code>; order-path tests 21/21b (expiry between review and submission sends nothing)</td></tr>
+        <tr><td>Restart and logout</td><td><span class="pill ok">IMPLEMENTED</span></td><td>A restart forgets every credential; logout revokes it. A fresh Kite login is required before any write, including Emergency Exit</td><td>Restart and logout tests; runbook §1.6 record</td></tr>
+        <tr><td>Kite session freshness</td><td><span class="pill ok">IMPLEMENTED</span></td><td><code>kite_client.get_kite</code>: the login must be from today (IST) and the token decryptable, else 401 <code>NO_SESSION</code></td><td>Session tests</td></tr>
+        <tr><td>CSP, anti-framing, nosniff</td><td><span class="pill ok">IMPLEMENTED</span></td><td><code>SecurityHeadersMiddleware</code> (PK-18)</td><td>Security hardening tests</td></tr>
+        <tr><td>Secret redaction in logs</td><td><span class="pill ok">IMPLEMENTED</span></td><td><code>backend/redaction.py</code>: API secret, request token and access token are registered and masked</td><td>Logging tests</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ================= NETWORK ================= -->
+<section id="network">
+  <div class="section-head">
+    <div class="kicker">Network · NET-1</div>
+    <h2>GCP proxy, static IP, and the direct WebSocket</h2>
+    <p>Zerodha requires API order placement to come from a whitelisted static IP. Kite REST therefore leaves through a GCP VM; the market-data WebSocket does not.</p>
+  </div>
+
+  <div class="grid g2">
+    <div class="card">
+      <h4>REST path <span class="pill ok">IMPLEMENTED</span></h4>
+      <p class="small">Kite Terminal <code>127.0.0.1:8000</code> → <code>KITE_REST_PROXY=http://10.77.0.1:3128</code> → WireGuard (Windows <code>10.77.0.2</code> ⇄ GCP <code>10.77.0.1</code>, split tunnel for <code>10.77.0.1/32</code> only) → Squid on the GCP VM (us-central1) → <code>api.kite.trade</code> from static IP <b><code>35.184.97.233</code></b>. TLS stays end to end to Kite (HTTP CONNECT).</p>
+    </div>
+    <div class="card">
+      <h4>Market-data WebSocket <span class="pill warn">DIRECT BY DESIGN</span></h4>
+      <p class="small">KiteTicker connects to <code>ws.kite.trade</code> directly over this PC's own internet connection. It is <b>not</b> GCP-routed. Zerodha does not require a static IP for the stream. Owner decision, 2026-11-04.</p>
+    </div>
+  </div>
+
+  <div class="table-wrap" style="margin-top:16px">
+    <table>
+      <thead><tr><th>Path</th><th>Route</th><th>Evidence</th></tr></thead>
+      <tbody>
+        <tr><td>Login token exchange (<code>POST /session/token</code>)</td><td>GCP proxy</td><td>Code: built by <code>create_kite_connect</code> (test 14). Real: on 2026-11-04 the first four login attempts failed at the token exchange with <code>ProxyError … Unable to connect to proxy</code> while the proxy was down, and succeeded once it was up (runbook §1.6) — proof that the exchange uses the proxy and does not fall back.</td></tr>
+        <tr><td>Read-only REST (profile, holdings, positions, margins, orders, GTTs, LTP, history)</td><td>GCP proxy</td><td>Code + wire tests 9–13. Real: Live Readiness broker check answered through the proxy; outbound-IP check through the proxy observed <code>35.184.97.233</code> (NET-1 report).</td></tr>
+        <tr><td>Order REST (<code>place_order</code>, <code>cancel_order</code>, GTT place/modify/delete)</td><td>GCP proxy (same client)</td><td>Code: <code>execution.py</code> calls <code>place_order</code> on the client <code>require_trading_account</code> returns, which is the proxied factory client (tests 11, 11b, 12). Wire: a proxy failure on <code>POST /orders/regular</code> is sent exactly once, never retried directly (test 19b). <b>Not proven on the real network</b>: no real order has been sent.</td></tr>
+        <tr><td>Market-data WebSocket</td><td>Direct</td><td>Code: tests 15–16, the ticker never receives or references the REST proxy. Real: the NET-1 validation saw KiteTicker connect directly (peer <code>43.204.153.52:443</code>), after login and after restart.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout warn">
+    <strong>Fail closed, never direct</strong>
+    A malformed proxy setting refuses every broker route (<code>KITE_REST_PROXY_INVALID</code>, 503) and stops the launcher. An unreachable proxy raises; the call is never retried directly, and before an order it means nothing is placed (<code>RISK_REVALIDATION_UNAVAILABLE</code>). Environment variables (<code>HTTP(S)_PROXY</code>, <code>NO_PROXY</code>) cannot redirect the route (<code>trust_env</code> off). The one gap: with <code>KITE_REST_PROXY</code> unset the route is DIRECT by configuration and Live Readiness only warns (see <a href="#status">Status</a>).
+  </div>
+</section>
+
+<!-- ================= ORDER PATH ================= -->
+<section id="orderpath">
+  <div class="section-head">
+    <div class="kicker">Order path · audited 4 November 2026</div>
+    <h2>From signal to broker answer, stage by stage</h2>
+    <p>Every control below is enforced on the server. A control that appears in the UI is display only; the confirm route decides again. One code path executes every ticket, whether it came from Approvals, New Ticket, a Quick Action or Emergency Exit (<code>routes/tickets.py</code> <code>confirm_and_execute_ticket</code>).</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Stage</th><th>Implementation</th><th>Validation and failure handling</th><th>Tests</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Signal or research candidate</td><td><code>strategy_engine.run_entry_scan</code> (source <code>strategy</code>); DMB inbox items are research only</td><td>A strategy signal is valid only while its candle is the latest completed session (<code>STALE_SIGNAL</code>, permanent)</td><td>strategy, signal-detail tests</td></tr>
+        <tr><td>2</td><td>Manual selection</td><td>New Ticket, Quick Action (<code>/api/tickets</code>, <code>/alert-action/buy|sell</code>); DMB <i>Start ticket</i> only pre-fills symbol, exchange, rationale</td><td>The server stamps <code>source</code>; a browser can never set it. DB CHECK allows only <code>manual</code>, <code>strategy</code>, <code>alert_action</code></td><td>baseline API, alert-action, DMB inbox</td></tr>
+        <tr><td>3</td><td>Ticket creation</td><td><code>routes/tickets.py</code> shared create body</td><td>PK-17: only BUY + CNC opens a position (<code>UNSUPPORTED_MANUAL_TRADE</code>); stop on the correct side; instrument must resolve in the cache (<code>INSTRUMENT_NOT_FOUND</code>); risk checks → <code>pending_confirmation</code> or <code>risk_rejected</code>; review digest stamped</td><td>assurance 08–10</td></tr>
+        <tr><td>4</td><td>Human review (P1-D)</td><td><code>account_safety.ticket_review_digest</code>, <code>review_stamp</code>, <code>review_token</code>; Re-review route</td><td>A manual or Quick-Action BUY needs a current review: same NSE session window, same Kite login, exact stored content, and the approver's token (ticket + digest + random generation + time + session)</td><td><code>test_manual_ticket_review.py</code>, <code>e2e_p1d.py</code>, assurance 02–06</td></tr>
+        <tr><td>5</td><td>Ticket validation at confirm</td><td><code>confirm_and_execute_ticket</code></td><td>Confirmable status only; unsupported or tampered tickets rejected for good; the displayed mode must equal the server mode (PK-11); stale exits refused</td><td>review-changes, mode-binding, tamper audit</td></tr>
+        <tr><td>6</td><td>Account and session</td><td><code>require_trading_account</code>, <code>require_kite</code>, terminal credential, <code>check_live_armed</code></td><td>403 <code>NOT_TRADING_ACCOUNT</code>; 401 <code>NO_SESSION</code>; 401 <code>TERMINAL_SESSION_REQUIRED</code>; LIVE armed for this Kite session only; a ticket of another account is 404</td><td>assurance 06b, 07, 21</td></tr>
+        <tr><td>7</td><td>Calendar and market session</td><td><code>account_safety.decide_variety</code>, <code>review_window</code>; <code>live_preflight.confirm_time_blockers</code></td><td>Market closed → AMO only with explicit consent; a year the NSE calendar does not cover fails closed (<code>LIVE_STATE_UNVERIFIED</code>, 503); special sessions without official evidence are UNVERIFIED</td><td><code>test_trading_calendar.py</code>, calendar parity, assurance 11–12</td></tr>
+        <tr><td>8</td><td>Funds, margin and risk</td><td><code>risk_engine.build_portfolio_context</code> (holdings, positions, margins) + six checks; <code>account_safety.precheck</code> / <code>final_gate</code></td><td>Re-run against the broker at confirm; broker data that cannot be read fails closed. Live: ₹ per-order cap, ₹ daily loss, entries per day (reserved inside the claim), circuit breaker, live prerequisites, critical reconciliation findings. <span class="pill warn">PARTIAL</span> no explicit available-cash check (RMS backstop)</td><td>risk, account-safety, live-critical-gate, assurance 09d, 10–10c</td></tr>
+        <tr><td>9</td><td>Quantity and price</td><td>Pydantic models; <code>market.round_to_tick</code> in execution; <code>check_price_sanity</code></td><td>Positive integer quantity; positive prices; MARKET or LIMIT only; one LTP just before the call: stop already crossed → rejected, price beyond the deviation limit → refused</td><td>assurance 09, 09e</td></tr>
+        <tr><td>10</td><td>Duplicate and idempotency</td><td>Compare-and-set claim <code>pending_confirmation → confirmed</code> + <code>submission_state=submitting</code> + deterministic order tag, in one write</td><td>Only one request can win the claim; the loser never reaches the broker. No automatic retry anywhere (the SDK session has 0 transport retries; 7 s timeout). A second confirm is 409</td><td>approval race tests, assurance 15, 17, proxy test 19</td></tr>
+        <tr><td>11</td><td>Broker adapter</td><td><code>paper_broker.broker_for(mode)</code> → Kite or the paper broker; <code>execution.execute_ticket</code></td><td>Mode isolation: a dry-run ticket never reaches Kite, a live one never the paper broker; PK-17 backstop before any call</td><td>paper-broker, mode-binding</td></tr>
+        <tr><td>12</td><td>Kite order API request</td><td><code>KiteConnect.place_order</code> → <code>POST /orders/{variety}</code> with the ticket's tag, then <code>ltp</code> + <code>place_gtt</code> (OCO stop+target, or single stop if trailing)</td><td>Proxied factory client; with writes disabled, refused locally before any request (<code>BrokerWritesDisabled</code>)</td><td>proxy tests 11, 19b; writes-switch tests; assurance 22–22c</td></tr>
+        <tr><td>13</td><td>Broker acceptance or rejection</td><td><code>execution.DEFINITE_REJECTIONS</code>, <code>unknown_result</code></td><td>Order/Input/Permission exception → <code>failed</code>, submission <code>rejected</code>. Anything else (timeout, proxy error, 5xx, malformed reply) → UNKNOWN: "DO NOT RESUBMIT"; further live entries blocked until resolved. Accepted but GTT failed → <code>protection_failed</code>, UNPROTECTED alert</td><td>assurance 10c, 14–16</td></tr>
+        <tr><td>14</td><td>Order-state persistence</td><td><code>_record_execution_result</code> (compare-and-set), <code>ticket_events</code>, <code>ticket_integrity</code></td><td>A later monitor verdict is never overwritten; content is re-checked after the claim, before the broker call and after it</td><td><code>POST_CLAIM_TAMPERING_AUDIT.md</code> tests</td></tr>
+        <tr><td>15</td><td>Partial and full fill</td><td><code>order_monitor.check_pending_orders</code> (20 s), <code>position_quantity</code></td><td>Acceptance is <code>pending</code>, never a fill. Filled quantity is the broker's, monotonic; the GTT is resized to shares held. COMPLETE → <code>filled</code> with the broker's price and time. REJECTED/CANCELLED with 0 filled → <code>cancelled</code> and the GTT removed. UNKNOWN → adopted by tag, <code>not_found</code> after 15 min, or <code>needs_review</code></td><td><code>test_partial_fills.py</code>, order-progress, assurance 01, 16, 18–19</td></tr>
+        <tr><td>16</td><td>Position reconciliation</td><td><code>reconciliation._run_cycle</code> (3 min)</td><td>Holdings and GTT book compared with the app; findings are logged, never auto-corrected, never an invented fill. Critical findings block live new entries, never exits</td><td>GTT-reconciliation tests, assurance 20</td></tr>
+        <tr><td>17</td><td>Audit and user-visible status</td><td><code>ticket_events</code>, <code>system_events</code>, <code>reconciliation_log</code> (append-only); structured <code>order.submitting</code> / <code>order.result</code> log lines with a request id</td><td>Positions shows ENTRY WORKING / OPEN / EXITING / CLOSED / PARTIAL and PROTECTED or UNPROTECTED</td><td>lifecycle tests</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 style="margin:26px 0 10px">Acceptance is not a fill</h3>
+  <p>Kite's <code>place_order</code> returning an order id means only that the broker <b>accepted</b> the request. The ticket becomes <code>executed</code> with fill status <code>pending</code>, filled quantity 0 and no fill price. The protective GTT is placed right after acceptance, before any fill, so the position is never left unprotected; if the entry is later rejected or cancelled with nothing filled, the order monitor removes that GTT. Partial fills are recorded as the broker reports them; a full fill only on COMPLETE. An exit order makes the position EXITING; the position closes only when the broker reports the full quantity filled.</p>
+
+  <h3 style="margin:22px 0 10px">BUY, SELL and exit controls are deliberately different</h3>
+  <p>The P1-D review, the trading lock, the daily limits, the circuit breaker and critical reconciliation findings can only refuse <b>adding</b> risk. Linked exits, Quick-Action sells and Emergency Exit are never held back by them, so you are never stuck in a position. Exits still pass their own checks: the position must be open, owned by no other exit, and hold exactly the exit's quantity (one exit owner per position, enforced by a unique index).</p>
+
+  <h3 style="margin:22px 0 10px">Emergency Exit</h3>
+  <ul>
+    <li><b>Route:</b> <code>POST /api/kill-switch/emergency-exit-confirm</code>. Needs a trading account, a current Kite session, the terminal credential and the CSRF header, plus the typed phrase <code>EXIT ALL</code>. After a restart or logout a fresh Kite login is required first.</li>
+    <li><b>Scope:</b> LIVE open positions only, each in its own mode; a working entry is cancelled first. Best effort per position: one failure never stops the others, and a summary event is always written.</li>
+    <li><b>Same path:</b> every exit runs through <code>confirm_and_execute_ticket</code>. With <code>KITE_TERMINAL_BROKER_WRITES=disabled</code> every sell is refused before any request (assurance 22b).</li>
+    <li><b>Status:</b> <span class="pill ok">IMPLEMENTED</span> and tested with FakeKite; <span class="pill bad">NOT VALIDATED</span> against Zerodha. MARKET exits are not covered by Zerodha's sandbox.</li>
+  </ul>
+
+  <h3 style="margin:22px 0 10px">The read-only broker switch</h3>
+  <p><code>KITE_TERMINAL_BROKER_WRITES=disabled</code> turns every REST client into a read-only one at the SDK's single request method. The only non-GET left is the login token exchange. Orders, GTTs, cancels, conversions and margin calculations are refused in this process before any request, whoever calls them (a route, a worker, Emergency Exit), and are recorded as definite rejections, never UNKNOWN. Any value other than <code>enabled</code> or empty disables writes. Start it as in <a href="#commands">Commands</a> and check that the startup line ends in <code>broker_writes=DISABLED</code>.</p>
+</section>
+
+<!-- ================= DMB HANDOFF ================= -->
+<section id="dmb">
+  <div class="section-head">
+    <div class="kicker">DMB integration</div>
+    <h2>DMB research handoff and source rights</h2>
+    <p>A one-way, file-based handoff from the Daily Market Byte Private Desk. There is no network connection between the two applications, no automatic import, no automatic ticket and no order.</p>
+  </div>
+
+  <div class="pipeline">
+    <div class="stage"><div class="who auto">DMB · explicit command</div><h4>Export</h4><p><code>python -m private_desk.handoff export --session D</code> writes one immutable bundle (<code>dmb-candidate-bundle-1</code>, packet schema 1.2). Real evidence: <code>RIGHTS_BLOCKED</code>, nothing written.</p></div>
+    <div class="stage you-stage"><div class="who you">You · logged in</div><h4>Import</h4><p>DMB Research Inbox → Import. The terminal only reads <code>KITE_DMB_HANDOFF_DIR</code> and re-checks the contract, integrity and rights independently.</p></div>
+    <div class="stage you-stage"><div class="who you">You</div><h4>Start ticket</h4><p>Pre-fills only symbol, exchange and rationale, under a "not a trade recommendation" banner.</p></div>
+    <div class="stage you-stage"><div class="who you">You</div><h4>Your ticket</h4><p>You type every trading detail. The unchanged manual path follows: risk checks, P1-D review, approval.</p></div>
+  </div>
+
+  <div class="table-wrap" style="margin-top:16px">
+    <table>
+      <thead><tr><th>Item</th><th>Status</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td>Synthetic handoff</td><td><span class="pill ok">IMPLEMENTED</span></td><td>Actionable only in the isolated synthetic test profile, which only a test harness can enter (no variable, setting or route). Synthetic bundles are refused in production (<code>SYNTHETIC_NOT_PERMITTED</code>); relabelling is refused (<code>SYNTHETIC_MISLABELLED</code>).</td></tr>
+        <tr><td>Real-data handoff</td><td><span class="pill bad">BLOCKED</span></td><td>Every real source is UNRESOLVED in DMB's handoff rights registry; Kite refuses any packet whose rights are not PERMITTED for every source (<code>RIGHTS_NOT_APPROVED</code>).</td></tr>
+        <tr><td>Source rights (Yahoo, NSE)</td><td><span class="pill bad">BLOCKED</span></td><td>Terms retrieved 2026-11-04 prohibit automated collection, storage and redistribution without the provider's express or written permission (<code>DMB_KITE_SOURCE_RIGHTS_MATRIX.md</code> §5). Derivation does not launder rights.</td></tr>
+        <tr><td>Kite Connect data in this terminal</td><td><span class="pill warn">PARTIAL</span></td><td>Personal, non-public display to the account holder: permitted in principle. Local permanent storage of candles and quotes: ambiguous; ask Zerodha.</td></tr>
+        <tr><td>Storage</td><td><span class="pill ok">IMPLEMENTED</span></td><td>Migration v9: imports and inbox events are append-only (triggers); every import records the file's SHA-256.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ================= ASSURANCE ================= -->
+<section id="assurance">
+  <div class="section-head">
+    <div class="kicker">Testing architecture</div>
+    <h2>FakeKite, the wire recorder and the order-path assurance suite</h2>
+    <p>Nothing in the automated suites reaches Zerodha. Tests use throwaway databases, never <code>backend/kite_terminal.db</code>.</p>
+  </div>
+
+  <div class="callout bad">
+    <strong>FakeKite and synthetic tests do not prove real broker order acceptance or execution.</strong>
+    They prove what this terminal does with each possible broker answer. What Zerodha actually answers, and whether it accepts this terminal's orders and GTTs, is untested. Real broker order acceptance remains unverified.
+  </div>
+
+  <div class="grid g3">
+    <div class="card"><h4>FakeKite</h4><p class="small"><code>tests/fake_kite.py</code>: an in-memory broker with an order book, GTT book, fills, and one-shot failures (<code>raise_on_next</code>: never reached the broker; <code>accept_then_raise</code>: accepted, response lost).</p></div>
+    <div class="card"><h4>Wire recorder</h4><p class="small"><code>tests/test_kite_rest_proxy.py</code>: a real KiteConnect from the production factory, with <code>requests</code>' adapter replaced. Records method, host, path and the proxies the socket layer would use.</p></div>
+    <div class="card"><h4>Demo server and browsers</h4><p class="small"><code>tests/demo_server.py</code> (scratch DB, FakeKite) drives <code>e2e_ui.py</code>, <code>e2e_p1d.py</code>, <code>e2e_dmb_inbox.py</code> and <code>acceptance_dmb_kite.py</code> in headless Edge.</p></div>
+  </div>
+
+  <h3 style="margin:22px 0 10px">Order-path assurance suite (<code>tests/test_order_path_assurance.py</code>, added 4 Nov 2026)</h3>
+  <p class="small muted">49 tests, all passing, plus a mutation check: breaking the read-only switch makes all four writes-disabled tests fail.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Scenario</th><th>Tests</th><th>Proven (with FakeKite / wire)</th></tr></thead>
+      <tbody>
+        <tr><td>Valid reviewed ticket</td><td>01</td><td>One order with the ticket's exact fields and tag; one GTT; fill status <code>pending</code>, no fill invented</td></tr>
+        <tr><td>Missing, expired or stale review</td><td>02, 03, 05</td><td>409 before the claim, nothing sent; a Re-review issues a new generation that kills the old view's token</td></tr>
+        <tr><td>Ticket changed after review</td><td>04</td><td>Rejected for good (<code>TICKET_EVIDENCE_MISMATCH</code>)</td></tr>
+        <tr><td>Wrong session or account</td><td>06, 06b, 07</td><td>An earlier Kite login voids the review and disarms LIVE; another account's ticket is 404</td></tr>
+        <tr><td>Invalid instrument, exchange, quantity, price, order shape</td><td>08–09e</td><td>Refused at creation (400/422) or before the broker call</td></tr>
+        <tr><td>Insufficient funds or margin</td><td>10–10c</td><td>Capital limit risk-rejects; RMS rejection (async or sync) never becomes a position, GTT removed</td></tr>
+        <tr><td>Market closed, unsupported calendar</td><td>11, 12</td><td>AMO needs consent; an uncovered year fails closed (503)</td></tr>
+        <tr><td>Proxy unavailable or invalid</td><td>13, 13b</td><td>Nothing placed; invalid setting refuses every route</td></tr>
+        <tr><td>Broker rejection, timeout, ambiguous response</td><td>14–16</td><td>Definite failure without GTT; UNKNOWN never retried or resubmittable, blocks further live entries; adopted by tag, sent once</td></tr>
+        <tr><td>Duplicate submission</td><td>17</td><td>Three further confirms: 409, still one order and one GTT</td></tr>
+        <tr><td>Partial and full fill</td><td>18, 19</td><td>Partial stays partial; full fill uses the broker's price and quantity</td></tr>
+        <tr><td>Reconciliation mismatch</td><td>20</td><td>Finding logged, position row unchanged, live entries blocked</td></tr>
+        <tr><td>Session expiry between review and submission</td><td>21, 21b</td><td>401 and nothing sent; activity cannot extend the absolute lifetime</td></tr>
+        <tr><td>Broker writes disabled, on the wire</td><td>22, 22b, 22c</td><td>Live confirm, Emergency Exit, GTT cancel and order cancel send only proxied GETs; the outcome is a definite rejection</td></tr>
+      </tbody>
+    </table>
   </div>
 </section>
 
@@ -373,9 +660,10 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
 <section id="training">
   <div class="section-head">
     <div class="kicker">App training</div>
-    <h2>Training path: from install to your first live trade</h2>
+    <h2>Training path: from install to live readiness</h2>
     <p>Work through the stages in order. Each stage ends with a <b>done when</b> test, so finish that before moving on. Stages 4 and 5 run alongside each other for several weeks, and that's where most of the learning happens.</p>
   </div>
+  <div class="callout warn"><strong>Stages 7 and 8 are BLOCKED (4 Nov 2026).</strong> They describe the protocol for when a real-broker validation has been separately authorized. Until then, stop after stage 6 and keep Live Readiness NOT READY with the trading lock on.</div>
 
   <div class="progress-wrap">
     <span class="small"><b id="train-count">0</b> of <b id="train-total">0</b> training steps done</span>
@@ -398,8 +686,8 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
         <ul class="checks">
           <li><label><input type="checkbox" data-k="t1-1"><span>Get your Kite Connect API key and secret from developers.kite.trade, then put them in <code>.env</code> (copied from <code>.env.example</code>).</span></label></li>
           <li><label><input type="checkbox" data-k="t1-2"><span>Install dependencies: <code>pip install -r requirements.txt</code> (and <code>requirements-dev.txt</code> for tests).</span></label></li>
-          <li><label><input type="checkbox" data-k="t1-3"><span>Start with <code>python -m backend.server</code>. Never use <code>--reload</code> or <code>--workers</code>.</span></label></li>
-          <li><label><input type="checkbox" data-k="t1-4"><span>Find the startup log line <code>Security summary:</code> and confirm it shows <code>bind=127.0.0.1</code>, <code>remote_exposure=no</code>, <code>reload=no</code>, <code>workers=1</code>.</span></label></li>
+          <li><label><input type="checkbox" data-k="t1-3"><span>Start with <code>python -m backend.server</code>, with <code>KITE_TERMINAL_BROKER_WRITES=disabled</code> set in the launching window (see <a href="#commands">Commands</a>). Never use <code>--reload</code> or <code>--workers</code>.</span></label></li>
+          <li><label><input type="checkbox" data-k="t1-4"><span>Find the startup log line <code>Security summary:</code> and confirm it shows <code>bind=127.0.0.1</code>, <code>remote_exposure=no</code>, <code>reload=no</code>, <code>workers=1</code> and ends in <code>broker_writes=DISABLED</code>. Also check <code>Kite REST proxy enabled: 10.77.0.1:3128</code>.</span></label></li>
           <li><label><input type="checkbox" data-k="t1-5"><span>Open <code>http://127.0.0.1:8000</code>, click Login and finish the Zerodha login. You'll need to do this every trading day.</span></label></li>
           <li><label><input type="checkbox" data-k="t1-6"><span>Check that the mode pill reads <b>Dry Run</b>, the WebSocket dot is green and the trailing heartbeat is alive.</span></label></li>
           <li><label><input type="checkbox" data-k="t1-7"><span>Check that <code>.env</code> now contains <code>KITE_TERMINAL_ENCRYPTION_KEY</code>, and back the file up somewhere safe. If you lose it, the stored token can't be read.</span></label></li>
@@ -494,7 +782,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
         <h4>Read</h4>
         <p><code>TESTING.md</code> §2 (manual checklist) and §3 (regression policy). The condensed version is in <a href="#testing">Testing</a> below.</p>
         <ul class="checks">
-          <li><label><input type="checkbox" data-k="t5-1"><span>Run <code>pytest</code> once. As of LIVE-0 it reports about 1,654 passed and 0 failed.</span></label></li>
+          <li><label><input type="checkbox" data-k="t5-1"><span>Run <code>pytest</code> once. On 4 Nov 2026 it reported 2,718 passed, 3 skipped (Windows symlink privilege), 0 failed.</span></label></li>
           <li><label><input type="checkbox" data-k="t5-2"><span>Complete the environment, risk engine and manual ticket sections (TESTING §2.1–2.3).</span></label></li>
           <li><label><input type="checkbox" data-k="t5-3"><span>Complete the strategy scan and Signal Detail checks (§2.4). The chart values must match the Entry Conditions values exactly.</span></label></li>
           <li><label><input type="checkbox" data-k="t5-4"><span>Recalculate the Journal stats by hand for 5 trades (§2.6).</span></label></li>
@@ -511,14 +799,14 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
         <div class="train-meta">1 evening<br><span class="stage-count"></span></div>
       </summary>
       <div class="train-body">
-        <div class="callout warn"><strong>Where your real account stood at LIVE-0 (30 Sep 2026)</strong>NOT READY, with four blockers, all of which are yours to clear: <code>STATIC_IP</code> unconfirmed, <code>MAX_ORDER_NOTIONAL_SET</code> not set, <code>DAILY_LOSS_AMOUNT_SET</code> not set, and <code>TRADING_LOCK</code> on (deliberately). Every technical check passed.</div>
+        <div class="callout warn"><strong>Historical: where your real account stood at LIVE-0 (30 Sep 2026)</strong>NOT READY, with four blockers: <code>STATIC_IP</code> unconfirmed, <code>MAX_ORDER_NOTIONAL_SET</code> not set, <code>DAILY_LOSS_AMOUNT_SET</code> not set, and <code>TRADING_LOCK</code> on (deliberately). <b>Since then:</b> the NET-1 proxy route exists and you confirmed on 4 Nov 2026 that <code>35.184.97.233</code> is whitelisted in the Kite developer console. The current state of the other items is whatever Live Readiness shows; this page does not read your account database.</div>
         <h4>Read</h4>
         <p><code>FIRST_LIVE_TRADE.md</code> (start to finish, before you begin) · <code>LIVE0_PRODUCTION_READINESS_REPORT.md</code> · <code>USER_GUIDE.md</code> §16 "Live Readiness"</p>
         <ul class="checks">
-          <li><label><input type="checkbox" data-k="t6-1"><span>In the Kite developer console, register this machine's <b>static IP</b> on your Kite Connect app.</span></label></li>
+          <li><label><input type="checkbox" data-k="t6-1"><span>In the Kite developer console, whitelist the <b>static IP of the REST route</b>: with the NET-1 proxy that is the GCP VM's <code>35.184.97.233</code>, not this PC's own address. Whitelist changes are allowed once per calendar week.</span></label></li>
           <li><label><input type="checkbox" data-k="t6-2"><span>Write down your first-live limits: max order value (₹), daily loss (₹), and 1 new entry per day.</span></label></li>
           <li><label><input type="checkbox" data-k="t6-3"><span>Settings → <b>Fill FIRST LIVE / CAUTIOUS profile…</b>, type your two ₹ limits, review every other field, then <b>Save</b>.</span></label></li>
-          <li><label><input type="checkbox" data-k="t6-4"><span>Live Readiness → Static IP: enter it, tick the box, click <b>Confirm static IP</b>. You can also run the outbound-IP check.</span></label></li>
+          <li><label><input type="checkbox" data-k="t6-4"><span>Live Readiness → Static IP: enter it, tick the box, click <b>Confirm static IP</b>. Run the outbound-IP check: it goes through the proxy and must read VERIFIED.</span></label></li>
           <li><label><input type="checkbox" data-k="t6-5"><span>Click <b>Run broker check (read-only)</b> and confirm the verdict reads <i>NOT READY — trading lock is ON / every other check passed</i>.</span></label></li>
         </ul>
         <div class="donewhen"><b>Done when:</b> the only remaining blocker is the trading lock you deliberately left on.</div>
@@ -528,16 +816,17 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
     <details class="train" data-stage>
       <summary>
         <div class="badge-num">7</div>
-        <div class="train-title"><b>First live trade</b><span>One small BUY + CNC trade, followed through its whole lifecycle</span></div>
+        <div class="train-title"><b>First live trade <span class="pill bad">BLOCKED</span></b><span>Only after a separately authorized real-broker validation. Not today.</span></div>
         <div class="train-meta">1–3 weeks<br><span class="stage-count"></span></div>
       </summary>
       <div class="train-body">
+        <div class="callout bad"><strong>Do not do this stage yet.</strong>Live broker execution is NO-GO (runbook §7). The first live order must not be the test of an unverified order path. The steps below are kept as the protocol for when validation is authorized.</div>
         <p>Follow <code>FIRST_LIVE_TRADE.md</code> step by step. Keep its "If something goes wrong" table open while the trade is live.</p>
         <ul class="checks">
           <li><label><input type="checkbox" data-k="t7-1"><span>Switch the mode to Live (this doesn't unlock trading). Create one small BUY + CNC LIMIT ticket while the lock is still on.</span></label></li>
           <li><label><input type="checkbox" data-k="t7-2"><span>Inspect it: quantity, limit, stop, target, mode LIVE, notional within your cap, all checks PASS.</span></label></li>
           <li><label><input type="checkbox" data-k="t7-3"><span>Unlock with a reason. Live Readiness should now read <b>READY</b>. Tick the 10-item first-live checklist yourself.</span></label></li>
-          <li><label><input type="checkbox" data-k="t7-4"><span>Approve that <b>one</b> ticket. Check that it has a real broker order id (not <code>PAPER-…</code>), and that after the fill it has a GTT id and reads PROTECTED.</span></label></li>
+          <li><label><input type="checkbox" data-k="t7-4"><span>Approve that <b>one</b> ticket. Check that it has a real broker order id (not <code>PAPER-…</code>), that it has a GTT id as soon as Kite accepts the order, and that it reads PROTECTED once filled.</span></label></li>
           <li><label><input type="checkbox" data-k="t7-5"><span>Cross-check in Kite web: the order shows COMPLETE, the holding exists, and both GTT legs have the right quantity. Then <b>re-lock</b>.</span></label></li>
           <li><label><input type="checkbox" data-k="t7-6"><span>Once the exit fills and the position is CLOSED, check there's exactly one LIVE Journal row and compare its P&amp;L with Kite's contract note.</span></label></li>
         </ul>
@@ -548,7 +837,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
     <details class="train" data-stage>
       <summary>
         <div class="badge-num">8</div>
-        <div class="train-title"><b>Scale up slowly</b><span>Raise limits one at a time, based on the live Journal</span></div>
+        <div class="train-title"><b>Scale up slowly <span class="pill bad">BLOCKED</span></b><span>Follows stage 7. Raise limits one at a time, based on the live Journal</span></div>
         <div class="train-meta">Ongoing<br><span class="stage-count"></span></div>
       </summary>
       <div class="train-body">
@@ -583,7 +872,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
       <div>
         <h3>Start, log in, health check</h3>
         <ul class="checks">
-          <li><label><input type="checkbox" data-d="d1"><span>Start the server (if it isn't already running) and <b>log in to Kite</b>, which is required every day. Check the mode pill shows what you intend (Dry Run or Live).</span></label></li>
+          <li><label><input type="checkbox" data-d="d1"><span>Start the server (if it isn't already running) and <b>log in to Kite</b>, which is required every day. Check the mode pill shows <b>Dry Run</b> (Live is NO-GO) and the startup line ends in <code>broker_writes=DISABLED</code>.</span></label></li>
           <li><label><input type="checkbox" data-d="d2"><span><b>Diagnostics</b>: schema current, integrity ok, workers running and not stale, session VALID, no flagged price history.</span></label></li>
           <li><label><input type="checkbox" data-d="d3"><span><b>Positions</b>: every OPEN position reads <b>PROTECTED</b> and has a GTT id. If anything is UNPROTECTED, lock trading and fix it now.</span></label></li>
           <li><label><input type="checkbox" data-d="d4"><span><b>Trade Queue → reconciliation</b>: no unreviewed findings. Look into any you find in Kite before marking them reviewed.</span></label></li>
@@ -687,13 +976,18 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
       <thead><tr><th>Document</th><th>Read it when</th><th>What you get from it</th></tr></thead>
       <tbody>
         <tr><td class="file">USER_GUIDE.md</td><td><span class="pill accent">Start here</span> Training stages 1–3, and as a reference</td><td>Every screen explained: setup, modes, Approvals and Signal Detail, manual tickets, strategies, kill switch, Journal, Settings, Live Readiness, a suggested routine and troubleshooting.</td></tr>
-        <tr><td class="file">FIRST_LIVE_TRADE.md</td><td><span class="pill warn">Before going live</span> Stage 6–7, and <b>whenever something goes wrong live</b></td><td>The step-by-step first live order protocol, the 10-item checklist, and the incident table (REJECTED, UNKNOWN, PARTIAL, GTT missing, quantity mismatch, double sell, circuit breaker).</td></tr>
+        <tr><td class="file">FIRST_LIVE_TRADE.md</td><td><span class="pill bad">Blocked</span> Stage 7 protocol, for when validation is authorized</td><td>The step-by-step first live order protocol, the 10-item checklist, and the incident table (REJECTED, UNKNOWN, PARTIAL, GTT missing, quantity mismatch, double sell, circuit breaker).</td></tr>
         <tr><td class="file">TESTING.md</td><td>Stage 5, after every code or settings change</td><td>How to run the automated tests, the manual verification checklist (§2), known coverage gaps (§1.5) and the regression policy (§3).</td></tr>
         <tr><td class="file">DEPLOYMENT.md</td><td>Setup, weekly maintenance, December, before running on a VM</td><td>Safe ways to run the app (local or private VM), health and readiness endpoints, logs, database migrations and backups, holiday calendar updates, rebuilding price history.</td></tr>
         <tr><td class="file">DESIGN.md</td><td>Stage 3, and whenever you check a signal by hand</td><td>Architecture, ticket lifecycle (§4), risk and safety design (§5), <b>exact strategy rules</b> (§6), backtest model (§7), config constants (§8).</td></tr>
+        <tr><td class="file">DMB_KITE_OPERATIONAL_RUNBOOK.md</td><td><span class="pill accent">Operating record</span> Every start, restart, login, and before any decision</td><td>How to run, restart, exit and recover; the §1.6 real-login record; §7 GO/NO-GO decisions; §9 static IP.</td></tr>
+        <tr><td class="file">DMB_KITE_SOURCE_RIGHTS_MATRIX.md</td><td>Before any real-data use</td><td>Per-source, per-use permissions and the 2026-11-04 terms review.</td></tr>
+        <tr><td class="file">NET1_KITE_REST_PROXY_REPORT.md</td><td>Proxy setup or failure</td><td>The GCP static-IP REST route, fail-closed behaviour, real read-only validation.</td></tr>
+        <tr><td class="file">SECURITY_P2G_AUDIT.md</td><td>Security questions</td><td>R-F1 to R-F4, session expiry, accepted residual risks.</td></tr>
+        <tr><td class="file">DMB_RESEARCH_INBOX.md</td><td>Using DMB research</td><td>The handoff contract, import, refusal codes and rights.</td></tr>
         <tr><td class="file">LIVE0_PRODUCTION_READINESS_REPORT.md</td><td>Before going live</td><td>What the pre-flight checks, the hard gate at confirm time, and the blockers left on your real account.</td></tr>
         <tr><td class="file">OPUS55_AUDIT_REPORT.md</td><td>When you want the background</td><td>The independent audit (P0/P1/P2 findings) that the PK packets below fix.</td></tr>
-        <tr><td class="file">KITE_TERMINAL_BLUEPRINT.html</td><td>This page</td><td>Training path, routine and checklists. Read it again when you return after a break.</td></tr>
+        <tr><td class="file">KITE_TERMINAL_BLUEPRINT.html</td><td>This page</td><td>Architecture, security, network, order path, status, training path, routine and checklists. Read it again when you return after a break.</td></tr>
       </tbody>
     </table>
   </div>
@@ -722,6 +1016,10 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
         <tr><td>Why the score is rated <b>LIMITED</b> and shouldn't be used to rank signals</td><td class="file">PK-25</td></tr>
         <tr><td>The Price-Volume Research page</td><td class="file">PK-26</td></tr>
         <tr><td>The test suite that checks the live-safety behaviour</td><td class="file">PK-0</td></tr>
+        <tr><td>P1-D ticket review, P1-E order states, P1-F terminal credential, LIVE arming</td><td class="file">SEC1_* reports</td></tr>
+        <tr><td>Login binding, sensitive reads, cookie scope, WebSocket closure, session expiry</td><td class="file">SECURITY_P2G_AUDIT</td></tr>
+        <tr><td>The static-IP REST proxy and the direct WebSocket</td><td class="file">NET1_KITE_REST_PROXY_REPORT</td></tr>
+        <tr><td>Changes to a ticket after it was claimed</td><td class="file">POST_CLAIM_TAMPERING_AUDIT</td></tr>
       </tbody>
     </table>
   </div>
@@ -741,7 +1039,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
       <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>pip install -r requirements-dev.txt
 pytest</div>
       <ul class="checks">
-        <li><label><input type="checkbox" data-k="v-a1"><span><code>pytest</code> shows 0 failed. About 1,654 passed at LIVE-0. A lower count than the last run means tests were skipped or removed.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-a1"><span><code>pytest</code> shows 0 failed. On 4 Nov 2026: 2,718 passed, 3 skipped (Windows symlink privilege), 0 failed. A lower count than the last run means tests were skipped or removed.</span></label></li>
         <li><label><input type="checkbox" data-k="v-a2"><span>E2E UI test against a <b>fresh</b> demo server passes, with no console errors.</span></label></li>
       </ul>
       <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>.venv\Scripts\python.exe tests\demo_server.py --port 8765
@@ -779,7 +1077,7 @@ pytest</div>
       <h3>D. Dry Run execution flow</h3>
       <ul class="checks">
         <li><label><input type="checkbox" data-k="v-d1"><span>A draft can be created, edited and deleted. An executed ticket can't be edited.</span></label></li>
-        <li><label><input type="checkbox" data-k="v-d2"><span>An approval creates a <code>PAPER-O-…</code> order that fills only when the price allows, and then a <code>PAPER-G-…</code> GTT.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-d2"><span>An approval creates a <code>PAPER-O-…</code> order and, in the same step, its <code>PAPER-G-…</code> GTT. The order fills only when the price allows.</span></label></li>
         <li><label><input type="checkbox" data-k="v-d3"><span>Outside market hours, the order is refused unless "Send as AMO" is ticked.</span></label></li>
         <li><label><input type="checkbox" data-k="v-d4"><span>An exit closes the position and creates exactly one Journal row.</span></label></li>
         <li><label><input type="checkbox" data-k="v-d5"><span>Cancel All Pending clears the queue and leaves positions untouched.</span></label></li>
@@ -798,10 +1096,11 @@ pytest</div>
     </div>
 
     <div class="card">
-      <h3>F. Live-only (small size, after A–E)</h3>
+      <h3>F. Live-only <span class="pill bad">BLOCKED</span></h3>
+      <p class="small muted">Only after a separately authorized real-broker validation (runbook §7.2). Kept as the checklist for that day.</p>
       <ul class="checks">
         <li><label><input type="checkbox" data-k="v-f1"><span>Switching to Live needs the dialog and is logged.</span></label></li>
-        <li><label><input type="checkbox" data-k="v-f2"><span>A filled entry immediately gets the correct GTT: a single-leg stop if trailing, otherwise an OCO stop + target.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-f2"><span>An accepted entry immediately gets the correct GTT: a single-leg stop if trailing, otherwise an OCO stop + target.</span></label></li>
         <li><label><input type="checkbox" data-k="v-f3"><span>The trailing stop ratchets up and snaps to the tick grid.</span></label></li>
         <li><label><input type="checkbox" data-k="v-f4"><span>Delete a GTT directly in Kite and confirm reconciliation flags it and waits for "Mark reviewed".</span></label></li>
         <li><label><input type="checkbox" data-k="v-f5"><span>Emergency Exit refuses to run without typing <code>EXIT ALL</code> exactly.</span></label></li>
@@ -839,7 +1138,7 @@ pytest</div>
 
   <div class="callout bad" style="margin-top:18px">
     <strong>Don't do these</strong>
-    Run with <code>--reload</code> or more than one worker · expose port 8000 to the internet (the app has no login of its own) · resubmit an order whose outcome is UNKNOWN · place a second order to "fix" a partial fill · trade the same symbols by hand in Kite while the app manages them · edit <code>kite_terminal.db</code> by hand · enable RSI Mean Reversion live · rank signals by the Smart Money score.
+    Run with <code>--reload</code> or more than one worker · expose port 8000 to a network (its access control is a per-launch browser credential for this PC, not a network login) · resubmit an order whose outcome is UNKNOWN · place a second order to "fix" a partial fill · trade the same symbols by hand in Kite while the app manages them · edit <code>kite_terminal.db</code> by hand · enable RSI Mean Reversion live · rank signals by the Smart Money score.
   </div>
 </section>
 
@@ -855,10 +1154,14 @@ pytest</div>
       <thead><tr><th>You see</th><th>It usually means</th><th>Do this</th></tr></thead>
       <tbody>
         <tr><td>"Session expired"</td><td>It's a new trading day</td><td>Log in again. Kite requires a login every day.</td></tr>
-        <tr><td>Live order rejected, "IP not allowed"</td><td>Your static IP isn't registered</td><td>Developer console → static IP, and Live Readiness → Static IP. Create a <i>new</i> ticket; the failed one can't be reused.</td></tr>
+        <tr><td>Live order rejected, "IP not allowed" / "No IPs configured for this app"</td><td>The REST route's egress IP isn't whitelisted, or the proxy wasn't used</td><td>Check the startup line shows the proxy, and the developer console lists <code>35.184.97.233</code>. Create a <i>new</i> ticket; the failed one can't be reused.</td></tr>
+        <tr><td><code>ProxyError … Unable to connect to proxy</code>, or <code>KITE_REST_PROXY_INVALID</code></td><td>The WireGuard tunnel or Squid is down, or the setting is malformed</td><td>Fix the tunnel or the setting. Nothing goes direct, so login and broker reads fail until it is fixed. Never remove the proxy setting to "get it working".</td></tr>
+        <tr><td><code>TERMINAL_SESSION_REQUIRED</code> (idle or lifetime)</td><td>The terminal credential expired, or the server restarted</td><td>Log in to Kite again. Nothing was sent.</td></tr>
+        <tr><td><code>TICKET_REVIEW_REQUIRED</code> / <code>TICKET_REVIEW_CHANGED</code></td><td>The review is from another session window or Kite login, or another tab re-reviewed it</td><td>Refresh, Re-review, then approve. Nothing was sent.</td></tr>
+        <tr><td><code>event=broker_write.refused</code> in the log</td><td>Broker writes are disabled and something tried to write</td><td>Expected in read-only mode. Note the route and ask for a review before any non-read-only run.</td></tr>
         <tr><td><code>LIVE_PREREQUISITE_MISSING</code></td><td>Notional cap, ₹ daily loss, static IP, or an UNKNOWN order</td><td>Open Live Readiness. It lists exactly which one.</td></tr>
         <tr><td>SUBMISSION UNKNOWN</td><td>The network failed while the order was being sent</td><td>Lock. <b>Do not resubmit.</b> Search Kite's order book for the ticket's tag, and wait up to 15 minutes for the monitor's verdict.</td></tr>
-        <tr><td>Protection failed / UNPROTECTED</td><td>The entry filled but the GTT couldn't be placed</td><td>Lock. Place a stop-loss <b>in Kite</b> immediately, then mark the finding reviewed.</td></tr>
+        <tr><td>Protection failed / UNPROTECTED</td><td>Kite accepted the entry but the GTT couldn't be placed</td><td>Lock. Place a stop-loss <b>in Kite</b> immediately, then mark the finding reviewed.</td></tr>
         <tr><td>ENTRY PARTIAL</td><td>Only part of the order filled</td><td>The GTT already covers the filled quantity. Let the rest keep working or cancel it. Never place a second order.</td></tr>
         <tr><td>Quantity mismatch / possible double sell</td><td>The app and Kite disagree about what you hold</td><td>Lock. Compare holdings and GTTs in Kite, delete any GTT on shares you no longer hold, then mark reviewed.</td></tr>
         <tr><td>Circuit breaker OPEN</td><td>The broker or connection failed repeatedly</td><td>Find the cause in Diagnostics and the logs. Reset only once you understand it.</td></tr>
@@ -880,12 +1183,14 @@ pytest</div>
   <div class="grid g2">
     <div class="card">
       <h4>Run</h4>
-      <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>.venv\Scripts\activate
-python -m backend.server</div>
+      <div class="cmd"><button class="icon-btn copy" type="button">Copy</button><span class="c"># PowerShell: read-only broker mode (recommended until live is authorized)</span>
+$env:KITE_TERMINAL_BROKER_WRITES='disabled'; .venv\Scripts\python.exe -m backend.server</div>
+      <p class="small muted">Set the variable in the launching window and let it inherit; never embed the assignment in a <code>Start-Process … -Command</code> string (it was lost that way once). Confirm the startup line ends in <code>broker_writes=DISABLED</code>.</p>
       <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>python -m backend.server --port 8001</div>
       <h4 style="margin-top:12px">Practice / test</h4>
       <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>.venv\Scripts\python.exe tests\demo_server.py --port 8765</div>
       <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>pytest</div>
+      <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>pytest tests/test_order_path_assurance.py tests/test_kite_rest_proxy.py tests/test_broker_writes_switch.py</div>
     </div>
     <div class="card">
       <h4>Database maintenance</h4>
@@ -914,7 +1219,8 @@ copy backend\kite_terminal.db backend\kite_terminal.db.pre_&lt;work&gt;_bak</div
 </section>
 
 <footer>
-  Kite Terminal Blueprint · based on <code>USER_GUIDE.md</code>, <code>TESTING.md</code>, <code>FIRST_LIVE_TRADE.md</code>, <code>DEPLOYMENT.md</code>, <code>DESIGN.md</code> and the LIVE-0 / PK-0…PK-26 reports, as of 2 Oct 2026.
+  Kite Terminal Blueprint · last reviewed 4 November 2026 against the code (order-path audit) and <code>USER_GUIDE.md</code>, <code>TESTING.md</code>, <code>FIRST_LIVE_TRADE.md</code>, <code>DEPLOYMENT.md</code>, <code>DESIGN.md</code>, <code>DMB_KITE_OPERATIONAL_RUNBOOK.md</code>, <code>DMB_KITE_SOURCE_RIGHTS_MATRIX.md</code>, <code>NET1_KITE_REST_PROXY_REPORT.md</code>, <code>SECURITY_P2G_AUDIT.md</code> and the LIVE-0 / PK-0…PK-26 / SEC-1 reports.
+  FakeKite and synthetic tests do not prove real broker order acceptance or execution.
   Backtest figures are historical results on the symbols tested, not a promise of returns. READY on Live Readiness means the app is technically ready; it says nothing about whether a trade is a good idea.
 </footer>
 
