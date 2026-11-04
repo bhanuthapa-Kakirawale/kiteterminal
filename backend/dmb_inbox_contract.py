@@ -22,9 +22,13 @@ What a valid packet is:
 - explicit-offset timestamps; generated_at not in the future; evidence after the session's
   close and not after generation;
 - session_date a regular NSE session in a covered calendar year, and review_session_date the
-  next regular session (Kite's calendar - a mismatch is refused, never re-interpreted);
-- not stale: a packet is actionable until its review session completes (15:30 IST on
-  review_session_date); a bundle already past that is refused at import.
+  first OFFICIAL session after it - regular, special full-day or special short alike (Kite's
+  calendar - a mismatch is refused, never re-interpreted);
+- not stale: a packet is actionable until its review session's official close (15:30 IST for a
+  regular day, the circular's close for a special one); a bundle already past that is refused at
+  import. Owner rule (2026-11-04): every officially notified session counts, so a Budget weekend
+  or Muhurat session ends the previous packet's window; validity is never extended to the next
+  regular weekday; a session the calendar cannot establish fails closed.
 """
 from __future__ import annotations
 
@@ -296,14 +300,17 @@ def utc_sql(t: datetime) -> str:
 
 # ---------------------------------------------------------------- session semantics
 def expires_at(review_session_date: date) -> datetime:
-    """A packet is actionable until its review session completes: 15:30 IST that day."""
-    return datetime.combine(review_session_date, trading_calendar.MARKET_CLOSE,
-                            tzinfo=trading_calendar.IST)
+    """A packet is actionable until its review session completes: that official session's close
+    (IST). Fail closed: a day the calendar cannot establish as a session is CALENDAR_UNCOVERED."""
+    try:
+        return trading_calendar.official_session_close(review_session_date)
+    except trading_calendar.CalendarDataError as exc:
+        _reject("CALENDAR_UNCOVERED", str(exc))
 
 
 def check_sessions(session: date, review: date, now: datetime) -> None:
     """Kite's calendar, fail closed: both years covered, session_date a regular session that
-    has completed, review_session_date exactly the next regular session."""
+    has completed, review_session_date exactly the first official session after it."""
     for d, path in ((session, "session_date"), (review, "review_session_date")):
         if trading_calendar.coverage(d.year) != "COVERED":
             _reject("CALENDAR_UNCOVERED", f"{path} {d} is in a year the NSE calendar does not cover")
@@ -312,7 +319,7 @@ def check_sessions(session: date, review: date, now: datetime) -> None:
     if trading_calendar.latest_completed_session(now) < session:
         _reject("INVALID_SESSION_DATE", f"session {session} has not completed yet")
     try:
-        expected = trading_calendar.next_trading_day(session)
+        expected = trading_calendar.next_official_session(session)
     except trading_calendar.CalendarDataError as exc:
         _reject("CALENDAR_UNCOVERED", str(exc))
     if review != expected:

@@ -20,8 +20,8 @@ A weekday/holiday boolean is not enough: Budget day can be a full session on a w
 | `session_type` | Meaning | Packet session? | Review session? | "Market open" in Kite? |
 |---|---|---|---|---|
 | `REGULAR` | weekday, not a listed holiday; 09:15–15:30 IST | yes | yes | yes, 09:15–15:30 |
-| `SPECIAL_FULL` | live session at standard timings on a weekend/holiday (Union Budget) | **no** | **no** | no (hours recorded, not modelled) |
-| `SPECIAL_SHORT` | short special session (Diwali Muhurat; DR drills) | **no** | **no** | no |
+| `SPECIAL_FULL` | live session at standard timings on a weekend/holiday (Union Budget) | **no** | **yes** (since 2026-11-04, §5) | no (hours recorded, not modelled) |
+| `SPECIAL_SHORT` | short special session (Diwali Muhurat; DR drills) | **no** | **yes** (since 2026-11-04, §5) | no |
 | `HOLIDAY` | a listed holiday or a weekend | no | no | no |
 | `UNVERIFIED` | uncovered year (2027), or a special session without official evidence | no (fail closed) | no | no |
 
@@ -53,7 +53,8 @@ Full hashes and copies are in the sprint's scratch evidence folder. The circular
 `tests/test_calendar_parity.py` (Kite; runs DMB's own code in DMB's interpreter, read-only) asserts, for every day of **2025-01-01 … 2027-01-31**:
 - weekday holidays identical for every year both cover;
 - the **complete session record** identical: type, open, close, source, publication date and verification;
-- DMB's `review_session_for(d)` equals Kite's next regular session, or both refuse;
+- DMB's `review_session_for(d)` equals Kite's `next_official_session(d)`, or both refuse, and DMB's
+  `review_session_close(d)` equals Kite's `expires_at(d)` (same instant) for every official session (§5);
 - special-session lists identical: 2025-02-01, 2025-10-21, 2026-02-01, 2026-11-08;
 - each special session is typed and sourced on both sides, DMB exports no packet for it, and Kite refuses one (`INVALID_SESSION_DATE`);
 - 2027 is `UNVERIFIED` on both sides and a packet into 2027 is refused (`CALENDAR_UNCOVERED`).
@@ -67,15 +68,42 @@ Full hashes and copies are in the sprint's scratch evidence folder. The circular
 
 DMB-side tests: `daily_byte/tests/test_trading_calendar_session_records.py` (14).
 
-## 5. Muhurat and special sessions: actionability (decision required, not guessed)
+## 5. Muhurat and special sessions: actionability (owner rule, 2026-11-04)
 
-The owner-approved rule is "a packet remains actionable until the next trading session completes", implemented on both sides as **the next REGULAR session**. It is **unchanged**. Consequences, tested on both sides:
-- Friday 2026-11-06's packet is reviewed on **Monday 2026-11-09** and expires at 15:30 IST that day. The Muhurat session on Sunday 2026-11-08 does not shorten it.
-- Friday 2026-01-30's packet was reviewed on Monday 2026-02-02, even though the Budget Sunday was a full session.
-- Tuesday 2025-10-20's packet is reviewed on Thursday 2025-10-23 (over Muhurat on the 21st and Balipratipada on the 22nd).
-- No packet ever describes a special session.
+**Rule (conservative, decided by the owner on 2026-11-04):**
+- every officially notified trading session counts, including special full-day sessions (Budget
+  weekend) and short Muhurat sessions;
+- a packet expires at the close of the first official trading session whose opening occurs after
+  packet creation; if a session is already open at creation, at that session's close;
+- validity is never extended because the next session is not a regular weekday session;
+- if the calendar cannot establish the applicable session, the packet fails closed.
 
-**Owner decision required** before the next announced weekend `SPECIAL_FULL` session (none is announced): should a full special session (a) be a packet session of its own, and/or (b) end the previous packet's window? Muhurat (`SPECIAL_SHORT`, about one hour) is not proposed to advance the rule. Until decided, the conservative-for-data reading above stands, and the documents say so (`daily_byte/docs/PRIVATE_DESK_KITE_INTEGRATION.md` §4.1, `docs/DMB_RESEARCH_INBOX.md`).
+**Implementation (both sides, parity-tested):** `review_session_date` = the first official session
+(`REGULAR`, `SPECIAL_FULL`, `SPECIAL_SHORT` with `VERIFIED`/`REFERENCED` evidence) after
+`session_date` (Kite `trading_calendar.next_official_session`, DMB
+`evidence.review_session_for`); expiry = that session's official close from its record (Kite
+`dmb_inbox_contract.expires_at` -> `trading_calendar.official_session_close`, DMB
+`evidence.review_session_close`). A packet is built only after `session_date` closes
+(`evidence_as_of` >= close is enforced on both sides), so this equals the rule for every packet
+created before or during the next official session. A packet created **after** that session closed
+is already expired: DMB does not export it (`PACKET_EXPIRED`), Kite refuses it (`STALE_EVIDENCE`).
+That is stricter than the rule, never longer. An `UNVERIFIED` day on the walk raises
+`CalendarDataError` / gives `None` (fail closed).
+
+Consequences, tested on both sides:
+- Friday 2026-11-06's packet is reviewed on **Sunday 2026-11-08 (Muhurat, 14:20-15:30)** and
+  expires at **15:30 IST that Sunday**. A packet claiming Monday 2026-11-09 is refused
+  (`REVIEW_SESSION_MISMATCH`).
+- Friday 2026-01-30's packet was reviewed on the **Budget Sunday 2026-02-01** and expired at 15:30
+  IST that day.
+- Monday 2026-11-09's packet is reviewed on Wednesday 2026-11-11 (Tuesday 10th is a holiday).
+- No packet ever describes a special session (unchanged: a special session is never a packet
+  session; `INVALID_SESSION_DATE`).
+- Muhurat 2026: CAS securities' normal market closes 15:15; the record carries the segment close
+  15:30, so for a CAS security the packet nominally outlives that security's own close by 15
+  minutes, during which it cannot trade anyway.
+- Kite's "market open" gate (`is_market_session_open`) still models regular sessions only, so the
+  terminal treats a special session as closed for order entry (fail closed; unchanged).
 
 ## 6. The monitor (`backend/nse_calendar_monitor.py`)
 

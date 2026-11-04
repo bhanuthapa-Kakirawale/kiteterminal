@@ -352,8 +352,13 @@ def actionability(conn, item, packet: dict, state: dict, now: datetime) -> dict:
         contract.check_sessions(session, review, now)
     except contract.BundleRejected as exc:
         reasons.append(exc.code)
-    expires = contract.expires_at(review)
-    if now >= expires:
+    try:
+        expires = contract.expires_at(review)
+    except contract.BundleRejected as exc:          # the calendar cannot establish it: fail closed
+        expires = None
+        if exc.code not in reasons:
+            reasons.append(exc.code)
+    if expires is None or now >= expires:
         reasons.append("EXPIRED")
     q = packet.get("quality") or {}
     if not q.get("freshness_ok"):
@@ -364,7 +369,8 @@ def actionability(conn, item, packet: dict, state: dict, now: datetime) -> dict:
         reasons.append("QUALITY_REPLAY_NOT_MATCHED")
     if not _instrument_resolved(conn, item["symbol"], item["listing_exchange"]):
         reasons.append("INSTRUMENT_UNRESOLVED")
-    return {"actionable": not reasons, "reasons": reasons, "expires_at": expires.isoformat()}
+    return {"actionable": not reasons, "reasons": reasons,
+            "expires_at": expires.isoformat() if expires is not None else None}
 
 
 def _view(conn, item, now: datetime) -> dict:

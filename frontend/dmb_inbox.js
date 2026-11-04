@@ -125,7 +125,7 @@
           ["DMB packet id", `<span class="mono" title="${esc(item.packet_id)}">${esc(item.packet_id)}</span>`],
           ["Source session", esc(item.session_date)],
           ["Evidence as of", esc(item.evidence_as_of)],
-          ["Review session", `${esc(item.review_session_date)} (actionable until ${esc(item.expires_at)})`],
+          ["Review session", `${esc(item.review_session_date)} (${item.expires_at ? `actionable until ${esc(item.expires_at)}` : "calendar cannot establish it: not actionable"})`],
           ["Generated", esc(item.generated_at)],
           ["Imported", `${esc(item.imported_at)} UTC · bundle <span class="mono">${esc(short(item.bundle_id))}</span>`],
           ["Supersession", item.superseded_by_item_id ? `superseded by item #${esc(item.superseded_by_item_id)}` : "current version"],

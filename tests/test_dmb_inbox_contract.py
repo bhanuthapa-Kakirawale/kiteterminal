@@ -3,6 +3,7 @@ closed with a stable code, and a well-formed synthetic bundle passes. Pure: no d
 no files, no broker."""
 import copy
 import json
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -212,18 +213,74 @@ def test_16_invalid_session_date(session, review, code):
     assert _code(_raw(B.bundle([p], session=session))) == code
 
 
-def test_17_review_session_must_be_kites_next_trading_session():
+def test_17_review_session_must_be_kites_first_official_session():
     assert _code(_raw(B.bundle([B.packet(review="2026-11-04")]))) == "REVIEW_SESSION_MISMATCH"
-    # Friday 6 Nov -> Monday 9 Nov: the Sunday Muhurat session is not a review session
-    fri = B.packet(session="2026-11-06", review="2026-11-08", evidence_as_of="2026-11-06T19:45:00+05:30",
-                   generated_at="2026-11-06T20:00:00+05:30")
+    # Owner rule (2026-11-04): Friday 6 Nov -> Sunday 8 Nov Muhurat; every official session counts,
+    # so a packet claiming Monday 9 Nov (the next REGULAR session) is refused: never extended.
     now = B.IMPORT_AT.replace(day=6)
-    assert _code(_raw(B.bundle([fri], session="2026-11-06", generated_at="2026-11-06T20:00:00+05:30")),
+    mon = B.packet(session="2026-11-06", review="2026-11-09", evidence_as_of="2026-11-06T19:45:00+05:30",
+                   generated_at="2026-11-06T20:00:00+05:30")
+    assert _code(_raw(B.bundle([mon], session="2026-11-06", generated_at="2026-11-06T20:00:00+05:30")),
                  now=now) == "REVIEW_SESSION_MISMATCH"
-    ok = B.packet(session="2026-11-06", review="2026-11-09", evidence_as_of="2026-11-06T19:45:00+05:30",
+    ok = B.packet(session="2026-11-06", review="2026-11-08", evidence_as_of="2026-11-06T19:45:00+05:30",
                   generated_at="2026-11-06T20:00:00+05:30")
     contract.parse_and_validate(_raw(B.bundle([ok], session="2026-11-06",
                                               generated_at="2026-11-06T20:00:00+05:30")), now)
+
+
+def _at(y, m, d, hh, mm=0):
+    return datetime(y, m, d, hh, mm, tzinfo=trading_calendar.IST)
+
+
+@pytest.mark.parametrize("session, review, now, code", [
+    # regular: Mon 2 Nov -> Tue 3 Nov 15:30
+    ("2026-11-02", "2026-11-03", _at(2026, 11, 2, 21), None),                   # before the review session
+    ("2026-11-02", "2026-11-03", _at(2026, 11, 3, 11), None),                   # during it
+    ("2026-11-02", "2026-11-03", _at(2026, 11, 3, 15, 30), "STALE_EVIDENCE"),   # at its close
+    # Muhurat: Fri 6 Nov -> Sun 8 Nov 14:20-15:30; Monday is already too late
+    ("2026-11-06", "2026-11-08", _at(2026, 11, 7, 10), None),
+    ("2026-11-06", "2026-11-08", _at(2026, 11, 8, 14, 45), None),               # during Muhurat
+    ("2026-11-06", "2026-11-08", _at(2026, 11, 8, 15, 30), "STALE_EVIDENCE"),
+    ("2026-11-06", "2026-11-08", _at(2026, 11, 9, 10), "STALE_EVIDENCE"),
+    # Budget Sunday: Fri 30 Jan -> Sun 1 Feb 09:15-15:30
+    ("2026-01-30", "2026-02-01", _at(2026, 1, 31, 12), None),
+    ("2026-01-30", "2026-02-01", _at(2026, 2, 1, 12), None),
+    ("2026-01-30", "2026-02-01", _at(2026, 2, 1, 15, 30), "STALE_EVIDENCE"),
+    ("2026-01-30", "2026-02-02", _at(2026, 1, 31, 12), "REVIEW_SESSION_MISMATCH"),  # Monday: never extended
+    # holiday in between: Mon 9 Nov -> Wed 11 Nov (Tue 10 Nov holiday)
+    ("2026-11-09", "2026-11-11", _at(2026, 11, 10, 12), None),
+    ("2026-11-09", "2026-11-10", _at(2026, 11, 9, 21), "REVIEW_SESSION_MISMATCH"),
+    # a special session is never a packet session
+    ("2026-11-08", "2026-11-09", _at(2026, 11, 8, 20), "INVALID_SESSION_DATE"),
+    ("2026-02-01", "2026-02-02", _at(2026, 2, 1, 20), "INVALID_SESSION_DATE"),
+    # missing calendar data
+    ("2026-12-31", "2027-01-01", _at(2026, 12, 31, 21), "CALENDAR_UNCOVERED"),
+])
+def test_packet_expiry_follows_every_official_session(session, review, now, code):
+    created = (datetime.fromisoformat(session + "T20:00:00+05:30") if now.date().isoformat() != session
+               else now - timedelta(minutes=30))
+    p = B.packet(session=session, review=review, evidence_as_of=(created - timedelta(minutes=15)).isoformat(),
+                 generated_at=created.isoformat())
+    raw = _raw(B.bundle([p], session=session, generated_at=created.isoformat()))
+    if code is None:
+        contract.parse_and_validate(raw, now)
+    else:
+        assert _code(raw, now=now) == code
+
+
+def test_expiry_is_the_official_close_and_fails_closed():
+    assert contract.expires_at(date(2026, 11, 3)) == _at(2026, 11, 3, 15, 30)
+    assert contract.expires_at(date(2026, 11, 8)) == _at(2026, 11, 8, 15, 30)      # Muhurat close
+    assert contract.expires_at(date(2026, 2, 1)) == _at(2026, 2, 1, 15, 30)        # Budget close
+    for not_a_session in (date(2026, 11, 10), date(2026, 11, 7), date(2027, 1, 4)):
+        with pytest.raises(contract.BundleRejected) as e:
+            contract.expires_at(not_a_session)
+        assert e.value.code == "CALENDAR_UNCOVERED"
+    # An unevidenced special session is UNVERIFIED: the walk refuses rather than skipping it.
+    with trading_calendar.use_calendar(special_sessions=[date(2026, 11, 7)], covered_years=[2026]):
+        assert trading_calendar.session_record(date(2026, 11, 7))["session_type"] == "UNVERIFIED"
+        with pytest.raises(trading_calendar.CalendarDataError):
+            trading_calendar.next_official_session(date(2026, 11, 6))
 
 
 def test_missing_calendar_coverage_fails_closed():

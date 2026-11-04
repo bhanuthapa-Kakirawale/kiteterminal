@@ -13,6 +13,11 @@ The two differences found in the previous sprint are resolved from NSE's own cir
 lists the 2026-02-01 Sunday Budget session (NSE/CMTR/72349, NSE/FAOP/72352), and DMB no longer
 computes a review session for a special-session day (its own rule: session_date is a REGULAR
 session), so both refuse such a packet.
+
+Packet-expiry sprint (2026-11-04, owner rule): every officially notified session counts, so the
+review session is the first OFFICIAL session (REGULAR / SPECIAL_FULL / SPECIAL_SHORT) after the
+packet's session and the packet expires at that session's official close. Both sides' review
+sessions AND expiry instants are compared for every day.
 """
 import json
 import os
@@ -38,7 +43,7 @@ SPECIAL_SESSION_DATES = ["2025-02-01", "2025-10-21", "2026-02-01", "2026-11-08"]
 _DUMP = """
 import datetime as dt, json, sys
 from core.trading_calendar import NSE_TRADING_HOLIDAYS, SPECIAL_SESSIONS, SESSION_TYPES, session_record
-from private_desk.handoff.evidence import review_session_for
+from private_desk.handoff.evidence import review_session_close, review_session_for
 probes = json.loads(sys.argv[1])
 out = {"years": sorted(NSE_TRADING_HOLIDAYS),
        "weekday_holidays": sorted(d.isoformat() for y in NSE_TRADING_HOLIDAYS for d in NSE_TRADING_HOLIDAYS[y]
@@ -47,7 +52,9 @@ out = {"years": sorted(NSE_TRADING_HOLIDAYS),
        "session_types": list(SESSION_TYPES),
        "records": {p: session_record(dt.date.fromisoformat(p)) for p in probes},
        "review": {p: (lambda r: r.isoformat() if r else None)(review_session_for(dt.date.fromisoformat(p)))
-                  for p in probes}}
+                  for p in probes},
+       "close": {p: (lambda c: c.isoformat() if c else None)(review_session_close(dt.date.fromisoformat(p)))
+                 for p in probes}}
 print(json.dumps(out))
 """
 
@@ -82,9 +89,9 @@ def test_weekday_holidays_agree_for_every_year_both_cover(dmb):
 
 @needs_dmb
 def test_every_review_session_agrees(dmb):
-    """For every day of 2025-2026: DMB's review session == this terminal's next regular session,
-    or both refuse (not a session / next session in an uncovered year) - except the documented
-    special-session dates, where only this terminal refuses."""
+    """For every day of 2025-2026: DMB's review session == this terminal's first official session
+    after it, or both refuse (not a regular session / next session unknowable) - except the
+    documented special-session dates, where only this terminal refuses."""
     from backend import trading_calendar
     mismatches = []
     for probe, theirs in dmb["review"].items():
@@ -95,14 +102,32 @@ def test_every_review_session_agrees(dmb):
             ours = None
         else:
             try:
-                ours = trading_calendar.next_trading_day(d).isoformat()
-                if trading_calendar.coverage(int(ours[:4])) != "COVERED":
-                    ours = None
+                ours = trading_calendar.next_official_session(d).isoformat()
             except trading_calendar.CalendarDataError:
                 ours = None
         if ours != theirs:
             mismatches.append((probe, ours, theirs))
     assert [m[0] for m in mismatches] == KNOWN_SPECIAL_SESSION_PACKET_DATES, mismatches
+
+
+@needs_dmb
+def test_every_expiry_instant_agrees(dmb):
+    """For every day of 2025-2026 that is an official session on both sides, DMB's packet expiry
+    (review_session_close) == this terminal's (contract.expires_at): same instant, same offset."""
+    from backend import dmb_inbox_contract as contract
+    differing, checked = [], 0
+    for probe, theirs in dmb["close"].items():
+        d = date.fromisoformat(probe)
+        if d.year > 2026:
+            continue
+        try:
+            ours = contract.expires_at(d).isoformat()
+        except contract.BundleRejected:
+            ours = None
+        checked += ours is not None
+        if ours != theirs:
+            differing.append((probe, ours, theirs))
+    assert differing == [] and checked > 480
 
 
 @needs_dmb
@@ -147,9 +172,10 @@ def test_the_2026_budget_sunday_is_an_official_full_session_on_both_sides(dmb):
     assert ours["session_type"] == "SPECIAL_FULL" and (ours["open"], ours["close"]) == ("09:15", "15:30")
     assert ours["source"].startswith("NSE/CMTR/72349") and "NSE/FAOP/72352" in ours["source"]
     assert ours["published"] == "2026-01-16" and ours["verification"] == "VERIFIED"
-    # The packet of Fri 2026-01-30 is reviewed on Mon 2026-02-02 on both sides (the owner rule walks
-    # REGULAR sessions; whether a special session should shorten it is an open owner decision).
-    assert dmb["review"]["2026-01-30"] == "2026-02-02" == trading_calendar.next_trading_day(date(2026, 1, 30)).isoformat()
+    # Owner rule (2026-11-04): the packet of Fri 2026-01-30 is reviewed on the Budget Sunday on both
+    # sides and expires at its 15:30 close, never extended to Mon 2026-02-02.
+    assert dmb["review"]["2026-01-30"] == "2026-02-01" == trading_calendar.next_official_session(date(2026, 1, 30)).isoformat()
+    assert dmb["close"]["2026-02-01"] == "2026-02-01T15:30:00+05:30"
 
 
 @needs_dmb
@@ -175,18 +201,22 @@ def test_both_fail_closed_for_2027(dmb):
     assert e.value.code == "CALENDAR_UNCOVERED"
 
 
-def test_muhurat_is_a_session_but_never_a_review_session():
-    """2026-11-08 Sunday Muhurat trading: an exchange session, not a regular one; the packet of
-    Friday 2026-11-06 is reviewed on Monday 2026-11-09 and expires 15:30 IST that day."""
+def test_muhurat_ends_the_previous_packets_window():
+    """2026-11-08 Sunday Muhurat trading: an exchange session, not a regular one, so never a packet
+    session; but it IS an official session, so Friday 2026-11-06's packet is reviewed on it and
+    expires at its 15:30 IST close - never extended to Monday 2026-11-09 (owner rule, 2026-11-04)."""
     from backend import dmb_inbox_contract as contract, trading_calendar
     muhurat = date(2026, 11, 8)
     assert trading_calendar.has_exchange_session(muhurat) and not trading_calendar.is_trading_day(muhurat)
-    assert trading_calendar.next_trading_day(date(2026, 11, 6)) == date(2026, 11, 9)
-    contract.check_sessions(date(2026, 11, 6), date(2026, 11, 9), datetime(2026, 11, 7, 9, 0, tzinfo=trading_calendar.IST))
+    assert trading_calendar.next_official_session(date(2026, 11, 6)) == muhurat
+    contract.check_sessions(date(2026, 11, 6), muhurat, datetime(2026, 11, 7, 9, 0, tzinfo=trading_calendar.IST))
     with pytest.raises(contract.BundleRejected) as e:
-        contract.check_sessions(date(2026, 11, 6), muhurat, datetime(2026, 11, 7, 9, 0, tzinfo=trading_calendar.IST))
+        contract.check_sessions(date(2026, 11, 6), date(2026, 11, 9),
+                                datetime(2026, 11, 7, 9, 0, tzinfo=trading_calendar.IST))
     assert e.value.code == "REVIEW_SESSION_MISMATCH"
-    assert contract.expires_at(date(2026, 11, 9)) == datetime(2026, 11, 9, 15, 30, tzinfo=trading_calendar.IST)
+    assert contract.expires_at(muhurat) == datetime(2026, 11, 8, 15, 30, tzinfo=trading_calendar.IST)
+    # Monday 9 Nov's packet (Tue 10 Nov is a holiday) reviews on Wednesday 11 Nov.
+    assert trading_calendar.next_official_session(date(2026, 11, 9)) == date(2026, 11, 11)
 
 
 @pytest.mark.parametrize("session,review", [
@@ -197,4 +227,5 @@ def test_muhurat_is_a_session_but_never_a_review_session():
 ])
 def test_holiday_and_weekend_boundaries(session, review):
     from backend import trading_calendar
+    assert trading_calendar.next_official_session(date.fromisoformat(session)) == date.fromisoformat(review)
     assert trading_calendar.next_trading_day(date.fromisoformat(session)) == date.fromisoformat(review)

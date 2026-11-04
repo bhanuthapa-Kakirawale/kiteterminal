@@ -15,7 +15,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -156,12 +156,19 @@ def test_synthetic_round_trip_from_the_dmb_exporter_to_a_reviewed_manual_ticket(
 @needs_dmb
 def test_the_dmb_cli_writes_a_bundle_the_terminal_accepts_or_refuses_as_stale(roundtrip, tmp_path):
     """The real CLI, real clock: what it writes either validates here, or - once the review
-    session has completed - is refused as STALE_EVIDENCE. Never anything else."""
+    session has completed - is refused as STALE_EVIDENCE. Never anything else. Since the
+    packet-expiry rule (2026-11-04) DMB refuses an already-expired packet itself
+    (NOT_EXPORTABLE / PACKET_EXPIRED) and writes no bundle at all."""
     from backend import dmb_inbox_contract as contract
     out = tmp_path / "private_out"
     r = _dmb(["export", "--session", B.SESSION, "--fixture", str(FIXTURE), "--out", str(out), "--json"], tmp_path)
-    assert r.returncode == 0, r.stdout + r.stderr
     result = json.loads(r.stdout)
+    if datetime.now(contract.trading_calendar.IST) >= contract.expires_at(date.fromisoformat(B.REVIEW)):
+        assert r.returncode == 21 and result["status"] == "NOT_EXPORTABLE", r.stdout + r.stderr
+        assert result["excluded"] == {"PACKET_EXPIRED": 2} and result["bundle_id"] is None
+        assert not list(out.rglob("*.json"))
+        return
+    assert r.returncode == 0, r.stdout + r.stderr
     assert result["status"] == "CREATED"
     raw = Path(result["path"]).read_bytes()
     generated = datetime.fromisoformat(json.loads(raw)["generated_at"])

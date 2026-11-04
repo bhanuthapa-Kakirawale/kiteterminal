@@ -93,13 +93,15 @@ and NaN/Infinity), `DUPLICATE_PACKET_ID`, `CONFLICTING_PACKET`, `PACKET_ID_MISMA
 
 ## Sessions and staleness (owner decision)
 
-A packet remains actionable **until the next trading session completes**:
+A packet remains actionable **until the first official session after it completes** (owner
+rule, 2026-11-04; `docs/NSE_CALENDAR_MONITORING.md` §5):
 
 - `session_date` is the completed regular NSE session the evidence describes;
-- `review_session_date` must equal this terminal's `trading_calendar.next_trading_day(session_date)`
-  (a special session such as Sunday Muhurat trading is not a review session; a mismatch is
-  refused, never re-interpreted);
-- the packet expires at **15:30 IST on `review_session_date`**. A bundle already expired is
+- `review_session_date` must equal this terminal's `trading_calendar.next_official_session(session_date)`:
+  every officially notified session counts, so a Budget weekend or Muhurat session ends the window
+  (Friday 2026-11-06 -> Sunday 2026-11-08); a mismatch is refused, never re-interpreted;
+- the packet expires at **that session's official close** (15:30 IST for a regular day and for
+  both 2026 special sessions); a day the calendar cannot establish fails closed. A bundle already expired is
   refused at import; an imported packet that expires stays visible but can no longer start a
   ticket (`EXPIRED`);
 - both years must be in the NSE holiday file. **2027 is not**, so a packet whose review session

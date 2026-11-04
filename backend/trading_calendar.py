@@ -232,6 +232,35 @@ def next_trading_day(d: date) -> date:
     raise CalendarDataError(f"no trading day within {_MAX_WALK_DAYS} days after {d}")
 
 
+# Every officially notified session counts for a DMB packet's window (owner rule, 2026-11-04):
+# a special session (Budget weekend, Muhurat) ENDS the previous packet's window. Parity: DMB's
+# private_desk.handoff.evidence.review_session_for / review_session_close.
+OFFICIAL_SESSION_TYPES = (REGULAR, SPECIAL_FULL, SPECIAL_SHORT)
+
+
+def next_official_session(d: date) -> date:
+    """The first officially notified NSE session after `d` - regular, special full-day or special
+    short alike. Fail closed: an UNVERIFIED day on the way (an uncovered year, a special session
+    without official evidence) raises CalendarDataError, never a guess."""
+    for _ in range(_MAX_WALK_DAYS):
+        d += timedelta(days=1)
+        kind = session_record(d)["session_type"]
+        if kind in OFFICIAL_SESSION_TYPES:
+            return d
+        if kind != HOLIDAY:
+            raise CalendarDataError(f"{d} is {kind}: the NSE calendar cannot establish the next session")
+    raise CalendarDataError(f"no official session within {_MAX_WALK_DAYS} days after {d}")
+
+
+def official_session_close(d: date) -> datetime:
+    """The official close (IST) of the session on `d`, from its typed record: 15:30 for a regular
+    day, the circular's close for a special one. CalendarDataError when `d` is no evidenced session."""
+    record = session_record(d)
+    if record["session_type"] not in OFFICIAL_SESSION_TYPES or not record["close"]:
+        raise CalendarDataError(f"{d} is not an evidenced NSE session ({record['session_type']})")
+    return datetime.combine(d, time.fromisoformat(record["close"]), tzinfo=IST)
+
+
 def trading_days_between(start: date, end: date) -> int:
     """Trading days d with start <= d < end: numpy.busday_count's convention,
     holiday-aware. For two trading days, the sessions from one to the other."""
