@@ -13,6 +13,7 @@ hour (on a weekend the browser's own clock says "market closed").
 import argparse
 import json
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -48,7 +49,6 @@ def main() -> None:
         token = page.evaluate("() => localStorage.getItem('kt.terminalToken')")
         assert token, "the demo login handed the page no terminal token"
         if args.pin_clock:
-            from datetime import datetime
             r = page.request.post(args.base + "/api/demo/clock", data=json.dumps({"time": "11:00"}),
                                   headers={"Origin": args.base, "X-Kite-Terminal": "1", "X-Kite-Terminal-Token": token,
                                            "Content-Type": "application/json"})
@@ -85,7 +85,21 @@ def main() -> None:
         check("inbox lists entry signals", entries >= 3, entries)
         check("inbox lists the exit signal", page.locator("#ap-exits .approval-card").count() == 1)
         check("inbox lists the stop adjustment", page.locator("#ap-adjustments .approval-card").count() == 1)
-        check("risk-blocked signal listed separately", page.locator("#ap-blocked .approval-card").count() == 1)
+        # Every risk-rejected ticket of today is listed separately, no more, no fewer - compared with
+        # the backend's own list, not a hard-coded count. The demo seeds TCS to be blocked by the
+        # single-stock exposure check; NEWLISTCO (no sector) is blocked by the fail-closed sector
+        # mapping gate added in eb089e7, which is what made the old "exactly one" count stale.
+        r = page.request.get(args.base + "/api/tickets?status=risk_rejected",
+                             headers={"X-Kite-Terminal": "1", "X-Kite-Terminal-Token": token})
+        today_ist = page.evaluate("() => new Date(Date.now() + 19800000).toISOString().slice(0, 10)")
+        expected_blocked = sorted(
+            t["symbol"] for t in (r.json()["data"] if r.ok else [])
+            if (datetime.fromisoformat(t["created_at"].replace(" ", "T")) + timedelta(hours=5, minutes=30))
+            .date().isoformat() == today_ist)
+        shown_blocked = sorted(s.strip() for s in page.locator("#ap-blocked .approval-card .ac-symbol").all_text_contents())
+        check("risk-blocked signals listed separately (exactly today's risk-rejected tickets)",
+              r.ok and shown_blocked == expected_blocked and "TCS" in shown_blocked,
+              f"shown={shown_blocked} expected={expected_blocked}")
         check("autopilot card shows pipeline", "You approve or reject" in page.inner_text("#autopilot-card"))
         page.screenshot(path=str(out / "02-approvals.png"), full_page=True)
 
