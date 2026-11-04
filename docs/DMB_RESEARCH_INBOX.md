@@ -97,9 +97,16 @@ A packet remains actionable **until the first official session after it complete
 rule, 2026-11-04; `docs/NSE_CALENDAR_MONITORING.md` §5):
 
 - `session_date` is the completed regular NSE session the evidence describes;
-- `review_session_date` must equal this terminal's `trading_calendar.next_official_session(session_date)`:
-  every officially notified session counts, so a Budget weekend or Muhurat session ends the window
-  (Friday 2026-11-06 -> Sunday 2026-11-08); a mismatch is refused, never re-interpreted;
+- `review_session_date` is the session the packet **names**, and it must equal this terminal's
+  `trading_calendar.review_session_for(session_date, generated_at)`: the first official session after
+  `session_date` that was still open, or yet to open, when the packet was created. Every officially
+  notified session counts, so a Budget weekend or Muhurat session ends the window of a packet created
+  before it closes (Friday 2026-11-06 built on Saturday -> Sunday 2026-11-08). A special session that
+  had already closed is passed over (the same packet built after Sunday's Muhurat closed names Monday
+  2026-11-09). A regular one never is: a packet built after a later regular session closed is stale
+  (`STALE_EVIDENCE`). A packet naming a session that had closed when it was created is stale
+  (`STALE_EVIDENCE`); any other disagreement is refused (`REVIEW_SESSION_MISMATCH`), never
+  re-interpreted;
 - the packet expires at **that session's official close** (15:30 IST for a regular day and for
   both 2026 special sessions); a day the calendar cannot establish fails closed. A bundle already expired is
   refused at import; an imported packet that expires stays visible but can no longer start a

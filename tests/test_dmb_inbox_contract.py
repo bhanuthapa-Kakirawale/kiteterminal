@@ -295,7 +295,7 @@ def test_missing_calendar_coverage_fails_closed():
 
 def test_a_session_that_has_not_completed_is_refused():
     with pytest.raises(contract.BundleRejected) as e:
-        contract.check_sessions(B.date_of("2026-11-03"), B.date_of("2026-11-04"), B.DURING_REVIEW)
+        contract.check_sessions(B.date_of("2026-11-03"), B.date_of("2026-11-04"), B.DURING_REVIEW, B.DURING_REVIEW)
     assert e.value.code == "INVALID_SESSION_DATE"
 
 
@@ -340,3 +340,70 @@ def test_evidence_direction_must_be_an_evidence_code():
         p = B.packet()
         p["radar_state"]["direction"] = bad
         assert _code(_raw(B.bundle([B.rehash(p)]))) == "MALFORMED"
+
+
+# --------------------------------------------------------------- explicit review session (2026-11-04)
+# A packet names its review session. It must be the first official session after session_date that
+# was still open, or yet to open, when the packet was created: a special session that had closed by
+# then is passed over (the packet is explicitly for the next one), a regular one never is (the
+# evidence is no longer the latest). A packet for a session that had already closed is stale.
+@pytest.mark.parametrize("session, created, review, now, code", [
+    # regular: Mon 2 Nov -> Tue 3 Nov
+    ("2026-11-02", _at(2026, 11, 2, 20), "2026-11-03", _at(2026, 11, 3, 11), None),           # before
+    ("2026-11-02", _at(2026, 11, 3, 10), "2026-11-03", _at(2026, 11, 3, 11), None),           # during
+    ("2026-11-02", _at(2026, 11, 3, 16), "2026-11-03", _at(2026, 11, 3, 17), "STALE_EVIDENCE"),  # after
+    ("2026-11-02", _at(2026, 11, 3, 16), "2026-11-04", _at(2026, 11, 4, 10), "STALE_EVIDENCE"),  # never carried on
+    ("2026-11-02", _at(2026, 11, 2, 14), "2026-11-03", _at(2026, 11, 2, 21), "INVALID_SESSION_DATE"),  # mid-session
+    # weekend: Fri 18 Sep -> Mon 21 Sep
+    ("2026-09-18", _at(2026, 9, 19, 11), "2026-09-21", _at(2026, 9, 21, 10), None),
+    ("2026-09-18", _at(2026, 9, 21, 16), "2026-09-21", _at(2026, 9, 21, 17), "STALE_EVIDENCE"),
+    # Muhurat: Fri 6 Nov, Sun 8 Nov 14:20-15:30, Mon 9 Nov
+    ("2026-11-06", _at(2026, 11, 6, 20), "2026-11-08", _at(2026, 11, 7, 10), None),           # before Muhurat
+    ("2026-11-06", _at(2026, 11, 8, 15), "2026-11-08", _at(2026, 11, 8, 15, 10), None),       # during Muhurat
+    ("2026-11-06", _at(2026, 11, 8, 15), "2026-11-09", _at(2026, 11, 8, 15, 10), "REVIEW_SESSION_MISMATCH"),
+    ("2026-11-06", _at(2026, 11, 7, 10), "2026-11-09", _at(2026, 11, 7, 11), "REVIEW_SESSION_MISMATCH"),
+    ("2026-11-06", _at(2026, 11, 8, 16), "2026-11-09", _at(2026, 11, 9, 10), None),           # after: for Monday
+    ("2026-11-06", _at(2026, 11, 8, 16), "2026-11-09", _at(2026, 11, 9, 15, 30), "STALE_EVIDENCE"),  # Monday close
+    ("2026-11-06", _at(2026, 11, 8, 16), "2026-11-08", _at(2026, 11, 8, 17), "STALE_EVIDENCE"),
+    ("2026-11-06", _at(2026, 11, 9, 16), "2026-11-11", _at(2026, 11, 10, 12), "STALE_EVIDENCE"),  # Monday closed too
+    # Budget Sunday: Fri 30 Jan, Sun 1 Feb 09:15-15:30, Mon 2 Feb
+    ("2026-01-30", _at(2026, 1, 31, 12), "2026-02-01", _at(2026, 2, 1, 12), None),
+    ("2026-01-30", _at(2026, 2, 1, 16), "2026-02-02", _at(2026, 2, 2, 10), None),
+    ("2026-01-30", _at(2026, 2, 1, 16), "2026-02-01", _at(2026, 2, 1, 17), "STALE_EVIDENCE"),
+    ("2026-01-30", _at(2026, 1, 31, 12), "2026-02-02", _at(2026, 1, 31, 13), "REVIEW_SESSION_MISMATCH"),
+    # holiday: Mon 9 Nov, Tue 10 Nov holiday, Wed 11 Nov
+    ("2026-11-09", _at(2026, 11, 10, 12), "2026-11-11", _at(2026, 11, 10, 13), None),
+    ("2026-11-09", _at(2026, 11, 10, 12), "2026-11-10", _at(2026, 11, 10, 13), "REVIEW_SESSION_MISMATCH"),
+    # unknown calendar
+    ("2026-12-31", _at(2026, 12, 31, 20), "2027-01-01", _at(2026, 12, 31, 21), "CALENDAR_UNCOVERED"),
+])
+def test_the_packet_names_its_review_session(session, created, review, now, code):
+    p = B.packet(session=session, review=review, evidence_as_of=max(created - timedelta(minutes=15), datetime.combine(
+        date.fromisoformat(session), trading_calendar.MARKET_CLOSE, tzinfo=trading_calendar.IST)).isoformat(),
+        generated_at=created.isoformat())
+    raw = _raw(B.bundle([p], session=session, generated_at=created.isoformat()))
+    if code is None:
+        contract.parse_and_validate(raw, now)
+    else:
+        assert _code(raw, now=now) == code
+
+
+def test_review_session_for_is_the_next_official_session_at_the_close():
+    """Created at its own session's close, every packet reviews on the first official session after
+    it, for every regular day the calendar covers - the earlier rule, unchanged for that case."""
+    d, checked = date(2025, 1, 1), 0
+    while d < date(2026, 12, 31):
+        if trading_calendar.is_trading_day(d):
+            close = datetime.combine(d, trading_calendar.MARKET_CLOSE, tzinfo=trading_calendar.IST)
+            assert trading_calendar.review_session_for(d, close) == trading_calendar.next_official_session(d), d
+            checked += 1
+        d += timedelta(days=1)
+    assert checked > 480
+
+
+def test_review_session_for_fails_closed_on_an_unevidenced_session():
+    with trading_calendar.use_calendar(special_sessions=[date(2026, 11, 7)], covered_years=[2026]):
+        with pytest.raises(trading_calendar.CalendarDataError):
+            trading_calendar.review_session_for(date(2026, 11, 6), _at(2026, 11, 6, 20))
+    with pytest.raises(trading_calendar.CalendarDataError):
+        trading_calendar.review_session_for(date(2026, 12, 31), _at(2026, 12, 31, 20))

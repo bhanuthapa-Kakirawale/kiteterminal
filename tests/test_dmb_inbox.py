@@ -696,3 +696,29 @@ def test_a_link_reported_by_lstat_is_refused_without_symlink_privileges(inbox, m
                         lambda p, *a, **k: LinkStat(real_lstat(p)) if os.fspath(p) == target else real_lstat(p))
     r = _import(inbox, b, path=True)
     assert r.status_code == 422 and r.json()["detail"]["error_code"] == "PATH_REFUSED"
+
+
+def test_a_packet_created_after_muhurat_names_monday_and_expires_at_its_close(inbox):
+    """Explicit review session (2026-11-04): Friday 2026-11-06's packet created after Sunday's
+    Muhurat closed is for Monday 2026-11-09. It imports and can start a ticket on Monday morning,
+    and becomes research only (EXPIRED) at Monday's 15:30 close. The same packet naming Sunday is
+    stale and is refused at import."""
+    from datetime import datetime
+    from backend.trading_calendar import IST
+    created = "2026-11-08T16:00:00+05:30"
+    for_monday = B.bundle([B.packet("INFY", session="2026-11-06", review="2026-11-09",
+                                    evidence_as_of="2026-11-06T19:45:00+05:30", generated_at=created)],
+                          session="2026-11-06", generated_at=created)
+    inbox.clock["now"] = datetime(2026, 11, 9, 10, 0, tzinfo=IST)
+    assert _import(inbox, for_monday).json()["data"]["status"] == "IMPORTED"
+    item = _items(inbox)["INFY"]
+    assert item["actionable"] and item["expires_at"] == "2026-11-09T15:30:00+05:30", item["reasons"]
+    inbox.clock["now"] = datetime(2026, 11, 9, 15, 30, tzinfo=IST)
+    assert "EXPIRED" in _items(inbox)["INFY"]["reasons"]
+
+    for_sunday = B.bundle([B.packet("TCS", session="2026-11-06", review="2026-11-08",
+                                    evidence_as_of="2026-11-06T19:45:00+05:30", generated_at=created)],
+                          session="2026-11-06", generated_at=created)
+    inbox.clock["now"] = datetime(2026, 11, 9, 10, 0, tzinfo=IST)
+    r = _import(inbox, for_sunday)
+    assert r.status_code == 422 and r.json()["detail"]["error_code"] == "STALE_EVIDENCE", r.text

@@ -40,8 +40,21 @@ KNOWN_SPECIAL_SESSION_DIFFERENCES = {"kite_only": [], "dmb_only": []}
 KNOWN_SPECIAL_SESSION_PACKET_DATES: list = []
 SPECIAL_SESSION_DATES = ["2025-02-01", "2025-10-21", "2026-02-01", "2026-11-08"]
 
+# Creation instants probed for every day: at the session's close, that evening, and before,
+# during and after the following sessions (IST). Shared verbatim by both interpreters.
+_CREATED_TIMES = """
+def created_times(p):
+    d = dt.date.fromisoformat(p)
+    out = [dt.datetime.combine(d, dt.time(15, 30)), dt.datetime.combine(d, dt.time(20, 0))]
+    for days in (1, 2, 3, 4):
+        for hhmm in ((10, 0), (15, 0), (15, 30), (16, 0)):
+            out.append(dt.datetime.combine(d + dt.timedelta(days=days), dt.time(*hhmm)))
+    return [t.replace(tzinfo=dt.timezone(dt.timedelta(hours=5, minutes=30))).isoformat() for t in out]
+"""
+
 _DUMP = """
 import datetime as dt, json, sys
+""" + _CREATED_TIMES + """
 from core.trading_calendar import NSE_TRADING_HOLIDAYS, SPECIAL_SESSIONS, SESSION_TYPES, session_record
 from private_desk.handoff.evidence import review_session_close, review_session_for
 probes = json.loads(sys.argv[1])
@@ -54,7 +67,10 @@ out = {"years": sorted(NSE_TRADING_HOLIDAYS),
        "review": {p: (lambda r: r.isoformat() if r else None)(review_session_for(dt.date.fromisoformat(p)))
                   for p in probes},
        "close": {p: (lambda c: c.isoformat() if c else None)(review_session_close(dt.date.fromisoformat(p)))
-                 for p in probes}}
+                 for p in probes},
+       "review_at": {f"{p}@{c}": (lambda r: r.isoformat() if r else None)(
+                         review_session_for(dt.date.fromisoformat(p), dt.datetime.fromisoformat(c)))
+                     for p in probes for c in created_times(p)}}
 print(json.dumps(out))
 """
 
@@ -111,6 +127,38 @@ def test_every_review_session_agrees(dmb):
 
 
 @needs_dmb
+def test_every_explicit_review_session_agrees(dmb):
+    """The review session a packet names depends on when it was built (2026-11-04): for every day of
+    2025-2026 and 18 creation instants each - at the close, that evening, and before, during and
+    after each of the next four days' sessions - DMB's review_session_for(d, created) equals this
+    terminal's, or both refuse (not a regular session, built before its close, calendar unknowable)."""
+    import datetime as dt
+    from backend import trading_calendar
+    namespace = {"dt": dt}
+    exec(_CREATED_TIMES, namespace)
+    differing, checked = [], 0
+    for probe in dmb["review"]:
+        d = date.fromisoformat(probe)
+        if d.year > 2026:
+            continue
+        for created in namespace["created_times"](probe):
+            at = datetime.fromisoformat(created)
+            close = datetime.combine(d, trading_calendar.MARKET_CLOSE, tzinfo=trading_calendar.IST)
+            if not trading_calendar.is_trading_day(d) or at < close:
+                ours = None
+            else:
+                try:
+                    ours = trading_calendar.review_session_for(d, at).isoformat()
+                except trading_calendar.CalendarDataError:
+                    ours = None
+            theirs = dmb["review_at"][f"{probe}@{created}"]
+            checked += ours is not None
+            if ours != theirs:
+                differing.append((probe, created, ours, theirs))
+    assert differing == [] and checked > 480 * 17
+
+
+@needs_dmb
 def test_every_expiry_instant_agrees(dmb):
     """For every day of 2025-2026 that is an official session on both sides, DMB's packet expiry
     (review_session_close) == this terminal's (contract.expires_at): same instant, same offset."""
@@ -158,8 +206,8 @@ def test_special_sessions_are_typed_sourced_and_never_packet_sessions(dmb):
         assert trading_calendar.has_exchange_session(date.fromisoformat(d))
         with pytest.raises(contract.BundleRejected) as e:                    # Kite: refused
             nxt = trading_calendar.next_trading_day(date.fromisoformat(d))
-            contract.check_sessions(date.fromisoformat(d), nxt, datetime.combine(nxt, datetime.min.time(),
-                                                                                 trading_calendar.IST))
+            at = datetime.combine(nxt, datetime.min.time(), trading_calendar.IST)
+            contract.check_sessions(date.fromisoformat(d), nxt, at, at)
         assert e.value.code == "INVALID_SESSION_DATE", d
 
 
@@ -197,6 +245,7 @@ def test_both_fail_closed_for_2027(dmb):
     assert trading_calendar.session_record(date(2027, 1, 4))["session_type"] == "UNVERIFIED"
     with pytest.raises(contract.BundleRejected) as e:               # this terminal: refused, not guessed
         contract.check_sessions(date(2026, 12, 31), date(2027, 1, 1),
+                                datetime(2026, 12, 31, 20, 0, tzinfo=trading_calendar.IST),
                                 datetime(2027, 1, 1, 8, 0, tzinfo=trading_calendar.IST))
     assert e.value.code == "CALENDAR_UNCOVERED"
 
@@ -209,9 +258,11 @@ def test_muhurat_ends_the_previous_packets_window():
     muhurat = date(2026, 11, 8)
     assert trading_calendar.has_exchange_session(muhurat) and not trading_calendar.is_trading_day(muhurat)
     assert trading_calendar.next_official_session(date(2026, 11, 6)) == muhurat
-    contract.check_sessions(date(2026, 11, 6), muhurat, datetime(2026, 11, 7, 9, 0, tzinfo=trading_calendar.IST))
+    friday_evening = datetime(2026, 11, 6, 20, 0, tzinfo=trading_calendar.IST)
+    contract.check_sessions(date(2026, 11, 6), muhurat, friday_evening,
+                            datetime(2026, 11, 7, 9, 0, tzinfo=trading_calendar.IST))
     with pytest.raises(contract.BundleRejected) as e:
-        contract.check_sessions(date(2026, 11, 6), date(2026, 11, 9),
+        contract.check_sessions(date(2026, 11, 6), date(2026, 11, 9), friday_evening,
                                 datetime(2026, 11, 7, 9, 0, tzinfo=trading_calendar.IST))
     assert e.value.code == "REVIEW_SESSION_MISMATCH"
     assert contract.expires_at(muhurat) == datetime(2026, 11, 8, 15, 30, tzinfo=trading_calendar.IST)

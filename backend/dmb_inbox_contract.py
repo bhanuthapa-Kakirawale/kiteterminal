@@ -308,9 +308,13 @@ def expires_at(review_session_date: date) -> datetime:
         _reject("CALENDAR_UNCOVERED", str(exc))
 
 
-def check_sessions(session: date, review: date, now: datetime) -> None:
-    """Kite's calendar, fail closed: both years covered, session_date a regular session that
-    has completed, review_session_date exactly the first official session after it."""
+def check_sessions(session: date, review: date, generated: datetime, now: datetime) -> None:
+    """Kite's calendar, fail closed: both years covered; session_date a regular session that had
+    completed when the packet was created; review_session_date - the session the packet names -
+    still open or yet to open at creation (a packet for a session already closed is stale), and
+    exactly the first official session after session_date that was (trading_calendar.
+    review_session_for): a special session that closed before creation is passed over, a regular
+    one never is."""
     for d, path in ((session, "session_date"), (review, "review_session_date")):
         if trading_calendar.coverage(d.year) != "COVERED":
             _reject("CALENDAR_UNCOVERED", f"{path} {d} is in a year the NSE calendar does not cover")
@@ -318,13 +322,25 @@ def check_sessions(session: date, review: date, now: datetime) -> None:
         _reject("INVALID_SESSION_DATE", f"{session} is not a regular NSE session")
     if trading_calendar.latest_completed_session(now) < session:
         _reject("INVALID_SESSION_DATE", f"session {session} has not completed yet")
+    if generated < datetime.combine(session, trading_calendar.MARKET_CLOSE, tzinfo=trading_calendar.IST):
+        _reject("INVALID_SESSION_DATE", f"session {session} had not completed when the packet was created")
     try:
-        expected = trading_calendar.next_official_session(session)
+        expected = trading_calendar.review_session_for(session, generated)
     except trading_calendar.CalendarDataError as exc:
         _reject("CALENDAR_UNCOVERED", str(exc))
+    try:
+        review_close = trading_calendar.official_session_close(review)
+    except trading_calendar.CalendarDataError:
+        review_close = None                          # not a session at all: a mismatch, below
+    if review_close is not None and generated >= review_close:
+        _reject("STALE_EVIDENCE", f"the review session {review} had closed when the packet was created")
+    if generated >= trading_calendar.official_session_close(expected):
+        _reject("STALE_EVIDENCE", f"regular session {expected} had closed when the packet was created: "
+                                  f"the evidence of {session} was no longer the latest")
     if review != expected:
         _reject("REVIEW_SESSION_MISMATCH",
-                f"review_session_date {review} is not the next NSE session after {session} ({expected})")
+                f"review_session_date {review} is not the session a packet for {session} created at "
+                f"{generated.isoformat()} is for ({expected})")
 
 
 # ---------------------------------------------------------------- rights
@@ -485,9 +501,9 @@ def validate_packet(p, now: datetime) -> dict:
 
     session = parse_date(p["session_date"], "$.session_date")
     review = parse_date(p["review_session_date"], "$.review_session_date")
-    check_sessions(session, review, now)
     as_of = parse_timestamp(p["evidence_as_of"], "$.evidence_as_of")
     generated = parse_timestamp(p["generated_at"], "$.generated_at")
+    check_sessions(session, review, generated, now)
     if generated > now + FUTURE_SKEW:
         _reject("FUTURE_TIMESTAMP", "generated_at is in the future")
     if as_of > generated:

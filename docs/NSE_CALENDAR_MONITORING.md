@@ -53,7 +53,9 @@ Full hashes and copies are in the sprint's scratch evidence folder. The circular
 `tests/test_calendar_parity.py` (Kite; runs DMB's own code in DMB's interpreter, read-only) asserts, for every day of **2025-01-01 … 2027-01-31**:
 - weekday holidays identical for every year both cover;
 - the **complete session record** identical: type, open, close, source, publication date and verification;
-- DMB's `review_session_for(d)` equals Kite's `next_official_session(d)`, or both refuse, and DMB's
+- DMB's `review_session_for(d, created)` equals Kite's `review_session_for(d, created)` for 18 creation
+  instants per day (at the close, that evening, and before, during and after each of the next four days'
+  sessions), and DMB's `review_session_for(d)` equals Kite's `next_official_session(d)`, or both refuse, and DMB's
   `review_session_close(d)` equals Kite's `expires_at(d)` (same instant) for every official session (§5);
 - special-session lists identical: 2025-02-01, 2025-10-21, 2026-02-01, 2026-11-08;
 - each special session is typed and sourced on both sides, DMB exports no packet for it, and Kite refuses one (`INVALID_SESSION_DATE`);
@@ -78,30 +80,50 @@ DMB-side tests: `daily_byte/tests/test_trading_calendar_session_records.py` (14)
 - validity is never extended because the next session is not a regular weekday session;
 - if the calendar cannot establish the applicable session, the packet fails closed.
 
-**Implementation (both sides, parity-tested):** `review_session_date` = the first official session
-(`REGULAR`, `SPECIAL_FULL`, `SPECIAL_SHORT` with `VERIFIED`/`REFERENCED` evidence) after
-`session_date` (Kite `trading_calendar.next_official_session`, DMB
-`evidence.review_session_for`); expiry = that session's official close from its record (Kite
-`dmb_inbox_contract.expires_at` -> `trading_calendar.official_session_close`, DMB
-`evidence.review_session_close`). A packet is built only after `session_date` closes
-(`evidence_as_of` >= close is enforced on both sides), so this equals the rule for every packet
-created before or during the next official session. A packet created **after** that session closed
-is already expired: DMB does not export it (`PACKET_EXPIRED`), Kite refuses it (`STALE_EVIDENCE`).
-That is stricter than the rule, never longer. An `UNVERIFIED` day on the walk raises
-`CalendarDataError` / gives `None` (fail closed).
+**Implementation (both sides, parity-tested; explicit review session since 2026-11-04):** the
+packet **names** its `review_session_date`. It must be the first official session (`REGULAR`,
+`SPECIAL_FULL`, `SPECIAL_SHORT` with `VERIFIED`/`REFERENCED` evidence) after `session_date` that
+was still open, or yet to open, when the packet was created (Kite
+`trading_calendar.review_session_for(session, created)`, DMB `evidence.review_session_for(session,
+created)`). A special session that had already closed at creation is passed over, so a packet created
+after it is explicitly for the next session. A regular session never is: once one has closed, the
+evidence is no longer the latest and the packet is stale. Expiry = the named session's official close
+from its record (Kite `dmb_inbox_contract.expires_at` -> `trading_calendar.official_session_close`,
+DMB `evidence.review_session_close`). This is the owner rule exactly. The earlier implementation
+derived the review session from `session_date` alone and refused every packet created after that
+session closed, which also refused the legitimate post-Muhurat packet. Refusals: a packet naming a
+session that had closed when it was created, or built after a later regular session closed, is stale
+(DMB `PACKET_EXPIRED`, Kite `STALE_EVIDENCE`). Any other disagreement is `REVIEW_SESSION_MISMATCH`. A
+packet created before its own session closed is refused (DMB `EVIDENCE_BEFORE_SESSION_CLOSE`, Kite
+`INVALID_SESSION_DATE`). An `UNVERIFIED` day on the walk raises `CalendarDataError` / gives `None`
+(fail closed).
 
 Consequences, tested on both sides:
-- Friday 2026-11-06's packet is reviewed on **Sunday 2026-11-08 (Muhurat, 14:20-15:30)** and
-  expires at **15:30 IST that Sunday**. A packet claiming Monday 2026-11-09 is refused
-  (`REVIEW_SESSION_MISMATCH`).
+- Friday 2026-11-06's packet created before the Muhurat closes is reviewed on **Sunday 2026-11-08
+  (Muhurat, 14:20-15:30)** and expires at **15:30 IST that Sunday**. Such a packet claiming Monday
+  2026-11-09 is refused (`REVIEW_SESSION_MISMATCH`). The same packet created **after** 15:30 on Sunday
+  names Monday 2026-11-09 and stays eligible until Monday's 15:30 close. If it names the closed Sunday,
+  it is stale.
 - Friday 2026-01-30's packet was reviewed on the **Budget Sunday 2026-02-01** and expired at 15:30
   IST that day.
 - Monday 2026-11-09's packet is reviewed on Wednesday 2026-11-11 (Tuesday 10th is a holiday).
 - No packet ever describes a special session (unchanged: a special session is never a packet
   session; `INVALID_SESSION_DATE`).
-- Muhurat 2026: CAS securities' normal market closes 15:15; the record carries the segment close
-  15:30, so for a CAS security the packet nominally outlives that security's own close by 15
-  minutes, during which it cannot trade anyway.
+- **Muhurat 2026: 15:15 versus 15:30 (verified 2026-11-04 against the retrieved circular
+  NSE/CMTR/76941, SHA-256 `ce94ee1c…1d58`).** Both times are official and they apply to different
+  securities within the **Capital Market segment**, so they are not a conflict. For **Closing Auction
+  Session (CAS) securities**, continuous normal-market trading ends at **15:15**. Those securities
+  then move through reference-price calculation (15:15-15:20) and CAS order entry
+  (15:20-15:25/15:30*), with matching at 15:30-15:35. For **non-CAS securities**, the normal market
+  closes at **15:30**. Other sessions: call auction (illiquid) 14:25-15:10*, special pre-open stocks
+  15:05-15:30, block deals 13:50-14:05. The calendar records the segment-level close **15:30**: the
+  latest normal-market close and the end of CAS order entry. It is the correct instant for packet
+  expiry, because a CAS security can still take orders in its closing auction until 15:30. The earlier
+  note here, that a CAS security "cannot trade anyway" after 15:15, was inaccurate and is withdrawn.
+  The 2025 Muhurat circular (NSE/CMTR/70319) has no CAS split (normal market 13:45-14:45).
+  **Not covered:** the F&O segment's and BSE's Muhurat timings (no circular retrieved). Nothing in
+  either application relies on them, and the terminal's market-open gate treats every special session
+  as closed for order entry (fail closed).
 - Kite's "market open" gate (`is_market_session_open`) still models regular sessions only, so the
   terminal treats a special session as closed for order entry (fail closed; unchanged).
 

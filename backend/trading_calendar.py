@@ -252,6 +252,25 @@ def next_official_session(d: date) -> date:
     raise CalendarDataError(f"no official session within {_MAX_WALK_DAYS} days after {d}")
 
 
+def review_session_for(session: date, created: datetime) -> date:
+    """The review session of a DMB packet that describes regular session `session` and was created
+    at `created` (owner rule, 2026-11-04): the first official session after `session` that was still
+    open, or yet to open, at creation. A SPECIAL session that had already closed at creation is passed
+    over - it describes nothing, and a packet created after it is explicitly for the next session.
+    A REGULAR session is never passed over: once one has closed, the packet's evidence is no longer
+    the latest, so that closed session is returned and the packet is stale. Created at `session`'s
+    own close, this is next_official_session(session). Fail closed: an UNVERIFIED day on the way
+    raises CalendarDataError. The caller checks that `session` is regular and closed before
+    `created`. Parity: DMB's private_desk.handoff.evidence.review_session_for."""
+    created = as_ist(created)
+    d = session
+    for _ in range(_MAX_WALK_DAYS):
+        d = next_official_session(d)
+        if session_record(d)["session_type"] == REGULAR or created < official_session_close(d):
+            return d
+    raise CalendarDataError(f"no open official session within {_MAX_WALK_DAYS} sessions after {session}")
+
+
 def official_session_close(d: date) -> datetime:
     """The official close (IST) of the session on `d`, from its typed record: 15:30 for a regular
     day, the circular's close for a special one. CalendarDataError when `d` is no evidenced session."""

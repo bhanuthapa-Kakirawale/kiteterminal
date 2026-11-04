@@ -349,7 +349,8 @@ def actionability(conn, item, packet: dict, state: dict, now: datetime) -> dict:
     session = contract.parse_date(item["session_date"], "session_date")
     review = contract.parse_date(item["review_session_date"], "review_session_date")
     try:
-        contract.check_sessions(session, review, now)
+        generated = contract.parse_timestamp(packet.get("generated_at"), "generated_at")
+        contract.check_sessions(session, review, generated, now)
     except contract.BundleRejected as exc:
         reasons.append(exc.code)
     try:
