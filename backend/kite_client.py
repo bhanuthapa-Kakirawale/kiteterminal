@@ -1,9 +1,11 @@
 import logging
+import os
 from datetime import datetime
 
 from cryptography.fernet import InvalidToken
 from fastapi import Depends, HTTPException
 from kiteconnect import KiteConnect
+from kiteconnect.exceptions import PermissionException
 
 from backend import crypto, kite_rest_proxy
 from backend.accounts import get_account, get_default_account, get_trading_account
@@ -45,6 +47,53 @@ def _access_token_decrypted(account) -> str | None:
     return token
 
 
+# ---- broker writes switch (read-only verification, runbook section 1.6) ----------------------
+#
+# KITE_TERMINAL_BROKER_WRITES=disabled builds every REST client so that it can only READ: the one
+# non-GET call left open is the login's request-token exchange (route "api.token"), without which
+# no session exists. Every other POST/PUT/DELETE - orders, GTTs, conversions, MF, token
+# invalidation, order-margin calculation - is refused inside this process before any request is
+# made, whoever calls it (a route, a background worker, Emergency Exit). The refusal is a
+# PermissionException subclass, so the order paths record it as a definite rejection (nothing was
+# sent), never as an UNKNOWN outcome. Unset or "enabled" keeps normal behaviour; ANY other value
+# disables writes (a typo fails safe). The SDK's single request method (kiteconnect 5.x
+# KiteConnect._request) is the choke point, so a new SDK write method is covered too.
+BROKER_WRITES_ENV = "KITE_TERMINAL_BROKER_WRITES"
+_WRITES_DISABLED_ALLOWED_ROUTES = frozenset({"api.token"})
+
+
+class BrokerWritesDisabled(PermissionException):
+    """A broker write refused locally: KITE_TERMINAL_BROKER_WRITES disables writes. Nothing was sent."""
+
+    def __init__(self, route: str, method: str):
+        super().__init__(f"Broker writes are disabled on this terminal ({BROKER_WRITES_ENV}): {method} {route} "
+                         f"was refused locally and never sent to Kite.", code=403)
+
+
+def broker_writes_enabled() -> bool:
+    return os.environ.get(BROKER_WRITES_ENV, "enabled").strip().lower() in ("", "enabled")
+
+
+class ReadOnlyKiteConnect(KiteConnect):
+    """A KiteConnect that can log in and read, and nothing else."""
+
+    def _request(self, route, method, *args, **kwargs):
+        if str(method).upper() != "GET" and route not in _WRITES_DISABLED_ALLOWED_ROUTES:
+            logger.warning("event=broker_write.refused route=%s method=%s: %s is not enabled",
+                           route, str(method).upper(), BROKER_WRITES_ENV)
+            raise BrokerWritesDisabled(route, str(method).upper())
+        return super()._request(route, method, *args, **kwargs)
+
+
+def _restrict_if_writes_disabled(kite: KiteConnect) -> KiteConnect:
+    """The factory's client, narrowed to ReadOnlyKiteConnect when writes are disabled. The object is
+    still the one KiteConnect(...) built above (same proxy route and session); only its class, and so
+    its _request, changes. Construction stays literal in the factory (test_14d)."""
+    if not broker_writes_enabled():
+        kite.__class__ = ReadOnlyKiteConnect
+    return kite
+
+
 def create_kite_connect(api_key: str) -> KiteConnect:
     """NET-1: the one place a KiteConnect REST client is built. With
     KITE_REST_PROXY set, every request it makes (login, reads, historical
@@ -55,10 +104,10 @@ def create_kite_connect(api_key: str) -> KiteConnect:
     built here and stays direct."""
     proxy = kite_rest_proxy.from_env()
     if proxy is None:
-        return KiteConnect(api_key=api_key)
+        return _restrict_if_writes_disabled(KiteConnect(api_key=api_key))
     kite = KiteConnect(api_key=api_key, proxies=proxy.requests_proxies)
     kite.reqsession.trust_env = False
-    return kite
+    return _restrict_if_writes_disabled(kite)
 
 
 def _resolve_account(account_id: int | None):

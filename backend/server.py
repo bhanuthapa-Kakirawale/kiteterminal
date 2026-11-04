@@ -206,6 +206,7 @@ def detect_runtime(env: Mapping[str, str], argv: Sequence[str]) -> RuntimeConfig
 
 
 def security_summary(config: RuntimeConfig, allowed_hosts) -> str:
+    from backend.kite_client import broker_writes_enabled   # lazily: the launcher stays light
     mode = "private-remote" if config.remote_bind else "local"
     return (
         f"Security summary: bind={config.host} port={config.port} "
@@ -213,7 +214,8 @@ def security_summary(config: RuntimeConfig, allowed_hosts) -> str:
         f"remote_exposure={'yes' if config.remote_bind else 'no'} "
         f"reload={'yes' if config.reload else 'no'} workers={config.workers} "
         f"trusted_proxies={','.join(config.trusted_proxy_ips) or 'none'} "
-        f"mode={mode} started_by={config.source}"
+        f"mode={mode} started_by={config.source} "
+        f"broker_writes={'enabled' if broker_writes_enabled() else 'DISABLED'}"
     )
 
 
