@@ -602,27 +602,112 @@ class _Reply:
 
 def test_23b_outbound_ip_check_goes_through_the_proxy(ready, proxy_env, monkeypatch):
     import urllib.request
-    handlers = []
+    sends = []
 
-    class Opener:
-        def open(self, request, timeout=None):
-            return _Reply(TEST_STATIC_IP)
-
-    def build_opener(*hs):
-        handlers.extend(hs)
-        return Opener()
+    def send(adapter, request, **kw):
+        sends.append((urllib.request.urlparse(request.url).hostname, dict(kw.get("proxies") or {})))
+        response = requests.Response()
+        response.status_code = 200
+        response._content = TEST_STATIC_IP.encode()
+        response.url, response.request = request.url, request
+        return response
 
     def direct(*a, **k):
         raise AssertionError("the outbound-IP check went direct while a REST proxy is configured")
 
-    monkeypatch.setattr(urllib.request, "build_opener", build_opener)
+    # Hostile environment: neither may redirect or bypass the configured proxy.
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("HTTPS_PROXY", "http://203.0.113.9:8080")
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
     monkeypatch.setattr(urllib.request, "urlopen", direct)
     r = ready.client.post("/api/live-readiness/egress-check")
     assert r.status_code == 200, r.text
     assert r.json()["data"]["status"] == "VERIFIED"
-    assert [h.proxies for h in handlers if isinstance(h, urllib.request.ProxyHandler)] == [PROXY_MAP]
+    assert sends == [("api.ipify.org", PROXY_MAP)]
     detail = _check(_evaluate(broker=False), "STATIC_IP")["detail"]
     assert (detail["egress_route"], detail["egress_proxy"]) == ("PROXY", "10.77.0.1:3128")
+
+
+class _MockConnectProxy:
+    """A real local TCP proxy that records each request line and refuses the tunnel (502)."""
+
+    def __init__(self):
+        import socket
+        import threading
+        self.lines: list[str] = []
+        self._srv = socket.socket()
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(5)
+        self.port = self._srv.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self._srv.accept()
+            except OSError:
+                return
+            with conn:
+                self.lines.append(conn.recv(512).split(b"\r\n")[0].decode("ascii", "replace"))
+                conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+
+    def close(self):
+        self._srv.close()
+
+
+@pytest.fixture
+def no_direct_sockets(monkeypatch):
+    """Records, and refuses, every TCP connect to a non-loopback address."""
+    import socket
+    attempts: list[str] = []
+    real_connect = socket.socket.connect
+
+    def connect(sock, address):
+        if isinstance(address, tuple) and not str(address[0]).startswith("127."):
+            attempts.append(f"{address[0]}:{address[1]}")
+            raise ConnectionRefusedError("test: direct connection refused")
+        return real_connect(sock, address)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    return attempts
+
+
+@pytest.mark.parametrize("no_proxy", ["api.ipify.org", "*"])
+def test_23d_outbound_ip_check_ignores_no_proxy_on_real_sockets(ready, monkeypatch, no_direct_sockets, no_proxy):
+    # urllib's ProxyHandler honoured NO_PROXY (and the Windows bypass list) and went direct.
+    proxy = _MockConnectProxy()
+    try:
+        monkeypatch.setenv("KITE_REST_PROXY", f"http://127.0.0.1:{proxy.port}")
+        monkeypatch.setenv("NO_PROXY", no_proxy)
+        monkeypatch.setenv("no_proxy", no_proxy)
+        r = ready.client.post("/api/live-readiness/egress-check")
+        assert r.status_code == 200, r.text
+        data = r.json()["data"]
+        assert data["status"] != "VERIFIED"
+        assert proxy.lines == ["CONNECT api.ipify.org:443 HTTP/1.1"]
+        assert no_direct_sockets == []
+    finally:
+        proxy.close()
+
+
+def test_23e_outbound_ip_check_proxy_down_fails_closed(ready, monkeypatch, no_direct_sockets):
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    dead_port = s.getsockname()[1]
+    s.close()                                   # nothing listens on dead_port now
+    monkeypatch.setenv("KITE_REST_PROXY", f"http://127.0.0.1:{dead_port}")
+    r = ready.client.post("/api/live-readiness/egress-check")
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["status"] != "VERIFIED"
+    assert no_direct_sockets == []
+    from backend import db as backend_db
+    conn = backend_db.get_connection()
+    try:
+        row = conn.execute("SELECT egress_ip, egress_error FROM live_readiness").fetchone()
+    finally:
+        conn.close()
+    assert row["egress_ip"] is None and "ProxyError" in row["egress_error"]
 
 
 def test_23c_outbound_ip_check_without_proxy_is_unchanged(ready, monkeypatch):

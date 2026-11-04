@@ -240,17 +240,24 @@ def _fetch_egress_ip() -> str:
     """One HTTPS GET to the configured echo service. Only ever called from
     check_egress_ip(), which only a deliberate user action reaches.
 
-    NET-1: with KITE_REST_PROXY set it goes through that proxy (an explicit
-    ProxyHandler, which ignores environment proxies), so it observes the IP
-    Kite sees for REST calls, never silently the direct route."""
-    request = urllib.request.Request(config.EGRESS_IP_ECHO_URL, headers={"User-Agent": "kite-terminal-preflight"})
+    NET-1: with KITE_REST_PROXY set it goes through that proxy, so it
+    observes the IP Kite sees for REST calls, never silently the direct route.
+    It uses the same mechanism as the KiteConnect client (requests with
+    trust_env off and explicit proxies): urllib's ProxyHandler still honours
+    NO_PROXY and the Windows proxy-bypass list, and would then connect
+    directly. A proxy failure raises; it is never retried directly."""
+    headers = {"User-Agent": "kite-terminal-preflight"}
     proxy = kite_rest_proxy.from_env()
     if proxy is None:
-        opener = urllib.request.urlopen
-    else:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxy.requests_proxies)).open
-    with opener(request, timeout=config.EGRESS_IP_TIMEOUT_SECONDS) as response:  # noqa: S310
-        return response.read(64).decode("ascii", "replace").strip()
+        request = urllib.request.Request(config.EGRESS_IP_ECHO_URL, headers=headers)
+        with urllib.request.urlopen(request, timeout=config.EGRESS_IP_TIMEOUT_SECONDS) as response:  # noqa: S310
+            return response.read(64).decode("ascii", "replace").strip()
+    with requests.Session() as session:
+        session.trust_env = False
+        response = session.get(config.EGRESS_IP_ECHO_URL, headers=headers, proxies=proxy.requests_proxies,
+                               timeout=config.EGRESS_IP_TIMEOUT_SECONDS, allow_redirects=False)
+        response.raise_for_status()
+        return response.content[:64].decode("ascii", "replace").strip()
 
 
 def check_egress_ip(conn: sqlite3.Connection, account_id: int) -> dict:
