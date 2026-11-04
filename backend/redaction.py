@@ -29,6 +29,9 @@ _SECRET_KEYS = (
     "access_token", "request_token", "refresh_token", "public_token", "enctoken",
     "api_secret", "api_secret_enc", "access_token_enc", "password", "checksum",
     "kite_api_secret", "kite_terminal_encryption_key",
+    # P2-G login state (in the /callback query string, so in the uvicorn access log line), the
+    # terminal token (landing fragment) and the credential / login-state cookie names.
+    "kt_state", "kt_token", "kt_session", "kt_login_state",
 )
 _KEY_ALT = "|".join(sorted(_SECRET_KEYS, key=len, reverse=True))
 # key, optional closing quote, separator, optional opening quote, then the

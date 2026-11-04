@@ -621,9 +621,11 @@ class TerminalCredentialGuard:
 # Only ONE login is pending at a time: starting a new one supersedes every earlier one, so a stale
 # Kite tab from an older attempt can never complete. Single use, 10 minutes.
 #
-# Real-login validation is outstanding (no real Kite login in this sprint): if a real login shows
-# that Kite does not echo the parameter, set KITE_TERMINAL_LOGIN_STATE_ECHO=cookie-only. That is
-# an explicit, logged downgrade to the earlier cookie-only binding - never a silent one.
+# Real-login validation is outstanding (no real Kite login has been performed). There is NO
+# downgrade: the owner forbade a cookie-only fallback (sprint of 2026-11-04), so the former
+# KITE_TERMINAL_LOGIN_STATE_ECHO=cookie-only switch is ignored (and reported as an error). If a real
+# login shows Kite does not echo the state, the login keeps failing closed (/?login_error=1) and
+# real-account use stays NO-GO until a secure, documented alternative is verified.
 
 LOGIN_STATE_COOKIE = "kt_login_state"
 LOGIN_STATE_PARAM = "kt_state"
@@ -632,11 +634,12 @@ LOGIN_STATE_ECHO_ENV = "KITE_TERMINAL_LOGIN_STATE_ECHO"
 
 
 def login_state_echo_required() -> bool:
+    """Always True: the echoed state is required on every callback. A leftover downgrade setting is
+    ignored, loudly - it never weakens the binding."""
     mode = os.environ.get(LOGIN_STATE_ECHO_ENV, "required").strip().lower()
-    if mode == "cookie-only":
-        logger.warning("%s=cookie-only: the Kite callback is bound to this browser's cookie only, not to "
-                       "the state echoed by Kite (P2-G R-F1 downgrade)", LOGIN_STATE_ECHO_ENV)
-        return False
+    if mode != "required":
+        logger.error("%s=%s is not supported and is ignored: the Kite callback must echo this browser's "
+                     "login state (P2-G R-F1; no cookie-only fallback)", LOGIN_STATE_ECHO_ENV, mode[:20])
     return True
 
 
@@ -682,7 +685,7 @@ def begin_login(now: float | None = None) -> str:
 
 def consume_login_state(presented: str | None, echoed: str | None = None, now: float | None = None) -> bool:
     """True once, for the pending, unexpired login whose state is in this browser's cookie
-    (`presented`) and, unless downgraded, was echoed back by Kite unchanged (`echoed`)."""
+    (`presented`) and was echoed back by Kite unchanged (`echoed`)."""
     return _login_states.consume(presented, echoed, login_state_echo_required(),
                                  time.time() if now is None else now)
 

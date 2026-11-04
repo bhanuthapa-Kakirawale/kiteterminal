@@ -89,9 +89,10 @@ browser makes from another origin or port (`Origin`, `Sec-Fetch-Site`) is
 refused. Login (P2-G F1/R-F1): `/login` sends a one-time state through Kite
 Connect's documented `redirect_params`, and `/callback` exchanges nothing
 unless Kite echoes exactly this browser's state. That echo is not yet
-confirmed with a real login; if the first real login is refused with
-`?login_error=1`, see `docs/SECURITY_P2G_AUDIT.md` (R-F1) for the logged
-`KITE_TERMINAL_LOGIN_STATE_ECHO=cookie-only` fallback.
+confirmed with a real login. There is **no fallback**: the former
+`KITE_TERMINAL_LOGIN_STATE_ECHO=cookie-only` switch is ignored (logged as an
+error). If the first real login is refused with `?login_error=1`, stop and
+follow `docs/DMB_KITE_OPERATIONAL_RUNBOOK.md` §1.6 (R-F1 verification).
 
 ## What the app enforces (PK-18)
 

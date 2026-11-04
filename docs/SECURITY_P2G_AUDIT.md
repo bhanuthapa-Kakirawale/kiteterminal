@@ -52,7 +52,11 @@ A forced `/callback?request_token=<attacker's>` used to replace the user's Kite 
 
 **Tests** (`tests/test_security_p2g.py`): login sends the state in `redirect_params`; own login completes once; replay refused (same and other browser); **forced callback inside the user's pending login refused, with no echo and with a guessed echo** (the old residual); echo without the browser's cookie refused; a new login supersedes a stale one; an echo of another value refused; expired state refused; cancel consumes; only one pending login; the downgrade below is explicit and logged.
 
-**Limitation (honest).** Whether Kite actually echoes `redirect_params` can only be observed with a real Kite login, which this sprint does not perform. If the first real login returns to `/?login_error=1` and the log says *"Kite callback refused: not the pending login started from this browser"*, inspect the callback URL. If `kt_state` is absent, set `KITE_TERMINAL_LOGIN_STATE_ECHO=cookie-only`. That is an explicit, logged downgrade (a WARNING on every callback) to the F1 cookie-only binding, i.e. back to the documented R-F1 residual. It is never silent. **Required before real use:** one real login confirming the echo, recorded in the runbook.
+**Limitation (honest).** Whether Kite actually echoes `redirect_params` can only be observed with a real Kite login, which no sprint has performed. Zerodha's documentation says the value "will be sent back to the redirect URL"; a Zerodha developer-forum answer (2019) shows the observed form: the decoded pairs appended as ordinary query parameters (`…?request_token=…&action=login&status=success&user_id=abcd`), which is exactly what `/callback` reads (`kt_state`). That is documentary, not observed. **Required before real use:** one user-operated real login confirming the echo (`docs/DMB_KITE_OPERATIONAL_RUNBOOK.md` §1.6), recorded in the runbook.
+
+**No downgrade (sprint of 2026-11-04).** The earlier `KITE_TERMINAL_LOGIN_STATE_ECHO=cookie-only` fallback was removed on the owner's instruction: the setting is ignored and reported as an error, and a callback without the echoed state never completes (`test_there_is_no_cookie_only_downgrade`). If a real login shows that Kite does not echo the state, the login keeps failing closed and real-account operation stays NO-GO until a secure, documented alternative is verified.
+
+**Logs.** The callback query string reaches the uvicorn access log. `request_token` was already redacted; `kt_state` (and the `kt_token`, `kt_session`, `kt_login_state` names) are now redacted too (`test_the_callback_access_log_line_carries_no_login_secret`). The state is single-use and consumed before the log line is written, so its earlier exposure there was low-impact, but it was a login secret in a log.
 
 ### R-F2 — Sensitive reads
 
@@ -123,7 +127,8 @@ The every-mutating-route sweep gained a fourth case, cookie without token.
 
 ## 4. Remaining limitations
 
-1. **R-F1 real-login confirmation** (above). Until done, real-terminal login is unproven, and the fallback is the logged `cookie-only` downgrade.
+1. **R-F1 real-login confirmation** (above). Until done, real-terminal login is unproven. There is no fallback (removed 2026-11-04).
+8. **No absolute credential lifetime (2026-11-04 review, Low, unresolved).** The terminal credential lives until logout, a new login or a restart; it does not expire with the Kite session's day. Broker calls stop when the Kite session goes stale (`NO_SESSION`/`SESSION_EXPIRED`), but app-database reads and some writes remain available to the holder of both factors. A stolen pair would therefore stay useful longer than a day. Mitigation today: log out at the end of the day, or restart the terminal. A fix needs an expiry that also closes open WebSockets (R-F4 closes them only on revoke), so it was not changed in a readiness sprint.
 2. **Same-user malware, extensions, admin/debugger, local packet capture** (R-F3 residual above). Outside any local web app's boundary.
 3. **XSS on the terminal origin would expose the terminal token** (still not the cookie). Mitigated by the strict CSP; no XSS is known.
 4. **Fragment in history** until the page replaces it (same-user data).

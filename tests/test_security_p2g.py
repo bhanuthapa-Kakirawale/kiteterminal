@@ -184,17 +184,34 @@ def test_only_one_login_is_pending_at_a_time(env):
     assert [security.consume_login_state(t, t, now=1010.0) for t in tokens] == [False] * 4 + [True]
 
 
-def test_the_cookie_only_downgrade_is_explicit_and_logged(exchanges, monkeypatch, caplog):
-    """If a real Kite login shows the parameter is not echoed, the operator may fall back to the
-    earlier cookie-only binding - explicitly, never silently."""
+def test_there_is_no_cookie_only_downgrade(exchanges, monkeypatch, caplog):
+    """Owner decision (2026-11-04): no cookie-only fallback for R-F1. The former switch is ignored
+    and reported; a callback that does not echo this browser's state never completes."""
     from backend import security
-    monkeypatch.setenv(security.LOGIN_STATE_ECHO_ENV, "cookie-only")
-    browser = _browser()
-    start_kite_login(browser)
-    with caplog.at_level(logging.WARNING, logger="backend.security"):
-        assert browser.get(CALLBACK, follow_redirects=False).headers["location"].startswith("/#kt_token=")
-    assert "R-F1 downgrade" in caplog.text
-    assert _browser().get(CALLBACK, follow_redirects=False).headers["location"] == "/?login_error=1"
+    for value in ("cookie-only", "COOKIE-ONLY", "off", "optional"):
+        monkeypatch.setenv(security.LOGIN_STATE_ECHO_ENV, value)
+        caplog.clear()
+        browser = _browser()
+        start_kite_login(browser)
+        with caplog.at_level(logging.WARNING, logger="backend.security"):
+            assert browser.get(CALLBACK, follow_redirects=False).headers["location"] == "/?login_error=1"
+        assert "is not supported and is ignored" in caplog.text
+        assert security.terminal_credential_valid(browser.cookies.get(security.CREDENTIAL_COOKIE)) is False
+    assert not exchanges
+
+
+def test_the_callback_access_log_line_carries_no_login_secret():
+    """uvicorn logs the full callback path; the request token and the echoed login state are redacted."""
+    from backend import redaction
+    state, token = "Zq3-STATEvalue_0123456789abcdef", "reqTOKENabcdef123456"
+    record = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                               ("127.0.0.1:5000", "GET",
+                                f"/callback?action=login&status=success&request_token={token}&kt_state={state}",
+                                "1.1", 307), None)
+    redaction.SecretRedactingFilter().filter(record)
+    line = record.getMessage()
+    assert state not in line and token not in line and line.count("[REDACTED]") == 2, line
+    assert redaction.redact_text(f"/#kt_token={state}") == "/#kt_token=[REDACTED]"
 
 
 # ============================================================ R-F2 sensitive reads
