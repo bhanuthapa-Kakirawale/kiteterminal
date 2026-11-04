@@ -1,5 +1,12 @@
 # First Live Trade — Protocol
 
+> **Superseded decision (2026-11-04): NO-GO.** Do **not** follow this protocol now.
+> `docs/DMB_KITE_OPERATIONAL_RUNBOOK.md` §7.1–§7.2: real login (R-F1) is unconfirmed
+> and the terminal's broker write path (orders, GTT, Emergency Exit) has never been
+> validated by any non-executing, broker-approved method. This document is kept as
+> the procedure to revisit only after those conditions are met and the owner
+> explicitly approves.
+
 This is the manual procedure for the **first real (LIVE) order** placed through
 Kite Terminal, after LIVE-0. Read it end to end before starting.
 
