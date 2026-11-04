@@ -1,6 +1,6 @@
 # DMB → Kite: operational runbook
 
-**Status (2026-11-04).** Software readiness work is complete for synthetic integration and FakeKite operation. **Real-data handoff is BLOCKED** (source rights, `docs/DMB_KITE_SOURCE_RIGHTS_MATRIX.md` §5). **Real login is unconfirmed** (R-F1 needs one user-operated login, §1.6). **Live broker execution is NO-GO**: the real broker write path, including GTT and Emergency Exit, has never been validated, and no non-executing, broker-approved method can validate the terminal's actual order path (§7.2). Decisions: §7.
+**Status (2026-11-04).** Software readiness work is complete for synthetic integration and FakeKite operation. **Real-data handoff is BLOCKED** (source rights, `docs/DMB_KITE_SOURCE_RIGHTS_MATRIX.md` §5). **Real login is confirmed** (R-F1 verified by the owner's read-only login on 2026-11-04, §1.6). **Live broker execution is NO-GO**: the real broker write path, including GTT and Emergency Exit, has never been validated, and no non-executing, broker-approved method can validate the terminal's actual order path (§7.2). Decisions: §7.
 
 This runbook changes no operating decision. It records how to run, restart, exit and recover, and what has and has not been tested.
 
@@ -14,7 +14,7 @@ This runbook changes no operating decision. It records how to run, restart, exit
 | Positions broker / fill display | yes | yes (paper broker) | **not tested** |
 | Post-claim tampering audit | yes | yes | **not tested** |
 | Restart / logout / fresh login, credential invalidation | yes | yes (real process restart) | **not tested** (real Kite login) |
-| P2-G R-F1 login binding (state via `redirect_params`; no cookie-only fallback since 2026-11-04) | yes | n/a | **one user-operated real login needed to confirm Kite echoes it (§1.6)** |
+| P2-G R-F1 login binding (state via `redirect_params`; no cookie-only fallback since 2026-11-04) | yes | n/a | **confirmed 2026-11-04** (owner's read-only login, §1.6) |
 | P2-G R-F2 / R-F3 / R-F4 (reads, port isolation, WS revocation) | yes | yes (incl. a real second server on another port) | n/a |
 | Session expiry: absolute lifetime + inactivity timeout, WS closed at expiry (2026-11-04) | yes (26 tests, mutation-checked) | browser runners unaffected | n/a |
 | Read-only broker switch `KITE_TERMINAL_BROKER_WRITES=disabled` (2026-11-04) | yes (every write refused before any request) | — | **to be used in §1.6** |
@@ -76,7 +76,7 @@ Preconditions: a trading day or not, it does not matter (no order is involved). 
 
 | Date | Operator | `broker_writes=DISABLED` shown? | Landed on dashboard? | `kt_state` present on callback? | Logout locked? | Restart locked? | Expiry locked? (optional) | `broker_write.refused` lines? | Notes |
 |---|---|---|---|---|---|---|---|---|---|
-| — | — | — | not yet performed | — | — | — | — | — | — |
+| 2026-11-04 15:53–16:48 IST | account owner | **yes** (every start) | **yes** (logins from 16:19 succeeded) | **yes**: implied, because the callback completes only with the echoed state and there is no fallback; 0 "callback refused" lines | **yes** | **yes** (a logout attempt right after the restart was refused, 401) | expiry event logged 16:41 (`SESSION_IDLE_TIMEOUT`); on-screen lock not reported | **0** | First 4 attempts (15:55–15:59) failed at the **token exchange**, not the R-F1 check: `ProxyError ... Unable to connect to proxy` (the NET-1 REST proxy was unreachable). They succeeded once it was. Outside §1.6: two launcher starts with a remote bind (16:11 `10.77.0.2`, 16:18 `10.77.0.1`, which failed to start); the only 2 requests came from `10.77.0.2` and the Host guard refused both, with no login in that window. |
 
 ## 2. Restart and login behaviour (verified)
 
@@ -164,7 +164,7 @@ Tested with FakeKite and scratch databases (`tests/test_emergency_exit_restart.p
 | 3 | DMB → Kite synthetic handoff | **GO** | Acceptance and browser runners in the isolated test profile (§8.1) |
 | 4 | DMB → Kite real-data handoff | **NO-GO** | No source permitted for cross-app transfer; `RIGHTS_BLOCKED` / `RIGHTS_NOT_APPROVED` |
 | 5 | Kite Terminal local operation with FakeKite | **GO** | Full suite, P2-G, P1-D/E/F, restart / logout / Emergency Exit scenarios (§8.1) |
-| 6 | Kite Terminal real login and read-only operation | **NO-GO until §1.6 passes** | R-F1 echo never observed; no fallback |
+| 6 | Kite Terminal real login and read-only operation | **GO, limited (2026-11-04)** | §1.6 passed: R-F1 confirmed, logout and restart lock. DRY RUN only, LIVE not armed, bind 127.0.0.1 only; `KITE_TERMINAL_BROKER_WRITES=disabled` recommended until a real-broker validation is authorized; the NET-1 proxy route must be up before login |
 | 7 | Kite Terminal live order execution | **NO-GO** | Broker write path unvalidated (§7.2) |
 | 8 | One manually initiated live trade through Kite Terminal | **NO-GO** | Follows from 6 and 7 (§7.2) |
 
@@ -174,7 +174,7 @@ Tested with FakeKite and scratch databases (`tests/test_emergency_exit_restart.p
 
 | Condition | Status | Evidence / blocker |
 |---|---|---|
-| Secure real login and R-F1 state verification | **Not met** | §1.6 not performed; no fallback |
+| Secure real login and R-F1 state verification | **Met (2026-11-04)** | §1.6 record: owner's read-only login; logout and restart locked; 0 broker writes attempted |
 | Authentication, session revocation, session expiry, WebSocket protections | Met (FakeKite) | `test_security_p2g.py`, `test_session_expiry.py`, P1-F sweeps, browser runners |
 | Data source authorized for the use | Met for Kite Connect quotes shown to the account holder; **not met** for any DMB data | Matrix §5.2 |
 | Instrument identity, exchange, segment, calendar | Met (FakeKite) | Instrument cache tests; calendar parity; market-session gate models regular sessions only |

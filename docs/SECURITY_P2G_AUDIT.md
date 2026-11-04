@@ -9,7 +9,7 @@
 | Finding | Severity (before) | Status | Evidence |
 |---|---|---|---|
 | F1 — login CSRF on `/callback` | Medium | **Fixed, re-verified** | `tests/test_security_p2g.py` (F1 tests), unchanged negative assertions |
-| R-F1 — callback accepted while the app's own login is pending | Low | **Fixed in code; one real-login confirmation outstanding** | 9 tests; protocol per Kite Connect docs |
+| R-F1 — callback accepted while the app's own login is pending | Low | **Fixed; confirmed with a real login (2026-11-04)** | 9 tests; protocol per Kite Connect docs; the owner's read-only login completed (runbook §1.6 record) |
 | R-F2 — sensitive reads relied on Host checks | Medium | **Fixed** | route-inventory sweep (53 sensitive GET routes), Origin / Fetch-Metadata / CORS tests, browser checks |
 | R-F3 — credential cookie shared across ports on 127.0.0.1 | Medium | **Mitigated: the cookie is no longer sufficient; residual documented** | backend tests + a real second server in headless Edge |
 | R-F4 — price WebSocket survives logout | Low | **Fixed** | 5 backend tests + a browser check |
@@ -129,7 +129,7 @@ The every-mutating-route sweep gained a fourth case, cookie without token.
 
 ## 4. Remaining limitations
 
-1. **R-F1 real-login confirmation** (above). Until done, real-terminal login is unproven. There is no fallback (removed 2026-11-04).
+1. **R-F1 real-login confirmation: DONE (2026-11-04).** The owner's read-only login completed, so Kite returned `kt_state` (the callback completes only with the echoed state, and there is no fallback, removed 2026-11-04). Logout and restart locked the terminal (runbook §1.6 record).
 8. **No absolute credential lifetime: CLOSED (2026-11-04).** Found in the 2026-11-04 review (Low): the credential lived until logout, a new login or a restart. Fixed as described in "Session expiry" below. Residual: the absolute lifetime is counted from the login, not tied to the Kite session's own end (Kite access tokens expire around 06:00 IST the next day); with the 8-hour default and 12-hour cap the credential cannot outlive a session started after 18:00 by more than a few hours, and broker calls stop at Kite's expiry anyway (`NO_SESSION`).
 2. **Same-user malware, extensions, admin/debugger, local packet capture** (R-F3 residual above). Outside any local web app's boundary.
 3. **XSS on the terminal origin would expose the terminal token** (still not the cookie). Mitigated by the strict CSP; no XSS is known.
