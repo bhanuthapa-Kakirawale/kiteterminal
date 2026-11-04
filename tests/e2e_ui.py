@@ -97,9 +97,12 @@ def main() -> None:
             if (datetime.fromisoformat(t["created_at"].replace(" ", "T")) + timedelta(hours=5, minutes=30))
             .date().isoformat() == today_ist)
         shown_blocked = sorted(s.strip() for s in page.locator("#ap-blocked .approval-card .ac-symbol").all_text_contents())
+        # ...and the backend blocks only the demo's designed cases, so a risk engine that started
+        # blocking other symbols fails here too (the UI-equals-backend comparison alone would not).
+        designed_blocks = {"TCS", "NEWLISTCO"}
         check("risk-blocked signals listed separately (exactly today's risk-rejected tickets)",
-              r.ok and shown_blocked == expected_blocked and "TCS" in shown_blocked,
-              f"shown={shown_blocked} expected={expected_blocked}")
+              r.ok and shown_blocked == expected_blocked and set(shown_blocked) == designed_blocks,
+              f"shown={shown_blocked} expected={expected_blocked} designed={sorted(designed_blocks)}")
         check("autopilot card shows pipeline", "You approve or reject" in page.inner_text("#autopilot-card"))
         page.screenshot(path=str(out / "02-approvals.png"), full_page=True)
 
