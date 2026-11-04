@@ -93,6 +93,11 @@ confirmed with a real login. There is **no fallback**: the former
 `KITE_TERMINAL_LOGIN_STATE_ECHO=cookie-only` switch is ignored (logged as an
 error). If the first real login is refused with `?login_error=1`, stop and
 follow `docs/DMB_KITE_OPERATIONAL_RUNBOOK.md` §1.6 (R-F1 verification).
+Session expiry (2026-11-04): a terminal session ends after
+`KITE_TERMINAL_SESSION_IDLE_MINUTES` without user activity (default 30) and at
+`KITE_TERMINAL_SESSION_ABSOLUTE_MINUTES` after its login (default 480),
+whichever comes first. The page then locks with the reason, and a fresh
+Zerodha login is needed (`docs/SECURITY_P2G_AUDIT.md`, "Session expiry").
 
 ## What the app enforces (PK-18)
 
@@ -130,6 +135,9 @@ All settings are environment variables, which can go in `.env`; see
 | `KITE_TERMINAL_PORT` | `8000` | Port (`--port`). |
 | `KITE_TERMINAL_ALLOW_REMOTE_BIND` | `0` | Must be `1` for any non-loopback bind. |
 | `KITE_TERMINAL_ALLOWED_HOSTS` | *(empty)* | Extra hostnames or IPs the browser may use, comma-separated. Wildcards are refused. |
+| `KITE_TERMINAL_SESSION_ABSOLUTE_MINUTES` | `480` | Absolute lifetime of a terminal session from its Zerodha login (max 720). Activity never extends it. Invalid values use the default. |
+| `KITE_TERMINAL_SESSION_IDLE_MINUTES` | `30` | Inactivity timeout (max 120, never above the absolute lifetime). Only user-driven requests count as activity. |
+| `KITE_TERMINAL_BROKER_WRITES` | `enabled` | `disabled` (or any value other than `enabled`) makes every Kite REST client read-only: login and reads work, and every order, GTT, cancel, modify, conversion or token-invalidation call is refused locally before anything is sent. Used for the read-only real-login verification (runbook §1.6). Shown in the startup "Security summary" as `broker_writes=`. |
 | `KITE_TERMINAL_TRUSTED_PROXY_IPS` | *(empty)* | IP addresses or networks of a TLS reverse proxy whose `X-Forwarded-Proto`/`-For` may be trusted. |
 | `KITE_TERMINAL_DEV_RELOAD` | `0` | Development only: restart on file changes (`--dev-reload`). |
 | `KITE_TERMINAL_WORKERS` | `1` | Must be 1. |
