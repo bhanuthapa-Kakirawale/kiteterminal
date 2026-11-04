@@ -13,6 +13,7 @@
 | R-F2 — sensitive reads relied on Host checks | Medium | **Fixed** | route-inventory sweep (53 sensitive GET routes), Origin / Fetch-Metadata / CORS tests, browser checks |
 | R-F3 — credential cookie shared across ports on 127.0.0.1 | Medium | **Mitigated: the cookie is no longer sufficient; residual documented** | backend tests + a real second server in headless Edge |
 | R-F4 — price WebSocket survives logout | Low | **Fixed** | 5 backend tests + a browser check |
+| §4 item 8 — no absolute credential lifetime (the R-F3 two-factor credential never expired) | Low | **Fixed (2026-11-04)**: absolute lifetime + inactivity timeout, enforced server-side on every check, revoking and closing sockets | `tests/test_session_expiry.py` (26 tests, mutation-checked) |
 
 **Security verdict:** the four findings are closed or mitigated with regression evidence; no finding is marked resolved without a test. The remaining limitations (§4) are inherent to a local browser application and are accepted risks, not open defects, **except** R-F1's real-login confirmation, which must be done on the first real login.
 
@@ -30,7 +31,8 @@
 | Credential | `TerminalCredentialGuard` | writes, WS, **and every non-public `/api/` read (new, R-F2)** | **Two factors (new, R-F3):** the `kt_session` cookie (HttpOnly, SameSite=Strict, host-only) **and** the terminal token (`X-Kite-Terminal-Token` header, or the `kt-token.<token>` WS subprotocol). Both held as SHA-256 digests in memory; restart forgets them, logout revokes them, a new login rotates them. |
 | Session | `require_kite`, `require_trading_account`, `require_inbox_session` | most API routes | An active, fresh Kite session and the trading account. |
 | Login | `GET /login` → Kite → `GET /callback` | top-level navigation | One pending, single-use, 10-minute state, cookie-bound **and** echoed by Kite (new, R-F1). |
-| WebSocket lifetime | `backend/routes/ws.py` | `/ws/ticks` | **New (R-F4):** closed with code 4401 when the credential is revoked or replaced. |
+| WebSocket lifetime | `backend/routes/ws.py` | `/ws/ticks` | **New (R-F4):** closed with code 4401 when the credential is revoked or replaced. **2026-11-04:** also at the credential's expiry (a per-socket deadline timer). |
+| Session expiry | `backend/security.py` (`_TerminalCredential`) | every credential check | **New (2026-11-04):** the credential dies at the earlier of an absolute lifetime (default 480 min, max 720) and an inactivity timeout (default 30 min, max 120); see "Session expiry" below. |
 
 ## 2. Findings and changes
 
@@ -128,13 +130,29 @@ The every-mutating-route sweep gained a fourth case, cookie without token.
 ## 4. Remaining limitations
 
 1. **R-F1 real-login confirmation** (above). Until done, real-terminal login is unproven. There is no fallback (removed 2026-11-04).
-8. **No absolute credential lifetime (2026-11-04 review, Low, unresolved).** The terminal credential lives until logout, a new login or a restart; it does not expire with the Kite session's day. Broker calls stop when the Kite session goes stale (`NO_SESSION`/`SESSION_EXPIRED`), but app-database reads and some writes remain available to the holder of both factors. A stolen pair would therefore stay useful longer than a day. Mitigation today: log out at the end of the day, or restart the terminal. A fix needs an expiry that also closes open WebSockets (R-F4 closes them only on revoke), so it was not changed in a readiness sprint.
+8. **No absolute credential lifetime: CLOSED (2026-11-04).** Found in the 2026-11-04 review (Low): the credential lived until logout, a new login or a restart. Fixed as described in "Session expiry" below. Residual: the absolute lifetime is counted from the login, not tied to the Kite session's own end (Kite access tokens expire around 06:00 IST the next day); with the 8-hour default and 12-hour cap the credential cannot outlive a session started after 18:00 by more than a few hours, and broker calls stop at Kite's expiry anyway (`NO_SESSION`).
 2. **Same-user malware, extensions, admin/debugger, local packet capture** (R-F3 residual above). Outside any local web app's boundary.
 3. **XSS on the terminal origin would expose the terminal token** (still not the cookie). Mitigated by the strict CSP; no XSS is known.
 4. **Fragment in history** until the page replaces it (same-user data).
 5. **Operator-visible change:** after restart or logout, account data is hidden until a fresh Zerodha login, and Emergency Exit already needed one. Kite web and the broker-side GTTs remain the fallback.
 6. **The `/api/tickets/{id}/chart` GET** caches a chart URL on first view. It is not an economic field and is now credential-gated like every read.
 7. **Real broker paths unvalidated:** every security test here uses FakeKite.
+
+## Session expiry (closes §4 item 8, 2026-11-04)
+
+| Property | Implementation |
+|---|---|
+| Absolute lifetime | `KITE_TERMINAL_SESSION_ABSOLUTE_MINUTES`, default **480** (8 h), capped at 720. Counted from the login that issued the credential. Nothing extends it: only a fresh Zerodha login (password + 2FA) issues a new credential with a new lifetime. |
+| Inactivity timeout | `KITE_TERMINAL_SESSION_IDLE_MINUTES`, default **30**, capped at 120, never more than the absolute lifetime. Only requests marked `X-Kite-Terminal-Activity: user` push it. `frontend/terminal_auth.js` adds the marker only within 60 s of a trusted keyboard, pointer, wheel or touch event, so background polling and streamed ticks never keep a session alive. The marker is not authentication. Anyone holding both factors could send it, which is why the absolute lifetime is the bound on a stolen credential. |
+| Settings | Read when a credential is issued, so a later change never lengthens a live session. A non-positive or non-integer value falls back to the default (never "no limit"); values above the cap are clamped. |
+| Enforcement | Every credential check enforces both deadlines on a monotonic clock: each protected read and write, the session check, the WebSocket handshake, and a once-per-second timer inside every open socket. An expired credential is revoked on the spot (digests cleared, generation bumped, listeners notified), so every socket opened under it closes with 4401, exactly as after a logout. |
+| Logout / restart | Unchanged: immediate revocation (logout) and an empty in-memory credential (restart). |
+| Cookie | `kt_session` now carries `Max-Age` = the absolute lifetime, so the browser also drops it; the server enforces regardless. |
+| User-facing behaviour | A refused request keeps `error_code: TERMINAL_SESSION_REQUIRED` (every client handles it as before) and adds `reason` (`SESSION_IDLE_TIMEOUT` / `SESSION_LIFETIME_EXCEEDED`) and a message naming the limit. `/api/session/status` returns `session_expired` and `session_expired_message`, but only to the browser whose own cookie expired. The page shows **"Log in to unlock this terminal"** with that reason, and a 60-second heartbeat locks an idle page without waiting for a click. |
+| Logs | `event=terminal_session.expired reason=...`; no secret (tested). |
+| Not changed | The Kite access token and LIVE arming are untouched by expiry, as by a restart. Server-side protective workers keep following live positions, and a new login disarms LIVE as before. |
+
+Tests (`tests/test_session_expiry.py`, 26): defaults; invalid, oversized and inconsistent settings; settings changed after login; idle expiry for reads and writes; background requests are not activity; user activity extends; heartbeat only with both factors; no revival after expiry; absolute expiry despite continuous activity; only a fresh login renews; an expired pair never works again; an expired session changes nothing; only the holder is told why; expiry logged without secrets; logout and restart; socket closed (4401) on idle and on absolute expiry; expired pair refused at the handshake; a socket follows the moving idle deadline. Four mutants were run: expiry disabled, activity extends the absolute deadline, every request counts as activity, no socket timer. Each one fails tests.
 
 ## 5. Test evidence (this sprint)
 

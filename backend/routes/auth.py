@@ -98,8 +98,8 @@ def session_status(request: Request):
     # SEC-1 P1-F + P2-G R-F3: whether THIS browser carries both factors of this launch's
     # credential (it does not after an app restart until the next Kite login). No value is
     # ever returned here.
-    authorized = security.request_authorized(request.cookies.get(security.CREDENTIAL_COOKIE),
-                                             request.headers.get(security.TOKEN_HEADER))
+    cookie = request.cookies.get(security.CREDENTIAL_COOKIE)
+    authorized = security.request_authorized(cookie, request.headers.get(security.TOKEN_HEADER))
     connected = row is not None and kite_client.is_session_fresh(row)
     return {
         "connected": connected,
@@ -107,6 +107,9 @@ def session_status(request: Request):
         "login_time": row["login_time"] if connected and authorized else None,
         "account_type": account["account_type"],
         "terminal_authorized": authorized,
+        # Session expiry: only the browser whose own credential timed out is told why it is locked.
+        "session_expired": security.credential_expired_reason(cookie),
+        "session_expired_message": security.credential_expired_message(cookie),
     }
 
 

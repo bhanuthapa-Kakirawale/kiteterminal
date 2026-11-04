@@ -47,6 +47,20 @@
     }
   }
 
+  // Session expiry: the server ends a session after its inactivity timeout, counting only requests
+  // marked as user activity. A request is marked only within ACTIVITY_WINDOW_MS of a real (trusted)
+  // keyboard, pointer, wheel or touch event, so background polling never keeps a session alive.
+  // The absolute lifetime is enforced by the server whatever this page does.
+  const ACTIVITY_HEADER = "X-Kite-Terminal-Activity";
+  const ACTIVITY_WINDOW_MS = 60000;
+  const HEARTBEAT_MS = 60000;
+  let lastUserInput = 0;
+  for (const type of ["keydown", "pointerdown", "pointermove", "wheel", "touchstart"]) {
+    window.addEventListener(type, (event) => {
+      if (event.isTrusted) lastUserInput = Date.now();
+    }, { capture: true, passive: true });
+  }
+
   const nativeFetch = window.fetch.bind(window);
   window.fetch = function (input, init) {
     const token = read();
@@ -54,9 +68,25 @@
     const options = Object.assign({}, init || {});
     const headers = new Headers(options.headers || (input instanceof Request ? input.headers : undefined));
     headers.set(HEADER, token);
+    if (Date.now() - lastUserInput < ACTIVITY_WINDOW_MS) headers.set(ACTIVITY_HEADER, "user");
     options.headers = headers;
     return nativeFetch(input, options);
   };
+
+  // Heartbeat: reports recent activity (a page can be in use without making requests) and notices
+  // a session that ended - by timeout, or a logout or login elsewhere - so the page locks itself
+  // with the server's reason instead of waiting for the next refused request.
+  setInterval(async () => {
+    if (!read()) return;
+    try {
+      const status = await (await window.fetch("/api/session/status")).json();
+      if (status && status.terminal_authorized === false) {
+        window.dispatchEvent(new CustomEvent("kt:terminal-locked", {
+          detail: { message: status.session_expired_message || null },
+        }));
+      }
+    } catch (e) { /* server unreachable: the price feed shows it */ }
+  }, HEARTBEAT_MS);
 
   // A download link (`<a href="/api/...csv" download>`) is a navigation, which cannot carry the
   // header: fetch it instead and save the response.

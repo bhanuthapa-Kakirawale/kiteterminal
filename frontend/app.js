@@ -30,7 +30,8 @@ async function fetchJson(url, wholeBody = false) {
     const body = await res.json();
     // P2-G R-F2: account data is readable only with this launch's credential.
     if (body?.detail?.error_code === "TERMINAL_SESSION_REQUIRED") {
-      showTerminalLocked();
+      // Session expiry: a timed-out session's refusal carries a reason, shown on the locked gate.
+      showTerminalLocked(body.detail.reason ? body.detail.message : null);
       throw new TerminalAuthorizationError(body.detail.message);
     }
     throw new SessionExpiredError(body.detail.message);
@@ -52,7 +53,8 @@ async function fetchJsonMutate(url, method, body) {
   if (res.status === 401) {
     const parsed = await res.json().catch(() => null);
     if (parsed?.detail?.error_code === "TERMINAL_SESSION_REQUIRED") {
-      showAuthorizeBanner(true);
+      if (parsed.detail.reason) showTerminalLocked(parsed.detail.message);   // session expiry
+      else showAuthorizeBanner(true);
       throw new TerminalAuthorizationError(parsed.detail.message);
     }
     throw new SessionExpiredError(parsed?.detail?.message || "Session expired");
@@ -201,6 +203,7 @@ const API = {
 const el = {
   connectGate: document.getElementById("connect-gate"),
   lockedGate: document.getElementById("terminal-locked-gate"),
+  lockedReason: document.getElementById("terminal-locked-reason"),
   unlockBtn: document.getElementById("unlock-btn"),
   authorizeBanner: document.getElementById("authorize-banner"),
   authorizeBtn: document.getElementById("authorize-btn"),
@@ -609,7 +612,8 @@ function showConnectGate() {
 
 // P2-G R-F2: Kite is connected but this browser holds no credential for this launch: nothing
 // account-related is shown, and the only action is the Zerodha login that issues a new one.
-function showTerminalLocked() {
+// `reason`: the server's message when this browser's session timed out (session expiry).
+function showTerminalLocked(reason = null) {
   // After a logout the connect gate is the right screen (no Kite session at all); a read that
   // was still in flight must not replace it.
   if (!el.connectGate.hidden) return;
@@ -618,6 +622,8 @@ function showTerminalLocked() {
   if (window.KTAuth) window.KTAuth.clear();
   wsIntentionallyClosed = true;
   if (ws) ws.close();
+  el.lockedReason.textContent = reason || "";
+  el.lockedReason.hidden = !reason;
   el.lockedGate.hidden = false;
   el.refreshBtn.hidden = true;
   el.connectionStatus.classList.remove("status-connected", "status-reconnecting");
@@ -3138,6 +3144,10 @@ function connectTickWs() {
       wsIntentionallyClosed = true;
       setFeedStatus(true);
       showAuthorizeBanner(true);
+      // Session expiry closes the socket the same way: then lock the page and say why.
+      API.status().then((s) => {
+        if (s.session_expired_message) showTerminalLocked(s.session_expired_message);
+      }).catch(() => {});
       return;
     }
     setFeedStatus(true);
@@ -6073,7 +6083,7 @@ async function init() {
     return;
   }
   if (!status.terminal_authorized) {
-    showTerminalLocked();
+    showTerminalLocked(status.session_expired_message);
     return;
   }
   showAuthorizeBanner(false);
@@ -6100,6 +6110,11 @@ el.connectBtn.addEventListener("click", () => { location.href = "/login"; });
 el.reconnectBtn.addEventListener("click", () => { location.href = "/login"; });
 el.authorizeBtn.addEventListener("click", () => { location.href = "/login"; });
 el.unlockBtn.addEventListener("click", () => { location.href = "/login"; });
+// Session expiry: terminal_auth.js's heartbeat found this browser's session ended.
+window.addEventListener("kt:terminal-locked", (event) => {
+  if (state.terminalAuthorized === false) return;
+  showTerminalLocked(event.detail?.message || null);
+});
 el.refreshBtn.addEventListener("click", () => {
   loadDashboard();
   refreshTicketViews();

@@ -16,6 +16,24 @@ router = APIRouter()
 _OVERFLOW_CLOSE_CODE = 1013
 
 
+# Session expiry: how often an open socket re-checks its credential's deadlines at most. Expiry
+# revokes the credential, and the revocation closes the socket (4401) like a logout.
+_EXPIRY_CHECK_MAX_SECONDS = 1.0
+
+
+async def _until_expired() -> None:
+    """Returns once the credential is gone (expired here, or revoked elsewhere). The inactivity
+    deadline can move while the socket is open, so the remaining time is re-read on every pass."""
+    while True:
+        remaining = security.credential_seconds_remaining()
+        if remaining is None:
+            return
+        if remaining <= 0:
+            security.expire_terminal_credential_if_due()
+            return
+        await asyncio.sleep(min(remaining, _EXPIRY_CHECK_MAX_SECONDS))
+
+
 async def _until_disconnect(websocket: WebSocket):
     """Returns the close code once the client disconnects — or the server
     closes the socket on shutdown. Anything the client sends is ignored."""
@@ -64,6 +82,8 @@ async def _serve_ticks(websocket: WebSocket, revoked: asyncio.Event):
     # Ctrl+C then force-quit it mid-await.
     disconnected = asyncio.ensure_future(_until_disconnect(websocket))
     revocation = asyncio.ensure_future(revoked.wait())
+    # Session expiry: at the credential's deadline it is revoked, which sets `revoked` above.
+    expiry = asyncio.ensure_future(_until_expired())
     try:
         while True:
             next_message = asyncio.ensure_future(queue.get())
@@ -76,7 +96,8 @@ async def _serve_ticks(websocket: WebSocket, revoked: asyncio.Event):
                 logger.info("Tick WS client disconnected: code=%s", disconnected.result())
                 break
             if revocation.done():
-                # Logout, restart-equivalent revoke or a new login: nothing more is sent on this socket.
+                # Logout, expiry, restart-equivalent revoke or a new login: nothing more is sent on
+                # this socket.
                 if next_message.done():
                     next_message.exception()
                 else:
@@ -99,4 +120,5 @@ async def _serve_ticks(websocket: WebSocket, revoked: asyncio.Event):
     finally:
         disconnected.cancel()
         revocation.cancel()
+        expiry.cancel()
         ticker_manager.remove_listener(queue)

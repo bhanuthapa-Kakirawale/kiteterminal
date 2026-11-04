@@ -381,6 +381,69 @@ WS_SUBPROTOCOL = "kt.v1"
 WS_TOKEN_PREFIX = "kt-token."
 WS_REVOKED_CLOSE_CODE = 4401
 
+# ---- session expiry (P2-G audit §4 item 8, closed 2026-11-04) --------------------------------
+#
+# A credential used to live until logout, a new login or a restart. Now it also dies, server-side,
+# at the EARLIER of:
+# - its absolute lifetime, counted from the login that issued it. Activity never extends it: the
+#   only way past it is a fresh Zerodha login (password and 2FA), which issues a new credential;
+# - its inactivity timeout: no USER activity for that long. Background polling and streamed ticks
+#   are not activity, otherwise an open tab would keep the session alive forever. A request counts
+#   only when the page marks it with `X-Kite-Terminal-Activity: user`, which frontend/
+#   terminal_auth.js adds only shortly after a real (trusted) keyboard, pointer or wheel event. An
+#   unmarked request is still checked, it just does not extend the session. The marker is not
+#   authentication: anyone holding both factors could send it to keep a session alive, which is
+#   why the absolute lifetime, not the inactivity timeout, is the bound on a stolen credential.
+# Every check of the credential (each protected request, the WebSocket handshake, and a timer in
+# each open WebSocket) enforces both deadlines; an expired credential is revoked on the spot, which
+# closes every socket opened under it (4401) exactly as a logout does. Settings are read when a
+# credential is issued, so changing them never lengthens a live session. Invalid values fall back to
+# the defaults; values above the caps are clamped; the inactivity timeout never exceeds the
+# absolute lifetime. Deadlines use a monotonic clock: changing the system clock moves none of them.
+SESSION_ABSOLUTE_ENV = "KITE_TERMINAL_SESSION_ABSOLUTE_MINUTES"
+SESSION_IDLE_ENV = "KITE_TERMINAL_SESSION_IDLE_MINUTES"
+DEFAULT_SESSION_ABSOLUTE_MINUTES = 480     # 8 h: one trading day of supervised use
+DEFAULT_SESSION_IDLE_MINUTES = 30
+MAX_SESSION_ABSOLUTE_MINUTES = 720         # 12 h: always well inside one Kite session day
+MAX_SESSION_IDLE_MINUTES = 120
+ACTIVITY_HEADER = "x-kite-terminal-activity"
+ACTIVITY_HEADER_VALUE = "user"
+EXPIRED_IDLE = "SESSION_IDLE_TIMEOUT"
+EXPIRED_ABSOLUTE = "SESSION_LIFETIME_EXCEEDED"
+_EXPIRED_MESSAGES = {
+    EXPIRED_IDLE: "Your terminal session expired after {minutes} minutes without activity. Log in to "
+                  "Zerodha again from this browser. Nothing was changed.",
+    EXPIRED_ABSOLUTE: "Your terminal session reached its {minutes}-minute limit. Log in to Zerodha again "
+                      "from this browser. Nothing was changed.",
+}
+_clock = time.monotonic
+
+
+def _minutes_setting(env: str, default: int, cap: int) -> int:
+    raw = os.environ.get(env, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        logger.error("%s=%r is not a positive whole number of minutes; using the default %d",
+                     env, raw[:20], default)
+        return default
+    if value > cap:
+        logger.warning("%s=%d exceeds the maximum %d minutes; using %d", env, value, cap, cap)
+        return cap
+    return value
+
+
+def session_timeouts() -> tuple[int, int]:
+    """(absolute lifetime, inactivity timeout) in minutes, as a credential issued now gets them."""
+    absolute = _minutes_setting(SESSION_ABSOLUTE_ENV, DEFAULT_SESSION_ABSOLUTE_MINUTES,
+                                MAX_SESSION_ABSOLUTE_MINUTES)
+    idle = _minutes_setting(SESSION_IDLE_ENV, DEFAULT_SESSION_IDLE_MINUTES, MAX_SESSION_IDLE_MINUTES)
+    return absolute, min(idle, absolute)
+
 
 def _digest(value: str | None) -> bytes | None:
     if not value:
@@ -395,6 +458,13 @@ class _TerminalCredential:
     def __init__(self) -> None:
         self._digest: bytes | None = None          # the cookie
         self._token_digest: bytes | None = None    # the port-isolated terminal token
+        self._issued_at = 0.0                      # monotonic seconds
+        self._last_activity = 0.0
+        self._absolute_seconds = 0.0
+        self._idle_seconds = 0.0
+        # The cookie digest of the last credential that EXPIRED, why, and the limit in minutes: only
+        # so the browser that held it can be told its session timed out. Never accepted for anything.
+        self._expired: tuple[bytes, str, int] | None = None
         self._generation = 0
         self._listeners: set = set()
         self._lock = threading.Lock()
@@ -404,9 +474,14 @@ class _TerminalCredential:
         from backend.redaction import register_secret
         register_secret(token)
         register_secret(terminal_token)
+        absolute, idle = session_timeouts()
+        now = _clock()
         with self._lock:
             self._digest = _digest(token)
             self._token_digest = _digest(terminal_token)
+            self._issued_at = self._last_activity = now
+            self._absolute_seconds, self._idle_seconds = absolute * 60.0, idle * 60.0
+            self._expired = None
             self._generation += 1
         self._notify()
         return token, terminal_token
@@ -414,8 +489,56 @@ class _TerminalCredential:
     def revoke(self) -> None:
         with self._lock:
             self._digest = self._token_digest = None
+            self._expired = None
             self._generation += 1
         self._notify()
+
+    def _due_locked(self, now: float) -> str | None:
+        if self._digest is None:
+            return None
+        if now >= self._issued_at + self._absolute_seconds:
+            return EXPIRED_ABSOLUTE
+        if now >= self._last_activity + self._idle_seconds:
+            return EXPIRED_IDLE
+        return None
+
+    def expire_if_due(self) -> str | None:
+        """Revokes the credential if a deadline has passed (closing its sockets); returns why."""
+        with self._lock:
+            reason = self._due_locked(_clock())
+            if reason is None:
+                return None
+            limit = self._absolute_seconds if reason == EXPIRED_ABSOLUTE else self._idle_seconds
+            self._expired = (self._digest, reason, round(limit / 60))
+            self._digest = self._token_digest = None
+            self._generation += 1
+        logger.warning("event=terminal_session.expired reason=%s: the credential is revoked; "
+                       "a fresh Zerodha login is required", reason)
+        self._notify()
+        return reason
+
+    def touch(self) -> None:
+        """User activity: pushes the inactivity deadline, never the absolute one."""
+        with self._lock:
+            now = _clock()
+            if self._due_locked(now) is None and self._digest is not None:
+                self._last_activity = max(self._last_activity, now)
+
+    def seconds_remaining(self) -> float | None:
+        """Seconds until the earlier deadline, or None when no credential is issued."""
+        with self._lock:
+            if self._digest is None:
+                return None
+            deadline = min(self._issued_at + self._absolute_seconds, self._last_activity + self._idle_seconds)
+            return deadline - _clock()
+
+    def expired_info(self, presented: str | None) -> tuple[str, int] | None:
+        candidate = _digest(presented)
+        with self._lock:
+            expired = self._expired
+        if candidate is None or expired is None or not hmac.compare_digest(candidate, expired[0]):
+            return None
+        return expired[1], expired[2]
 
     @staticmethod
     def _matches(expected: bytes | None, presented: str | None) -> bool:
@@ -423,11 +546,13 @@ class _TerminalCredential:
         return expected is not None and candidate is not None and hmac.compare_digest(candidate, expected)
 
     def valid(self, presented: str | None) -> bool:
+        self.expire_if_due()
         with self._lock:
             expected = self._digest
         return self._matches(expected, presented)
 
     def token_valid(self, presented: str | None) -> bool:
+        self.expire_if_due()
         with self._lock:
             expected = self._token_digest
         return self._matches(expected, presented)
@@ -481,6 +606,36 @@ def terminal_token_valid(presented: str | None) -> bool:
     return _credential.token_valid(presented)
 
 
+def expire_terminal_credential_if_due() -> str | None:
+    """Revokes the credential when its absolute lifetime or inactivity timeout has passed."""
+    return _credential.expire_if_due()
+
+
+def record_user_activity() -> None:
+    _credential.touch()
+
+
+def credential_seconds_remaining() -> float | None:
+    return _credential.seconds_remaining()
+
+
+def credential_expired_reason(presented_cookie: str | None) -> str | None:
+    """EXPIRED_IDLE / EXPIRED_ABSOLUTE if `presented_cookie` belonged to the credential that last
+    expired (so that browser can be told why it is locked), else None."""
+    info = _credential.expired_info(presented_cookie)
+    return info[0] if info else None
+
+
+def credential_expired_message(presented_cookie: str | None) -> str | None:
+    """What to tell the browser whose credential expired, or None for any other caller."""
+    info = _credential.expired_info(presented_cookie)
+    return _EXPIRED_MESSAGES[info[0]].format(minutes=info[1]) if info else None
+
+
+def is_user_activity(scope) -> bool:
+    return _headers(scope).get(ACTIVITY_HEADER) == ACTIVITY_HEADER_VALUE
+
+
 def authorized_landing_url(terminal_token: str) -> str:
     """Where a completed login sends the browser: the UI, with the terminal token in the fragment."""
     return f"/#{TOKEN_FRAGMENT}={terminal_token}"
@@ -506,8 +661,10 @@ def request_authorized(cookie: str | None, token: str | None) -> bool:
 
 def set_credential_cookie(response, token: str, secure: bool) -> None:
     """HttpOnly (no script can read it), SameSite=Strict (never sent on a
-    cross-site request), whole-site path, Secure when served over https."""
-    response.set_cookie(CREDENTIAL_COOKIE, token, httponly=True, samesite="strict", path="/", secure=secure)
+    cross-site request), whole-site path, Secure when served over https. Max-Age is the absolute
+    session lifetime, so the browser drops it then too; the server enforces it regardless."""
+    response.set_cookie(CREDENTIAL_COOKIE, token, max_age=session_timeouts()[0] * 60, httponly=True,
+                        samesite="strict", path="/", secure=secure)
 
 
 def clear_credential_cookie(response, secure: bool) -> None:
@@ -576,10 +733,29 @@ def credential_rejection_reason(scope) -> str | None:
     return None
 
 
+def _credential_rejected_body(scope) -> bytes:
+    """The usual refusal; for the browser whose credential just timed out, also why (the error code
+    stays TERMINAL_SESSION_REQUIRED, so every client handles it as before)."""
+    cookie = request_cookie(scope, CREDENTIAL_COOKIE)
+    expired = credential_expired_reason(cookie)
+    if expired is None:
+        return _CREDENTIAL_REJECTED_BODY
+    return json.dumps({"detail": {"error_code": CREDENTIAL_ERROR_CODE, "reason": expired,
+                                  "message": credential_expired_message(cookie)}}).encode()
+
+
+def _note_activity(scope) -> None:
+    """A user-marked request carrying both current factors pushes the inactivity deadline. Public
+    reads are included (the page's session check doubles as its activity heartbeat)."""
+    if is_user_activity(scope) and request_authorized(request_cookie(scope, CREDENTIAL_COOKIE),
+                                                       _presented_token(scope)):
+        record_user_activity()
+
+
 class TerminalCredentialGuard:
     """Pure ASGI middleware, registered inside the Origin guard: a write or
     WebSocket handshake that passed the Host and Origin checks must also
-    carry this launch's terminal credential."""
+    carry this launch's terminal credential, and it must not have expired."""
 
     def __init__(self, app):
         self.app = app
@@ -589,6 +765,8 @@ class TerminalCredentialGuard:
             return await self.app(scope, receive, send)
         reason = credential_rejection_reason(scope)
         if reason is None:
+            if scope["type"] == "http":
+                _note_activity(scope)
             return await self.app(scope, receive, send)
 
         logger.warning("Credential guard blocked %s %s: %s",
@@ -596,7 +774,7 @@ class TerminalCredentialGuard:
         if scope["type"] == "websocket":
             await send({"type": "websocket.close", "code": 1008})
             return
-        await _send_json(send, 401, _CREDENTIAL_REJECTED_BODY)
+        await _send_json(send, 401, _credential_rejected_body(scope))
 
 
 # ---------------------------------------------------------------- login CSRF (P2-G)

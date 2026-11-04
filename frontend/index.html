@@ -119,7 +119,9 @@
     <p>The terminal was restarted, you logged out, or this browser has not logged in since. Account, position,
        order and research data stay hidden, and nothing can be changed (Emergency Exit included), until you log
        in to Zerodha again from this browser. Kite's own web interface and your broker-side GTT stop orders are
-       not affected.</p>
+       not affected. For safety a session also ends after a period without activity and at a fixed
+       maximum length.</p>
+    <p id="terminal-locked-reason" class="gate-reason" role="status" hidden></p>
     <button id="unlock-btn" class="btn btn-primary btn-lg">Log in to Zerodha</button>
   </div>
 

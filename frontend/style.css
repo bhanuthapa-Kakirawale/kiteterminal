@@ -289,6 +289,7 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 }
 .gate h1 { font-size: 22px; margin: 18px 0 8px; letter-spacing: -0.01em; }
 .gate p { color: var(--text-secondary); margin: 0 auto 22px; max-width: 420px; }
+.gate p.gate-reason { color: var(--text-primary); font-weight: 600; }
 
 .banner {
   margin: 12px 24px;
