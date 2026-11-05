@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kite Terminal Blueprint</title>
-<meta name="description" content="Architecture, security, network, order path, current GO/NO-GO status, training path, daily routine, document map and verification checklists for Kite Terminal. Last reviewed 4 November 2026.">
+<meta name="description" content="Architecture, security, network, order path, current GO/NO-GO status, training path, daily routine, document map and verification checklists for Kite Terminal. Last reviewed 5 November 2026.">
 <style>
 :root {
   --bg: #f7f6f2;
@@ -318,7 +318,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
 
 <!-- ================= HERO ================= -->
 <div class="hero" id="rules">
-  <div class="pill accent" style="white-space:normal">docs/KITE_TERMINAL_BLUEPRINT.html · last reviewed 4 November 2026 · branch feature/signal-detail-and-strategy-revision</div>
+  <div class="pill accent" style="white-space:normal">docs/KITE_TERMINAL_BLUEPRINT.html · last reviewed 5 November 2026 · branch feature/signal-detail-and-strategy-revision</div>
   <h1 style="margin-top:14px">How to learn, run and get the most out of Kite Terminal</h1>
   <p class="lede">
     Kite Terminal is a semi-automated trading assistant. It scans your NSE watchlist after the close,
@@ -327,8 +327,8 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
     gives you a training path, a daily routine, the doc to read for each job, what to verify, and how to use the app well.
   </p>
   <div class="callout bad">
-    <strong>Status, 4 November 2026: live execution is NO-GO.</strong>
-    Use the terminal in DRY RUN, with <code>KITE_TERMINAL_BROKER_WRITES=disabled</code>. The real broker order path has never been accepted by Zerodha and cannot be validated by any non-executing method today. See <a href="#status">Status</a>.
+    <strong>Status, 5 November 2026: live execution is NO-GO, and LIVE new entries are disabled in the code.</strong>
+    Use the terminal in DRY RUN, with <code>KITE_TERMINAL_BROKER_WRITES=disabled</code>. The frozen order path places the protective sell GTT for the full quantity as soon as Kite accepts an entry, before it fills, and a GTT acts on all of the account's holdings. Until a separately authorized fix (<code>docs/PROPOSAL_EXECUTION_GTT_AFTER_FILL.md</code>), every LIVE new entry is refused server-side (<code>LIVE_ENTRIES_DISABLED</code>) and LIVE cannot be armed. The real broker order path has also never been accepted by Zerodha. See <a href="#status">Status</a>.
   </div>
   <p class="small muted">Ticks on this page are saved only in this browser. The daily-routine ticks clear themselves each new day.</p>
 
@@ -356,7 +356,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
     <div class="stage"><div class="who auto">Automatic</div><h4>Strategy scan</h4><p>Momentum Breakout and Trend Pullback look for entries. Exit and breakeven checks run on open positions.</p></div>
     <div class="stage"><div class="who auto">Automatic</div><h4>Risk engine</h4><p>Runs six checks: R:R, capital per trade, stock and sector exposure, open positions, portfolio risk. Signals that fail go to "Blocked by risk".</p></div>
     <div class="stage you-stage"><div class="who you">You</div><h4>Approvals</h4><p>Open Signal Detail, read the evidence, then Approve and place, or Reject.</p></div>
-    <div class="stage"><div class="who auto">Automatic</div><h4>Execution</h4><p>Places a LIMIT or MARKET entry (or an AMO, with your consent). As soon as the broker accepts it, the app places the protective GTT. In Dry Run both are paper (<code>PAPER-O-…</code>, <code>PAPER-G-…</code>).</p></div>
+    <div class="stage"><div class="who auto">Automatic</div><h4>Execution</h4><p>Places a LIMIT or MARKET entry (or an AMO, with your consent). As soon as the broker accepts it, the app places the protective GTT, before any fill. In Dry Run both are paper (<code>PAPER-O-…</code>, <code>PAPER-G-…</code>). LIVE entries are disabled (see <a href="#status">Status</a>).</p></div>
     <div class="stage"><div class="who auto">Automatic · every 20–180 s</div><h4>Guard</h4><p>The order monitor checks every 20 s, the trailing stop every 45 s and reconciliation every 3 min.</p></div>
     <div class="stage"><div class="who auto">Automatic</div><h4>Journal</h4><p>A position closes only after the broker confirms the exit. Results land in the Journal, with Dry Run and Live kept separate.</p></div>
   </div>
@@ -385,7 +385,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
 <!-- ================= STATUS (reviewed 2026-11-04) ================= -->
 <section id="status">
   <div class="section-head">
-    <div class="kicker">Current status · last reviewed 4 November 2026</div>
+    <div class="kicker">Current status · last reviewed 5 November 2026</div>
     <h2>What is approved today, and what is not</h2>
     <p>Each mode has its own decision. A GO for one never implies a GO for another. The source of record is <code>DMB_KITE_OPERATIONAL_RUNBOOK.md</code> §7; this table repeats it and adds the 4 November order-path audit.</p>
   </div>
@@ -410,7 +410,8 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
         <tr><td>7</td><td>Kite dry-run operation (paper broker, real login)</td><td><span class="pill warn">GO, limited</span></td><td>Same conditions as 6. Paper orders never reach Kite (mode isolation, PK-20). Paper P&amp;L is gross of costs.</td></tr>
         <tr><td>8</td><td>Kite order-path validation with FakeKite / mocks</td><td><span class="pill ok">GO (validated)</span></td><td>The order-path assurance suite and the existing order, proxy and writes-switch suites pass (see <a href="#assurance">Assurance</a>). This validates the terminal's own logic only.</td></tr>
         <tr><td>9</td><td>Kite live broker order acceptance</td><td><span class="pill bad">NO-GO · UNVERIFIED</span></td><td>Real broker order acceptance remains unverified. Zerodha's sandbox supports LIMIT orders only (no GTT, margins or MARKET orders) and the terminal has no sandbox mode.</td></tr>
-        <tr><td>10</td><td>One manually initiated live trade through Kite Terminal</td><td><span class="pill bad">NO-GO</span></td><td>Follows from 9. Whether to trade through Zerodha's own Kite web or app is the owner's separate decision; this terminal makes no trade recommendation.</td></tr>
+        <tr><td>10</td><td>One manually initiated live trade through Kite Terminal</td><td><span class="pill bad">NO-GO · BLOCKED in code</span></td><td>Follows from 9 and 11. Whether to trade through Zerodha's own Kite web or app is the owner's separate decision; this terminal makes no trade recommendation.</td></tr>
+        <tr><td>11</td><td>LIVE new entries through Kite Terminal (any route)</td><td><span class="pill bad">BLOCKED</span></td><td>The protective GTT is placed for the full quantity on acceptance, before the fill (frozen <code>execution.py</code>). <code>backend/live_entry_gate.py</code> refuses every LIVE new entry: manual, strategy, Quick Action BUY and inbox. It is enforced before the claim, at the final gate, and immediately before the only <code>execute_ticket</code> call. Live Readiness <code>LIVE_ENTRY_GATE</code> is a blocker. Lifting it needs the separately authorized change in <code>PROPOSAL_EXECUTION_GTT_AFTER_FILL.md</code>. Exits, Emergency Exit and dry run are unaffected.</td></tr>
       </tbody>
     </table>
   </div>
@@ -422,9 +423,12 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
       <tbody>
         <tr><td>Real broker order, GTT, exit and Emergency Exit paths</td><td><span class="pill bad">BLOCKED</span></td><td>Never accepted by Zerodha from this terminal. Earlier live attempts (Sep 2026) were rejected with "No IPs configured for this app". Unblocking needs a separately authorized, supervised validation plan (runbook §7.2).</td></tr>
         <tr><td>Order REST through the GCP proxy</td><td><span class="pill warn">PARTIAL</span></td><td>Proven in code and on a recorded wire (same client, same proxy, sent once). Not proven on the real network, because no real order has been sent through the proxy.</td></tr>
-        <tr><td>Proxy is optional at Live Readiness</td><td><span class="pill warn">PARTIAL</span></td><td>With <code>KITE_REST_PROXY</code> unset, REST goes direct and Live Readiness shows only a WARN. Kite would then reject orders from the non-whitelisted IP (safe at the broker, but not refused locally). Making the proxy mandatory for LIVE is <span class="pill accent">PLANNED</span>, an owner decision.</td></tr>
-        <tr><td>Static IP check</td><td><span class="pill warn">PARTIAL</span></td><td>Kite does not expose the whitelisted IP. The check rests on your attestation, upgraded to VERIFIED only by a manual outbound-IP check through the proxy (observed <code>35.184.97.233</code> on 2026-11-04).</td></tr>
-        <tr><td>Available cash vs order value</td><td><span class="pill warn">PARTIAL</span></td><td>No local "order value ≤ available cash" check. Sizing is a % of portfolio value (holdings + cash from <code>margins()</code>); the absolute ₹ cap and Kite's RMS are the backstops. An RMS rejection is followed to the end and never becomes a position.</td></tr>
+        <tr><td>GTT placed before the entry fills (frozen <code>execution.py</code>)</td><td><span class="pill bad">BLOCKED</span></td><td>A sell GTT for the full quantity is live from acceptance. It protects nothing until a fill, and it could sell pre-existing holdings of the instrument. Not fixed (frozen file). LIVE entries are disabled (row 11). Fix proposed for separate authorization: create protection by the order monitor for confirmed filled quantity only (<code>PROPOSAL_EXECUTION_GTT_AFTER_FILL.md</code>). <span class="pill bad">UNVERIFIED with the broker</span>: whether Kite accepts a sell GTT before the holding exists, and what a triggered oversized leg does.</td></tr>
+        <tr><td>Honest protection states and alerts</td><td><span class="pill ok">IMPLEMENTED</span></td><td>PROTECTED only when an active GTT covers exactly the confirmed filled open quantity. <code>NOT_PROTECTED_PENDING_FILL</code> covers an accepted entry with nothing filled; <code>QUANTITY_EXCEEDS_POSITION</code> covers a GTT larger than what is held. The GTT's broker-observed status and quantity are shown next to the confirmed fill. Every filled entry's GTT is verified at the broker; a missing one is an URGENT finding and alert, never re-created or retried. Tested with FakeKite (<code>test_protection_states.py</code>).</td></tr>
+        <tr><td>Interim LIVE-entry guards (behind the disabled gate)</td><td><span class="pill ok">IMPLEMENTED</span> · interim</td><td>(1) Regular MARKET only: no LIVE LIMIT or AMO. This is secondary, since a MARKET order can still stay pending or fill partly. (2) No pre-existing sellable quantity of the instrument anywhere in the account: holdings incl. T1 and collateral, other exchange or ISIN, positions, open orders, active GTTs, other live app tickets. Fails closed on unavailable or inconsistent data. Not a fix. Tested with the gate lifted in-test (<code>test_presellable_guard.py</code>).</td></tr>
+        <tr><td>GCP proxy mandatory for LIVE</td><td><span class="pill ok">IMPLEMENTED</span></td><td>With <code>KITE_REST_PROXY</code> unset the REST client is direct and <b>read-only</b>: every broker write (orders, GTTs, cancels, order-margin calculation) is refused locally (<code>DirectRouteKiteConnect</code>), whoever calls it, Emergency Exit included. Live Readiness <code>KITE_REST_ROUTE</code> is a blocker, and a live entry is refused (<code>KITE_REST_PROXY_REQUIRED</code>). Dry run and reads keep working. Tested with the wire recorder and a mock proxy (<code>test_proxy_mandatory.py</code>).</td></tr>
+        <tr><td>Static IP / intended proxy endpoint</td><td><span class="pill warn">PARTIAL</span></td><td>Kite does not expose the whitelisted IP. Arming LIVE now needs an outbound-IP observation taken <b>through the configured proxy, by this process</b>, equal to the confirmed static IP. The proof is lost on restart or proxy change, so re-run the check. Your attestation alone no longer passes. The proof is functional (the IP Kite would see), not an identity check of the VM.</td></tr>
+        <tr><td>Margin preflight</td><td><span class="pill ok">IMPLEMENTED</span> · <span class="pill bad">UNVERIFIED with the broker</span></td><td>At the final gate, a fresh <code>margins("equity")</code> read and Kite's own <code>order_margins</code> calculation for the exact instrument, exchange, side, product, variety, type and quantity. Available = min(<code>live_balance</code>, net − collateral). Required = Kite's total (never below the CNC notional) + charges. Missing or inconsistent data refuses (<code>MARGIN_DATA_UNAVAILABLE</code>); insufficient funds refuse (<code>INSUFFICIENT_FUNDS</code>). Shown in the confirm dialog (<code>/api/tickets/{id}/margin-preview</code>). Field semantics follow Kite's docs and are not verified on a real account. Kite's RMS stays the final control.</td></tr>
         <tr><td>Kite Connect local storage of candles and quotes</td><td><span class="pill warn">PARTIAL</span></td><td>Terms ambiguous (rights matrix §5.2); ask Zerodha.</td></tr>
         <tr><td>Same-user malware, browser extensions, local packet capture</td><td>Accepted risk</td><td>Outside a local web app's boundary (SECURITY_P2G_AUDIT §4).</td></tr>
       </tbody>
@@ -528,7 +532,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
 
   <div class="callout warn">
     <strong>Fail closed, never direct</strong>
-    A malformed proxy setting refuses every broker route (<code>KITE_REST_PROXY_INVALID</code>, 503) and stops the launcher. An unreachable proxy raises; the call is never retried directly, and before an order it means nothing is placed (<code>RISK_REVALIDATION_UNAVAILABLE</code>). Environment variables (<code>HTTP(S)_PROXY</code>, <code>NO_PROXY</code>) cannot redirect the route (<code>trust_env</code> off). The one gap: with <code>KITE_REST_PROXY</code> unset the route is DIRECT by configuration and Live Readiness only warns (see <a href="#status">Status</a>).
+    A malformed proxy setting refuses every broker route (<code>KITE_REST_PROXY_INVALID</code>, 503) and stops the launcher. An unreachable proxy raises; the call is never retried directly, and before an order it means nothing is placed (<code>RISK_REVALIDATION_UNAVAILABLE</code>). Environment variables (<code>HTTP(S)_PROXY</code>, <code>NO_PROXY</code>) cannot redirect the route (<code>trust_env</code> off). With <code>KITE_REST_PROXY</code> unset, the REST route is direct and read-only: every broker write is refused inside the process and LIVE is blocked at Live Readiness (see <a href="#status">Status</a>). The KiteTicker WebSocket is a separate route and stays direct by design: it carries market data, never an order.
   </div>
 </section>
 
@@ -566,7 +570,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
   </div>
 
   <h3 style="margin:26px 0 10px">Acceptance is not a fill</h3>
-  <p>Kite's <code>place_order</code> returning an order id means only that the broker <b>accepted</b> the request. The ticket becomes <code>executed</code> with fill status <code>pending</code>, filled quantity 0 and no fill price. The protective GTT is placed right after acceptance, before any fill, so the position is never left unprotected; if the entry is later rejected or cancelled with nothing filled, the order monitor removes that GTT. Partial fills are recorded as the broker reports them; a full fill only on COMPLETE. An exit order makes the position EXITING; the position closes only when the broker reports the full quantity filled.</p>
+  <p>Kite's <code>place_order</code> returning an order id means only that the broker <b>accepted</b> the request. The ticket becomes <code>executed</code> with fill status <code>pending</code>, filled quantity 0 and no fill price. The frozen order path places the protective GTT right after acceptance, <b>before any fill</b>, for the full ticket quantity. Until the entry fills, that GTT protects nothing, and because a GTT acts on the account's holdings it could sell shares held outside this entry. The terminal therefore shows such a position as <code>NOT_PROTECTED_PENDING_FILL</code>, never PROTECTED, and LIVE entries are disabled until the fix is authorized. If the entry is later rejected or cancelled with nothing filled, the order monitor removes that GTT. A partial fill resizes it to the filled quantity, and every full fill verifies it at the broker. Partial fills are recorded as the broker reports them; a full fill only on COMPLETE. An exit order makes the position EXITING; the position closes only when the broker reports the full quantity filled.</p>
 
   <h3 style="margin:22px 0 10px">BUY, SELL and exit controls are deliberately different</h3>
   <p>The P1-D review, the trading lock, the daily limits, the circuit breaker and critical reconciliation findings can only refuse <b>adding</b> risk. Linked exits, Quick-Action sells and Emergency Exit are never held back by them, so you are never stuck in a position. Exits still pass their own checks: the position must be open, owned by no other exit, and hold exactly the exit's quantity (one exit owner per position, enforced by a unique index).</p>
@@ -576,7 +580,10 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
     <li><b>Route:</b> <code>POST /api/kill-switch/emergency-exit-confirm</code>. Needs a trading account, a current Kite session, the terminal credential and the CSRF header, plus the typed phrase <code>EXIT ALL</code>. After a restart or logout a fresh Kite login is required first.</li>
     <li><b>Scope:</b> LIVE open positions only, each in its own mode; a working entry is cancelled first. Best effort per position: one failure never stops the others, and a summary event is always written.</li>
     <li><b>Same path:</b> every exit runs through <code>confirm_and_execute_ticket</code>. With <code>KITE_TERMINAL_BROKER_WRITES=disabled</code> every sell is refused before any request (assurance 22b).</li>
-    <li><b>Status:</b> <span class="pill ok">IMPLEMENTED</span> and tested with FakeKite; <span class="pill bad">NOT VALIDATED</span> against Zerodha. MARKET exits are not covered by Zerodha's sandbox.</li>
+    <li><b>Never creates a GTT</b>, including for a position whose own GTT failed. It sells only the broker-confirmed open quantity and refuses an unknown one (<code>QUANTITY_UNKNOWN</code>).</li>
+    <li><b>Not an entry:</b> it is not held back by the LIVE-entry gate, LIVE not being armed, a stale P1-D review, the trading lock, the breaker, the interim guards or missing funds. A rejection is <code>failed</code>. A timeout or Kite session error is <code>exit_outcome_unknown</code>, sent once and never resubmitted.</li>
+    <li><b>No direct route:</b> with <code>KITE_REST_PROXY</code> unset its SELLs are refused locally (a definite failure, nothing sent) with a message to exit in Kite web or the Kite app. Entries whose outcome is UNKNOWN are listed in <code>not_exitable_unknown</code>, never silently left out.</li>
+    <li><b>Status:</b> <span class="pill ok">IMPLEMENTED</span> and tested with FakeKite (<code>test_emergency_exit_safety.py</code>); <span class="pill bad">NOT VALIDATED</span> against Zerodha. MARKET exits are not covered by Zerodha's sandbox.</li>
   </ul>
 
   <h3 style="margin:22px 0 10px">The read-only broker switch</h3>
@@ -632,7 +639,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
   </div>
 
   <h3 style="margin:22px 0 10px">Order-path assurance suite (<code>tests/test_order_path_assurance.py</code>, added 4 Nov 2026)</h3>
-  <p class="small muted">49 tests, all passing, plus a mutation check: breaking the read-only switch makes all four writes-disabled tests fail.</p>
+  <p class="small muted">50 tests, all passing, plus a mutation check: breaking the read-only switch makes all four writes-disabled tests fail. Since 5 Nov, test 22 expects the writes-disabled entry to be refused one step earlier, at the margin preflight (Kite's order-margin calculation is a POST, refused locally); 22a keeps the original end-to-end assertion.</p>
   <div class="table-wrap">
     <table>
       <thead><tr><th>Scenario</th><th>Tests</th><th>Proven (with FakeKite / wire)</th></tr></thead>
@@ -651,6 +658,23 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
         <tr><td>Reconciliation mismatch</td><td>20</td><td>Finding logged, position row unchanged, live entries blocked</td></tr>
         <tr><td>Session expiry between review and submission</td><td>21, 21b</td><td>401 and nothing sent; activity cannot extend the absolute lifetime</td></tr>
         <tr><td>Broker writes disabled, on the wire</td><td>22, 22b, 22c</td><td>Live confirm, Emergency Exit, GTT cancel and order cancel send only proxied GETs; the outcome is a definite rejection</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+<!-- assurance-remediation -->
+  <h3 style="margin:22px 0 10px">Final order-path remediation suites (added 5 Nov 2026)</h3>
+  <p class="small muted">FakeKite, wire recorder, mock proxy and scratch databases only. They validate the terminal's own logic, not Zerodha's behaviour. Full suite 2,858 passed, 3 skipped, 0 failed; 13 of 13 mutants killed; <code>e2e_ui --pin-clock</code> 56/56 (also with the seed backdated past 15:30 IST, the former 53/54 condition); <code>e2e_p1d</code> 13/13; <code>e2e_dmb_inbox</code> 42/42; acceptance 44/44 (runbook §8.3).</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>File</th><th>Proven (with FakeKite / wire / mock proxy)</th></tr></thead>
+      <tbody>
+        <tr><td><code>test_live_entry_gate.py</code></td><td>The source constant is False and cannot be lifted by env or settings. Manual, Quick Action and strategy LIVE entries are refused with nothing sent. Dry run, exits and Emergency Exit still work. The final gate refuses before any broker read. The backstop holds even if both orchestrators are skipped. Readiness blocks and arming is refused. <code>execute_ticket</code> has one caller, and only <code>execution.py</code> places orders or GTTs.</td></tr>
+        <tr><td><code>test_proxy_mandatory.py</code></td><td>Without a proxy, every write is refused locally (definite, nothing on the wire) while reads still work. Live confirm is refused and arming is blocked. Emergency Exit sends nothing and points to Kite. A malformed proxy refuses every route. An unreachable proxy refuses an entry with GETs only. A write through a refusing proxy is attempted once and never directly. The endpoint proof covers a match, another proxy, a restart, another IP and a failed check.</td></tr>
+        <tr><td><code>test_protection_states.py</code></td><td>An unfilled entry is never PROTECTED, and the broker-observed GTT is shown. A partial fill resizes the GTT; a failed resize is a mismatch. A full fill is verified. A triggered GTT counts as missing. A failed GTT is flagged and never retried, including on a fill straight to COMPLETE. Rejected and cancelled entries remove the GTT. An ambiguous entry is never resubmitted or given a GTT by itself.</td></tr>
+        <tr><td><code>test_presellable_guard.py</code></td><td>LIVE LIMIT and AMO are refused, while dry run is unaffected. Settled, T1, collateral, other-exchange or ISIN holdings, positions (long or short), open orders, active GTTs and app-owned positions all refuse. Unavailable or inconsistent data fails closed (15 cases).</td></tr>
+        <tr><td><code>test_margin_preflight.py</code></td><td>Kite's figure is used for the exact order. Insufficient funds, pledged collateral and charges are handled. Read failures, missing fields and inconsistent rows fail closed (17 cases). No derivatives model is guessed. The rupee cap still applies, dry run and exits make no margin call, and the preview endpoint works.</td></tr>
+        <tr><td><code>test_emergency_exit_safety.py</code></td><td>Refused on a previous-day Kite session, after logout, on idle expiry and after the absolute lifetime. Not blocked by any entry control. Never creates a GTT. Sells the confirmed quantity and refuses an unknown one. Rejection, timeout and session error, second click, and async reject or partial fill all have explicit outcomes. Critical states do not block it. UNKNOWN entries are reported.</td></tr>
       </tbody>
     </table>
   </div>
@@ -782,7 +806,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
         <h4>Read</h4>
         <p><code>TESTING.md</code> §2 (manual checklist) and §3 (regression policy). The condensed version is in <a href="#testing">Testing</a> below.</p>
         <ul class="checks">
-          <li><label><input type="checkbox" data-k="t5-1"><span>Run <code>pytest</code> once. On 4 Nov 2026 it reported 2,718 passed, 3 skipped (Windows symlink privilege), 0 failed.</span></label></li>
+          <li><label><input type="checkbox" data-k="t5-1"><span>Run <code>pytest</code> once. On 5 Nov 2026 it reported 2,858 passed, 3 skipped (Windows symlink privilege), 0 failed.</span></label></li>
           <li><label><input type="checkbox" data-k="t5-2"><span>Complete the environment, risk engine and manual ticket sections (TESTING §2.1–2.3).</span></label></li>
           <li><label><input type="checkbox" data-k="t5-3"><span>Complete the strategy scan and Signal Detail checks (§2.4). The chart values must match the Entry Conditions values exactly.</span></label></li>
           <li><label><input type="checkbox" data-k="t5-4"><span>Recalculate the Journal stats by hand for 5 trades (§2.6).</span></label></li>
@@ -1039,7 +1063,7 @@ footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--border
       <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>pip install -r requirements-dev.txt
 pytest</div>
       <ul class="checks">
-        <li><label><input type="checkbox" data-k="v-a1"><span><code>pytest</code> shows 0 failed. On 4 Nov 2026: 2,718 passed, 3 skipped (Windows symlink privilege), 0 failed. A lower count than the last run means tests were skipped or removed.</span></label></li>
+        <li><label><input type="checkbox" data-k="v-a1"><span><code>pytest</code> shows 0 failed. On 5 Nov 2026: 2,858 passed, 3 skipped (Windows symlink privilege), 0 failed. A lower count than the last run means tests were skipped or removed.</span></label></li>
         <li><label><input type="checkbox" data-k="v-a2"><span>E2E UI test against a <b>fresh</b> demo server passes, with no console errors.</span></label></li>
       </ul>
       <div class="cmd"><button class="icon-btn copy" type="button">Copy</button>.venv\Scripts\python.exe tests\demo_server.py --port 8765
@@ -1219,7 +1243,7 @@ copy backend\kite_terminal.db backend\kite_terminal.db.pre_&lt;work&gt;_bak</div
 </section>
 
 <footer>
-  Kite Terminal Blueprint · last reviewed 4 November 2026 against the code (order-path audit) and <code>USER_GUIDE.md</code>, <code>TESTING.md</code>, <code>FIRST_LIVE_TRADE.md</code>, <code>DEPLOYMENT.md</code>, <code>DESIGN.md</code>, <code>DMB_KITE_OPERATIONAL_RUNBOOK.md</code>, <code>DMB_KITE_SOURCE_RIGHTS_MATRIX.md</code>, <code>NET1_KITE_REST_PROXY_REPORT.md</code>, <code>SECURITY_P2G_AUDIT.md</code> and the LIVE-0 / PK-0…PK-26 / SEC-1 reports.
+  Kite Terminal Blueprint · last reviewed 5 November 2026 against the code (order-path audit and final order-path remediation) and <code>USER_GUIDE.md</code>, <code>TESTING.md</code>, <code>FIRST_LIVE_TRADE.md</code>, <code>DEPLOYMENT.md</code>, <code>DESIGN.md</code>, <code>DMB_KITE_OPERATIONAL_RUNBOOK.md</code>, <code>DMB_KITE_SOURCE_RIGHTS_MATRIX.md</code>, <code>NET1_KITE_REST_PROXY_REPORT.md</code>, <code>SECURITY_P2G_AUDIT.md</code> and the LIVE-0 / PK-0…PK-26 / SEC-1 reports.
   FakeKite and synthetic tests do not prove real broker order acceptance or execution.
   Backtest figures are historical results on the symbols tested, not a promise of returns. READY on Live Readiness means the app is technically ready; it says nothing about whether a trade is a good idea.
 </footer>

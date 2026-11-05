@@ -247,8 +247,13 @@ for 30 s.
 **Manual outbound-IP diagnostic.** The existing "Check this machine's
 outbound IP" button would have seen the home ISP IP and turned STATIC_IP
 into FAILED. When a proxy is configured, it now sends its one request
-through the same proxy (an explicit `ProxyHandler`, which ignores the
-environment). The button is labelled "Verify outbound IP via the Kite
+through the same proxy, with the same mechanism as the KiteConnect client:
+`requests` with `trust_env` off and explicit `proxies` (since `57d9cd2`;
+the earlier `urllib` `ProxyHandler` still honoured `NO_PROXY` and the
+Windows proxy-bypass list). Since 2026-11-05 a VERIFIED observation taken
+through the configured proxy, by the running process, is required to arm
+LIVE, and the proxy itself is mandatory for any broker write (the direct
+route is read-only). The button is labelled "Verify outbound IP via the Kite
 REST proxy (host:port)". It stays user-triggered, read-only toward Kite,
 and separate from the readiness refresh.
 

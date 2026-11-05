@@ -1,6 +1,6 @@
 # DMB → Kite: operational runbook
 
-**Status (2026-11-04).** Software readiness work is complete for synthetic integration and FakeKite operation. **Real-data handoff is BLOCKED** (source rights, `docs/DMB_KITE_SOURCE_RIGHTS_MATRIX.md` §5). **Real login is confirmed** (R-F1 verified by the owner's read-only login on 2026-11-04, §1.6). **Live broker execution is NO-GO**: the real broker write path, including GTT and Emergency Exit, has never been validated, and no non-executing, broker-approved method can validate the terminal's actual order path (§7.2). Decisions: §7.
+**Status (2026-11-04).** Software readiness work is complete for synthetic integration and FakeKite operation. **Real-data handoff is BLOCKED** (source rights, `docs/DMB_KITE_SOURCE_RIGHTS_MATRIX.md` §5). **Real login is confirmed** (R-F1 verified by the owner's read-only login on 2026-11-04, §1.6). **Live broker execution is NO-GO**: the real broker write path, including GTT and Emergency Exit, has never been validated, and no non-executing, broker-approved method can validate the terminal's actual order path (§7.2). **Since 2026-11-05 LIVE new entries are also disabled in the code** (`backend/live_entry_gate.py`). The frozen order path places the protective sell GTT for the full quantity as soon as Kite accepts an entry, before it fills, and a GTT acts on all of the account's holdings. The fix is proposed for separate authorization in `docs/PROPOSAL_EXECUTION_GTT_AFTER_FILL.md`. The GCP REST proxy is mandatory for LIVE (§1.2). Decisions: §7.
 
 This runbook changes no operating decision. It records how to run, restart, exit and recover, and what has and has not been tested.
 
@@ -18,7 +18,11 @@ This runbook changes no operating decision. It records how to run, restart, exit
 | P2-G R-F2 / R-F3 / R-F4 (reads, port isolation, WS revocation) | yes | yes (incl. a real second server on another port) | n/a |
 | Session expiry: absolute lifetime + inactivity timeout, WS closed at expiry (2026-11-04) | yes (26 tests, mutation-checked) | browser runners unaffected | n/a |
 | Read-only broker switch `KITE_TERMINAL_BROKER_WRITES=disabled` (2026-11-04) | yes (every write refused before any request) | — | **to be used in §1.6** |
-| Emergency Exit | yes (6 scenarios) | yes (FakeKite) | **NOT VALIDATED** |
+| Emergency Exit | yes (6 scenarios + `test_emergency_exit_safety.py`, 16: session, logout, expiry, entry gates, no GTT, quantity, outcomes, 2026-11-05) | yes (FakeKite) | **NOT VALIDATED** |
+| LIVE-entry hard gate (`LIVE_ENTRIES_DISABLED`, 2026-11-05) | yes (`test_live_entry_gate.py`, 16) | — | n/a (nothing can be sent) |
+| Proxy mandatory for LIVE; direct route read-only (2026-11-05) | yes (`test_proxy_mandatory.py`, 27; wire recorder, mock proxy) | — | **not tested** on the real network for writes |
+| Honest GTT protection states, alerts (2026-11-05) | yes (`test_protection_states.py`, 14) | — | **not tested**; GTT-before-holding behaviour at Kite **UNVERIFIED** |
+| Margin preflight (2026-11-05) | yes (`test_margin_preflight.py`, 34) | — | **not tested**: funds and order-margin field semantics **UNVERIFIED** |
 | Calendar session semantics, DMB/Kite parity, packet expiry (every official session counts; the packet names its review session, 2026-11-04) | yes (761 days: review sessions, expiry instants, and the named review session at 18 creation instants per day, 0 differences) | — | n/a |
 | Real DMB evidence handoff | — | — | **BLOCKED by source rights** |
 | 2027 sessions | fail-closed tested | — | **BLOCKED: NSE 2027 circular not published** |
@@ -32,6 +36,10 @@ This runbook changes no operating decision. It records how to run, restart, exit
 
 ### 1.2 Kite Terminal (real terminal, dry run)
 1. From `D:\Claude_WS\kite-terminal`: `.venv\Scripts\python.exe -m backend.server`. It serves `127.0.0.1:8000` with one worker, no reload, loopback only. Check the startup "Security summary" line. The Host header must name port 8000 exactly.
+   - **REST route.** Expect `Kite REST proxy enabled: 10.77.0.1:3128`.
+     - If it says `Kite REST: direct, read-only (KITE_REST_PROXY not set)`, the terminal refuses every broker write locally (orders, GTTs, cancels, Emergency Exit SELLs) and LIVE cannot be armed. Reads, login and dry run still work.
+     - The REST route and the KiteTicker WebSocket are separate: REST goes only through the proxy; the WebSocket (market data, never orders) stays direct.
+     - Before LIVE could ever be armed, run Live Readiness → *Check this machine's outbound IP* after each start. The observation must be taken through the configured proxy and match the whitelisted static IP; a restart or a proxy change forgets it.
 2. Open `http://127.0.0.1:8000/` in **your normal browser profile** (the one you will keep using; the terminal token lives in that profile's storage for this origin).
 3. Before login you see **"Log in to unlock this terminal"**. No account data is shown and nothing can be changed.
 4. Press **Log in to Zerodha** → Zerodha password and 2FA → back to the terminal.
@@ -110,11 +118,20 @@ Tested with FakeKite and scratch databases (`tests/test_emergency_exit_restart.p
 | Cookie without the terminal token (e.g. collected by another port) | 401, nothing sent |
 | Wrong confirmation phrase | 400, nothing sent |
 | A post-claim tampered exit row | That exit refused (`TICKET_TAMPERED_AFTER_CLAIM`); the others continue |
+| A previous trading day's Kite login (no logout) | 401 `NO_SESSION`, nothing sent (2026-11-05) |
+| Terminal idle expiry / absolute lifetime | 401, nothing sent |
+| LIVE-entry gate closed, LIVE not armed, trading lock on, breaker open, no funds, interim guards | **Not held back**: none of them applies to an exit |
+| `KITE_REST_PROXY` not set | Each SELL refused locally (`failed`, "never sent to Kite"); **exit in Kite web or the Kite app** (§4) |
+| A position whose GTT failed | Exited; **no GTT is ever created** by Emergency Exit |
+| Partially filled entry (40 of 100) | Sells the 40 confirmed, never the 100 ordered; unknown quantity is `refused QUANTITY_UNKNOWN` |
+| SELL timeout or Kite session error | `exit_outcome_unknown`, sent once, never resubmitted; check Kite |
+| Entries with UNKNOWN broker outcome | Not sold (quantity unprovable); listed in `not_exitable_unknown` with their order tag |
 
 **Real-broker Emergency Exit behaviour has NOT been validated.** Real broker validation is outside this sprint and needs separate authorization.
 
 ## 4. Fallback (when the terminal cannot exit)
 
+0. **Without the REST proxy** (`KITE_REST_PROXY` unset, or the tunnel down) the terminal cannot exit anything: it never sends a write directly. Go to 2.
 1. **Broker-side stop orders.** A position opened with "Protective GTT" (the default) has a stop-loss GTT at Zerodha. It survives terminal restarts, crashes and logouts. Positions shows each position's protection status; a position without one needs a manual stop in Kite.
 2. **Kite web / app.** Log in at kite.zerodha.com → Positions/Holdings → Exit; Orders → cancel open entries. Then **GTTs**: delete or adjust the protective GTT of anything exited by hand, or it can trigger against shares you no longer hold.
 3. **Terminal unavailable: manual procedure.**
@@ -153,7 +170,7 @@ Tested with FakeKite and scratch databases (`tests/test_emergency_exit_restart.p
 | **B** | DMB private research using real market data | **NO-GO on documented rights (2026-11-04)** | — (the software works; the rights basis does not) | Yahoo ToS §2(d)(9) and NSE Terms of Use expressly prohibit automated collection without permission (matrix §5) | Running it anyway is an owner decision outside this record | Yahoo's express prior permission or a licensed feed; NSE written permission / NSE Data licence (matrix §3, §5.3) |
 | **C** | Real-data DMB → Kite handoff | **NO-GO** | — | Every real source `UNRESOLVED`; real export `RIGHTS_BLOCKED`; Kite allowlist empty | — | Written permission per provider for private cross-app transfer (matrix §3), owner-recorded and reviewed, then a deliberate registry change |
 | **D** | Kite Terminal dry-run operation with a real login | **NO-GO until §1.6 passes, then GO, limited** | DRY RUN only; LIVE not armed; the user-operated R-F1 verification (§1.6, with `KITE_TERMINAL_BROKER_WRITES=disabled`) passes first (no fallback exists); session expiry on (defaults); operator accepts the §6 / audit §4 residual risks | P2-G closed/mitigated with tests; P1-D/P1-E/P1-F/P0 tests; restart/EE scenarios (FakeKite) | Real Kite login and broker reads not exercised in tests; same-user malware/extensions out of scope; Kite Connect data-use terms not reviewed | Owner's informed acceptance of the audit's residual risks; R-F1 confirmation on first login |
-| **E** | Live broker execution | **NO-GO** | — | **Real-broker order, GTT and Emergency Exit paths never validated**; Zerodha's sandbox cannot validate GTT, margins or MARKET orders (§7.2) | Every broker write path unproven against Zerodha | Separately authorized real-broker validation plan (small, supervised), then Live Readiness, then explicit owner approval. Passing software tests is not authorization. |
+| **E** | Live broker execution | **NO-GO; LIVE entries BLOCKED in code (2026-11-05)** | — | **Real-broker order, GTT and Emergency Exit paths never validated**; Zerodha's sandbox cannot validate GTT, margins or MARKET orders (§7.2). The frozen order path places the protective GTT before the fill (`docs/PROPOSAL_EXECUTION_GTT_AFTER_FILL.md`) | Every broker write path unproven against Zerodha | Separately authorized real-broker validation plan (small, supervised), then Live Readiness, then explicit owner approval. Passing software tests is not authorization. |
 
 ### 7.1 Operational status matrix (2026-11-04)
 
@@ -165,7 +182,7 @@ Tested with FakeKite and scratch databases (`tests/test_emergency_exit_restart.p
 | 4 | DMB → Kite real-data handoff | **NO-GO** | No source permitted for cross-app transfer; `RIGHTS_BLOCKED` / `RIGHTS_NOT_APPROVED` |
 | 5 | Kite Terminal local operation with FakeKite | **GO** | Full suite, P2-G, P1-D/E/F, restart / logout / Emergency Exit scenarios (§8.1) |
 | 6 | Kite Terminal real login and read-only operation | **GO, limited (2026-11-04)** | §1.6 passed: R-F1 confirmed, logout and restart lock. DRY RUN only, LIVE not armed, bind 127.0.0.1 only; `KITE_TERMINAL_BROKER_WRITES=disabled` recommended until a real-broker validation is authorized; the NET-1 proxy route must be up before login |
-| 7 | Kite Terminal live order execution | **NO-GO** | Broker write path unvalidated (§7.2) |
+| 7 | Kite Terminal live order execution | **NO-GO; BLOCKED in code** | Broker write path unvalidated (§7.2). LIVE new entries refused server-side (`LIVE_ENTRIES_DISABLED`) until the GTT-after-fill change is authorized |
 | 8 | One manually initiated live trade through Kite Terminal | **NO-GO** | Follows from 6 and 7 (§7.2) |
 
 ### 7.2 One-trade readiness assessment (2026-11-04)
@@ -180,7 +197,9 @@ Tested with FakeKite and scratch databases (`tests/test_emergency_exit_restart.p
 | Instrument identity, exchange, segment, calendar | Met (FakeKite) | Instrument cache tests; calendar parity; market-session gate models regular sessions only |
 | Fresh market data with visible timestamps | Met (FakeKite); unobserved with the real feed | Requires §1.6 |
 | Order preview shows side, quantity, product, type, price, trigger | Met (UI tests) | `e2e_ui.py`, `e2e_p1d.py` |
-| Margin/funds and risk checks visible | Margins: unobserved with the real account; risk checks met | Requires §1.6 |
+| Margin/funds and risk checks visible | Implemented 2026-11-05 (FakeKite): the final gate compares fresh available funds with Kite's own `order_margins` figure plus charges; the confirm dialog shows them. **Unobserved with the real account** | `test_margin_preflight.py`; field semantics unverified |
+| **Protective GTT created only for confirmed filled quantity** | **Not met** (frozen `execution.py` places it on acceptance, for the full quantity) | LIVE entries disabled; fix proposed (`docs/PROPOSAL_EXECUTION_GTT_AFTER_FILL.md`); honest states and alerts implemented |
+| GCP proxy mandatory for every broker write | Met (FakeKite / wire recorder) | `test_proxy_mandatory.py`; real network unverified for writes |
 | Position sizing and maximum loss reviewable | Met (UI) | Ticket form, P1-D review dialog |
 | P1-D review and risk gates enforced | Met (FakeKite) | `e2e_p1d.py`, risk-engine tests |
 | Duplicate-submission protection and audit log | Met (FakeKite) | Approval claim/race tests (`test_account_safety_integration.py`), no-duplicate-exit tests (`test_emergency_exit_isolation.py`), post-claim tamper audit (`docs/POST_CLAIM_TAMPERING_AUDIT.md`) |
@@ -209,11 +228,28 @@ What would be needed before this could change (each separately authorized): (1) 
 1. Decide the route. Either (a) this PC behind an ISP static IP, or (b) Kite REST through the NET-1 static-IP proxy (`docs/DEPLOYMENT.md`, "Mode A+"): only REST goes through the proxy, the ticker stays direct.
 2. Find the public egress IP of that route from the route itself (e.g. your ISP's account page, the VM's console, or `curl https://api.ipify.org` run on the VM for route b). A private address (10.x, 172.16-31.x, 192.168.x) is never valid.
 3. Log in to developers.kite.trade yourself → Profile → IP Whitelist → add it as primary (optionally a secondary) → Update. Remember the once-a-week limit.
-4. In the terminal (when real login is allowed, §1.6 passed): Live Readiness → Static IP → enter the same IP, tick the confirmation, Confirm. Optionally *Check this machine's outbound IP* (one request to api.ipify.org): it must read VERIFIED, never FAILED. With the NET-1 proxy, the readiness page also requires the proxy route to be reachable.
+4. In the terminal (when real login is allowed, §1.6 passed): Live Readiness → Static IP → enter the same IP, tick the confirmation, Confirm. Then *Check this machine's outbound IP* (one request to api.ipify.org, through the proxy): it must read VERIFIED, never FAILED. Since 2026-11-05 this is **required** for LIVE: the attestation alone no longer passes, and the observation must have been taken through the currently configured proxy by the running process. With the NET-1 proxy, the readiness page also requires the proxy route to be reachable.
 5. Do **not** test the whitelist with a real order. Whitelisting proves nothing about the terminal's order path; live execution stays NO-GO (§7.2) until a separately authorized validation plan exists.
 6. Re-check the console after any change of ISP plan, router, VPN or VM, and before any future authorized live step.
 
 Nothing in this sprint changed a broker setting, read the account database, or sent a request to Kite.
+
+## 8.3 Final order-path remediation: verification results (2026-11-05)
+
+Run on branch `feature/signal-detail-and-strategy-revision`, from HEAD `bfc0f73` with a clean tree. FakeKite, the wire recorder, a mock CONNECT proxy and throwaway databases only. No real login, broker request, order, GTT, cancel or broker-setting change. No Kite MCP tool was used.
+
+| Run | Result |
+|---|---|
+| Kite full suite, before (baseline) | 2,718 passed, 3 skipped, 0 failed |
+| Kite full suite, after | **2,858 passed, 3 skipped, 0 failed**. +140: live-entry gate 16, proxy mandatory 27, protection states 14, interim guards 32, margin preflight 34, Emergency Exit 16, order-path 22a 1. Skips: 3 symlink tests (Windows privilege). |
+| Inverted or updated existing tests | Each is commented in place: DIRECT route is now a blocker (`test_21b`); USER_CONFIRMED alone no longer passes STATIC_IP (`test_08b`); an unfilled entry is NOT_PROTECTED_PENDING_FILL, not PROTECTED (`test_lifecycle_state` 3); a GTT larger than the position is QUANTITY_EXCEEDS_POSITION (4 tests); a full fill now reads the GTT book once; writes-disabled live confirm is refused at the margin preflight (`test_22`, original assertion kept as `22a`); log and route texts; two test login doubles accept `proxies=`; the nonexistent `/api/kill-switch/activate` in `test_session_expiry`/`test_security_p2g` replaced by the real Emergency Exit route |
+| Mutation checks | 13 of 13 killed: gate constant flipped; direct-route writes allowed; precheck proxy check removed; pre-broker backstop removed; holdings guard ignores `t1_quantity`; holdings guard passes on a read error; margin passes on missing `live_balance`; margin ignores collateral; unfilled entry PROTECTED; oversized GTT PROTECTED; fill verification only for adopted entries; Emergency Exit places a GTT; arming accepts an unproven proxy route. Files restored byte-for-byte (hash-checked). |
+| Browser `e2e_ui.py --pin-clock` | **56/56** (54 earlier checks + 2 alignment checks). Also **56/56** with the seeded signals backdated to the previous day after 15:30 IST, the exact condition of the former 53/54 failure |
+| Browser `e2e_p1d.py` | **13/13**. A first run found a real defect: the direct-route client narrowing also narrowed the demo's login stand-in. It was fixed (only a real SDK client is narrowed) and has a regression test |
+| Browser `e2e_dmb_inbox.py` | **42/42** |
+| Acceptance `acceptance_dmb_kite.py` | **44/44** |
+| Frozen PK-25 files (15 hash-pinned incl. `execution.py`, `risk_engine.py`, `strategy_engine.py`; `research/pk25/*`, 30 files) | byte-identical |
+| Real account database `backend/kite_terminal.db` | SHA-256 and mtime unchanged |
 
 ## 8.2 Sprint verification results (2026-11-04, session expiry / explicit review session)
 
