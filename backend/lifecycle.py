@@ -71,9 +71,16 @@ TERMINAL_STATES = frozenset({CLOSED, REJECTED, CANCELLED, FAILED})
 
 # ---- protection ---------------------------------------------------------------
 
-PROTECTED = "PROTECTED"
+# Judged against the CONFIRMED filled open quantity, never the ordered one: an
+# accepted order is not a fill, and a GTT acts on the account's holdings, not
+# on the entry (the frozen order path places it before the fill). The GTT's
+# quantity is the broker's last observation (backend/gtt_observations.py)
+# when there is one, else the app's own record of it.
+PROTECTED = "PROTECTED"                    # held > 0, an active GTT covering exactly what is held
 MISSING = "MISSING"
-QUANTITY_MISMATCH = "QUANTITY_MISMATCH"
+QUANTITY_MISMATCH = "QUANTITY_MISMATCH"    # the GTT covers fewer shares than are held (or a resize failed)
+QUANTITY_EXCEEDS_POSITION = "QUANTITY_EXCEEDS_POSITION"    # the GTT could sell more than is confirmed held
+NOT_PROTECTED_PENDING_FILL = "NOT_PROTECTED_PENDING_FILL"  # entry working, 0 filled, its GTT already live
 PRICE_MISMATCH = "PRICE_MISMATCH"
 PROTECTION_UNKNOWN = "UNKNOWN"
 NOT_REQUESTED = "NOT_REQUESTED"            # use_gtt = 0: the ticket asked for no protective GTT
@@ -81,9 +88,13 @@ NOT_APPLICABLE = "NOT_APPLICABLE"          # dry run, closed, or not a position 
 
 PROTECTION_LABELS = {
     PROTECTED: "PROTECTED", MISSING: "UNPROTECTED", QUANTITY_MISMATCH: "GTT QTY MISMATCH",
+    QUANTITY_EXCEEDS_POSITION: "GTT EXCEEDS POSITION", NOT_PROTECTED_PENDING_FILL: "NOT PROTECTED · GTT BEFORE FILL",
     PRICE_MISMATCH: "GTT PRICE MISMATCH", PROTECTION_UNKNOWN: "PROTECTION UNKNOWN",
     NOT_REQUESTED: "NO GTT (by choice)", NOT_APPLICABLE: "—",
 }
+# Every one of these is alerted; none is ever shown as protected.
+PROTECTION_ALERT_STATUSES = frozenset({MISSING, QUANTITY_MISMATCH, QUANTITY_EXCEEDS_POSITION,
+                                       NOT_PROTECTED_PENDING_FILL, PRICE_MISMATCH, PROTECTION_UNKNOWN})
 
 # ---- reconciliation findings ----------------------------------------------------
 #
@@ -101,6 +112,7 @@ PROTECTION_QUANTITY_MISMATCH = rc.PROTECTION_QUANTITY_MISMATCH
 POSITION_QUANTITY_REVIEW = rc.POSITION_QUANTITY_REVIEW
 POSSIBLE_DOUBLE_SELL = rc.POSSIBLE_DOUBLE_SELL
 ORPHANED_GTT_AFTER_EXIT = rc.ORPHANED_GTT_AFTER_EXIT
+GTT_STAGED_BEFORE_FILL = rc.GTT_STAGED_BEFORE_FILL
 GENERIC_FINDING = "RECONCILIATION_FINDING"
 
 ISSUE_LABELS = {
@@ -113,6 +125,7 @@ ISSUE_LABELS = {
     POSITION_QUANTITY_REVIEW: "Position quantity needs review",
     POSSIBLE_DOUBLE_SELL: "POSSIBLE DOUBLE SELL",
     ORPHANED_GTT_AFTER_EXIT: "Orphaned GTT after exit",
+    GTT_STAGED_BEFORE_FILL: "GTT live before the entry filled",
     rc.ORPHAN_GTT: "Orphan GTT",
     rc.GTT_ON_CLOSED_POSITION: "GTT still active on closed position",
     rc.MULTIPLE_ACTIVE_GTTS: "Multiple active GTTs",
@@ -333,7 +346,23 @@ def _issue(row) -> dict:
     }
 
 
-def _protection(row, state: str, ticket_issue_codes: set, desired) -> str:
+def gtt_view(row, desired) -> dict:
+    """What is known about the position's GTT: the broker's last observation if there is one,
+    else the app's own record (the quantity it placed or last resized it to)."""
+    if row["kite_gtt_id"] is None:
+        return {"gtt_status": None, "gtt_quantity": None, "gtt_observed_at": None, "gtt_source": None}
+    from backend import gtt_observations
+    seen = gtt_observations.get(row["kite_gtt_id"])
+    if seen is not None:
+        return {"gtt_status": seen["status"], "gtt_quantity": seen["quantity"],
+                "gtt_observed_at": seen["observed_at"], "gtt_source": "broker"}
+    return {"gtt_status": "recorded", "gtt_quantity": desired, "gtt_observed_at": None, "gtt_source": "app_record"}
+
+
+def _protection(row, state: str, ticket_issue_codes: set, desired, held=None, gtt: dict | None = None) -> str:
+    """`held` is the CONFIRMED filled open quantity (bought minus sold); `desired` the app's
+    record of what its GTT covers. PROTECTED only when shares are held and an active GTT covers
+    exactly them: never for an entry that has filled nothing, never when the GTT could sell more."""
     if state not in POSITION_STATES or not position_quantity.broker_tracked(row):
         # A dry-run position from before PK-20 never had a GTT; a paper
         # position's paper GTT is judged exactly like a live one's.
@@ -346,7 +375,17 @@ def _protection(row, state: str, ticket_issue_codes: set, desired) -> str:
         return PROTECTION_UNKNOWN
     if (row["kite_gtt_id"] is None and desired > 0) or ticket_issue_codes & _MISSING_CODES:
         return MISSING
-    if ticket_issue_codes & _QUANTITY_CODES:
+    gtt = gtt if gtt is not None else gtt_view(row, desired)
+    if row["kite_gtt_id"] is not None and gtt["gtt_source"] == "broker" and gtt["gtt_status"] != "active":
+        return MISSING
+    covered = (gtt["gtt_quantity"] or 0) if row["kite_gtt_id"] is not None else 0
+    if held is None or held < 0:
+        return PROTECTION_UNKNOWN
+    if covered > held:
+        if held == 0 and position_quantity.entry_still_working(row):
+            return NOT_PROTECTED_PENDING_FILL
+        return QUANTITY_EXCEEDS_POSITION
+    if ticket_issue_codes & _QUANTITY_CODES or covered < held:
         return QUANTITY_MISMATCH
     if GTT_PRICE_MISMATCH in ticket_issue_codes:
         return PRICE_MISMATCH
@@ -380,19 +419,21 @@ def derive(row, ctx: Context) -> dict:
 
     desired = (position_quantity.protection_quantity_from_rows(row, exits)
                if executed and not closed else None)
-    protection = _protection(row, state, ticket_codes, desired)
+    gtt = gtt_view(row, desired)
+    protection = _protection(row, state, ticket_codes, desired, open_qty, gtt)
 
     reasons = []
     if state == SUBMISSION_UNKNOWN:
         reasons.append("SUBMISSION_UNKNOWN")
     if state == NEEDS_REVIEW:
         reasons.append("NEEDS_REVIEW")
-    if protection in (MISSING, QUANTITY_MISMATCH, PRICE_MISMATCH, PROTECTION_UNKNOWN):
+    if protection in PROTECTION_ALERT_STATUSES:
         reasons.append(f"PROTECTION_{protection}")
     reasons.extend(sorted({i["code"] for i in issues}))
     review_required = bool(reasons)
 
-    if (state in (SUBMISSION_UNKNOWN, NEEDS_REVIEW) or protection in (MISSING, QUANTITY_MISMATCH, PRICE_MISMATCH)
+    if (state in (SUBMISSION_UNKNOWN, NEEDS_REVIEW)
+            or protection in (MISSING, QUANTITY_MISMATCH, QUANTITY_EXCEEDS_POSITION, PRICE_MISMATCH)
             or any(i["severity"] == "critical" for i in issues)):
         severity = "critical"
     elif review_required or state in (ENTRY_PARTIAL, EXITING, EXIT_PARTIAL):
@@ -434,6 +475,11 @@ def derive(row, ctx: Context) -> dict:
         "trailing_enabled": bool(row["trailing_enabled"]), "trailing_active": bool(row["trailing_active"]),
         "protection_status": protection, "protection_label": PROTECTION_LABELS[protection],
         "protection_quantity": desired, "kite_gtt_id": row["kite_gtt_id"],
+        # The GTT as last observed at the broker (or as the app recorded it), next to what is
+        # confirmed held: the two are never conflated.
+        "gtt_status": gtt["gtt_status"], "gtt_quantity": gtt["gtt_quantity"],
+        "gtt_observed_at": gtt["gtt_observed_at"], "gtt_source": gtt["gtt_source"],
+        "confirmed_filled_quantity": bought, "protection_alert": protection in PROTECTION_ALERT_STATUSES,
         "kite_order_id": row["kite_order_id"], "order_tag": row["order_tag"],
         "submission_state": row["submission_state"],
         "active_exit": active_exit,
@@ -704,5 +750,6 @@ def summary(active: list[dict]) -> dict:
                        for p in active),
         "needs_attention": sum(p["review_required"] for p in active),
         "unprotected": sum(p["protection_status"] == MISSING for p in active),
+        "protection_attention": sum(p["protection_status"] in PROTECTION_ALERT_STATUSES for p in active),
         "total": len(active),
     }

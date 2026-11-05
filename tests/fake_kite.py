@@ -28,6 +28,13 @@ class FakeKite:
         self._positions = positions if positions is not None else []
         self.margins_net = margins_net
         self.margins_collateral = 0.0  # equity.available.collateral (pledged holdings), included in net
+        # equity.available.live_balance; None = net minus collateral (cash actually available).
+        self.margins_live_balance = None
+        self.margins_enabled = True
+        # order_margins(): per-symbol replacement rows (a dict, or a callable(params) -> dict), and
+        # the delivery charges Kite would add, as a fraction of the order value.
+        self.order_margin_rows: dict[str, object] = {}
+        self.order_charges_fraction = 0.001
         self.ltp_map = dict(ltp or {})
         self.candles = candles or {}
         self._instruments = instruments or []
@@ -180,13 +187,47 @@ class FakeKite:
     def mf_holdings(self):
         return []
 
-    def margins(self):
-        self._record("margins")
-        equity = {"net": self.margins_net}
-        if self.margins_collateral:
-            # Like Kite: equity.net already includes the margin from pledged holdings.
-            equity["available"] = {"collateral": self.margins_collateral}
-        return {"equity": equity}
+    def _equity_funds(self) -> dict:
+        equity = {"enabled": self.margins_enabled, "net": self.margins_net}
+        # Like Kite: equity.net already includes the margin from pledged holdings (collateral).
+        live = self.margins_live_balance
+        if live is None:
+            numeric = all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                          for v in (self.margins_net, self.margins_collateral))
+            # A test that sets an unusable net (malformed broker data) gets it passed through as is.
+            live = self.margins_net - self.margins_collateral if numeric else self.margins_net
+        equity["available"] = {"collateral": self.margins_collateral, "cash": live, "live_balance": live,
+                               "opening_balance": live, "adhoc_margin": 0.0, "intraday_payin": 0.0}
+        equity["utilised"] = {"debits": 0.0}
+        return equity
+
+    def margins(self, segment=None):
+        self._record("margins", segment=segment)
+        if segment == "equity":
+            return self._equity_funds()
+        return {"equity": self._equity_funds()}
+
+    def order_margins(self, params):
+        """Kite's POST /margins/orders: the margin each order would block. A cash-equity CNC BUY
+        blocks its full value; charges are added separately. Places nothing."""
+        self._record("order_margins", params=copy.deepcopy(params))
+        rows = []
+        for order in params:
+            key = f"{order['exchange']}:{order['tradingsymbol']}"
+            override = self.order_margin_rows.get(order["tradingsymbol"])
+            if callable(override):
+                rows.append(override(order))
+                continue
+            if override is not None:
+                rows.append(copy.deepcopy(override))
+                continue
+            price = order.get("price") or self.ltp_map.get(key, 100.0)
+            value = float(price) * int(order["quantity"])
+            rows.append({"type": "equity", "tradingsymbol": order["tradingsymbol"], "exchange": order["exchange"],
+                         "span": 0, "exposure": 0, "option_premium": 0, "additional": 0, "bo": 0, "cash": 0,
+                         "var": value, "pnl": {"realised": 0, "unrealised": 0}, "leverage": 1,
+                         "charges": {"total": round(value * self.order_charges_fraction, 2)}, "total": value})
+        return rows
 
     def ltp(self, keys):
         if isinstance(keys, str):

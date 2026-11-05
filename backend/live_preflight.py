@@ -260,13 +260,55 @@ def _fetch_egress_ip() -> str:
         return response.content[:64].decode("ascii", "replace").strip()
 
 
+# The REST route each stored egress observation was taken through. Process memory on purpose: after
+# a restart (or a change of KITE_REST_PROXY) no observation proves the current route, so the
+# outbound-IP check is run again before LIVE can be armed. Keyed by account id.
+_egress_routes: dict[int, dict] = {}
+
+
+def record_egress_route(account_id: int, checked_at: str, route: dict) -> None:
+    _egress_routes[account_id] = {"checked_at": checked_at, "mode": route["mode"], "endpoint": route["endpoint"]}
+
+
+def reset_egress_routes() -> None:
+    _egress_routes.clear()
+
+
+def egress_proof(conn: sqlite3.Connection, account_id: int, now: datetime | None = None) -> dict:
+    """Is the configured proxy the intended endpoint? The one functional proof available: a recent
+    outbound-IP observation taken THROUGH the currently configured proxy, by this process, equal to
+    the static IP whitelisted in Kite. {proven: bool, message: str, route: ...}."""
+    s = static_ip_status(conn, account_id, now)
+    route = kite_rest_proxy.route_status()
+    seen = _egress_routes.get(account_id)
+    out = {"proven": False, "route_mode": route["mode"], "endpoint": route["endpoint"],
+           "observed_via": seen, "static_ip_state": s["status"]}
+    if route["mode"] != kite_rest_proxy.PROXY:
+        return {**out, "message": f"No usable Kite REST proxy is configured ({kite_rest_proxy.ENV_VAR}); LIVE "
+                                  f"requires the GCP proxy route."}
+    if s["status"] != STATIC_IP_VERIFIED:
+        return {**out, "message": "The outbound IP has not been observed recently and matched to the confirmed "
+                                  "static IP. Run the outbound-IP check (it goes through the proxy)."}
+    if (seen is None or seen["checked_at"] != s["egress_checked_at"] or seen["mode"] != kite_rest_proxy.PROXY
+            or seen["endpoint"] != route["endpoint"]):
+        return {**out, "message": f"The stored outbound-IP observation was not taken through the configured proxy "
+                                  f"{route['endpoint']} by this process (restart or proxy change since). Run the "
+                                  f"outbound-IP check again."}
+    return {**out, "proven": True,
+            "message": f"Outbound IP {s['egress_ip']} observed through proxy {route['endpoint']} matches the "
+                       f"confirmed static IP."}
+
+
 def check_egress_ip(conn: sqlite3.Connection, account_id: int) -> dict:
     """Observe this machine's outbound public IP and store it (or the error).
     Commits. Never raises for a network failure."""
     now = _sql_utc(_utc_now())
     _ensure_row(conn, account_id)
+    route = kite_rest_proxy.route_status()
+    _egress_routes.pop(account_id, None)
     try:
         observed = str(ipaddress.ip_address(_fetch_egress_ip()))
+        record_egress_route(account_id, now, route)
         conn.execute("UPDATE live_readiness SET egress_ip = ?, egress_checked_at = ?, egress_error = NULL, "
                      "updated_at = ? WHERE account_id = ?", (observed, now, now, account_id))
     except Exception as e:
@@ -665,10 +707,10 @@ def _rest_route_checks(snap: BrokerSnapshot | None, route: dict) -> list[dict]:
                        f"{route['error']} Every Kite REST call is refused until it is fixed (never sent directly).",
                        True, detail=detail)]
     if route["mode"] == kite_rest_proxy.DIRECT:
-        return [_check("KITE_REST_ROUTE", "network", WARN,
-                       f"No REST proxy configured ({kite_rest_proxy.ENV_VAR} not set): Kite REST calls go directly "
-                       f"from this machine. Live orders work only if this machine's own outbound IP is the "
-                       f"whitelisted static IP.", False, detail=detail)]
+        return [_check("KITE_REST_ROUTE", "network", FAIL,
+                       f"REST proxy required for LIVE: {kite_rest_proxy.ENV_VAR} is not set. Without the GCP proxy "
+                       f"the terminal refuses every broker write (orders, GTTs, cancels) locally and never sends one "
+                       f"directly; reads and dry run still work.", True, detail=detail)]
     via = f"proxy {route['endpoint']}"
     if snap is None:
         return [_check("KITE_REST_ROUTE", "network", USER_ACTION,
@@ -697,11 +739,14 @@ def _static_ip_checks(conn: sqlite3.Connection, account_id: int, now: datetime) 
     route = kite_rest_proxy.route_status()
     detail["egress_route"] = route["mode"]
     detail["egress_proxy"] = route["endpoint"]
-    if s["status"] == STATIC_IP_VERIFIED:
-        return [_check("STATIC_IP", "static_ip", PASS, s["message"], True, detail=detail)]
-    if s["status"] == STATIC_IP_USER_CONFIRMED:
-        return [_check("STATIC_IP", "static_ip", PASS,
-                       s["message"] + " Optional: check this machine's outbound IP.", True, detail=detail)]
+    proof = egress_proof(conn, account_id, now)
+    detail["egress_proven_via_proxy"] = proof["proven"]
+    if s["status"] == STATIC_IP_VERIFIED and proof["proven"]:
+        return [_check("STATIC_IP", "static_ip", PASS, s["message"] + " " + proof["message"], True, detail=detail)]
+    if s["status"] in (STATIC_IP_VERIFIED, STATIC_IP_USER_CONFIRMED):
+        return [_check("STATIC_IP", "static_ip", USER_ACTION,
+                       s["message"] + " LIVE needs proof that the configured proxy is the intended endpoint: "
+                       + proof["message"], True, detail=detail)]
     if s["status"] == STATIC_IP_FAILED:
         return [_check("STATIC_IP", "static_ip", FAIL, s["message"], True, detail=detail)]
     return [_check("STATIC_IP", "static_ip", USER_ACTION,
@@ -709,8 +754,16 @@ def _static_ip_checks(conn: sqlite3.Connection, account_id: int, now: datetime) 
                                   "attempts). Enter the IP and confirm it.", True, detail=detail)]
 
 
+def _live_entry_gate_check() -> dict:
+    from backend import live_entry_gate
+    if live_entry_gate.entries_enabled():
+        return _check("LIVE_ENTRY_GATE", "trading_lock", PASS, "LIVE new entries are enabled in this build.", True)
+    return _check("LIVE_ENTRY_GATE", "trading_lock", FAIL, live_entry_gate.REASON, True,
+                  detail={"proposal": live_entry_gate.PROPOSAL_DOC})
+
+
 def _mode_and_lock_checks(conn: sqlite3.Connection, account_id: int) -> list[dict]:
-    out = []
+    out = [_live_entry_gate_check()]
     from backend import live_arming
     mode = conn.execute("SELECT mode FROM execution_settings WHERE id = 1").fetchone()["mode"]
     if mode == "live" and live_arming.live_armed_for_active_session(conn, account_id):

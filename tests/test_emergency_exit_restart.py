@@ -94,7 +94,8 @@ def test_after_logout_the_old_credential_is_dead_and_a_new_kite_login_is_needed(
     # A full fresh login: /login (P2-G state), Kite's callback, the new credential.
     class _FakeKiteConnect:
         def __init__(self, api_key, **kwargs):
-            pass
+            # The production factory sets reqsession.trust_env on a proxied client.
+            self.reqsession = type("Session", (), {"trust_env": True})()
 
         def generate_session(self, request_token, api_secret):
             return {"access_token": "fresh-token", "public_token": "p", "user_id": "DT0001", "user_name": "Demo"}

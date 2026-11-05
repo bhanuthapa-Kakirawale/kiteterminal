@@ -329,7 +329,7 @@ def test_r_f3_the_cookie_alone_replayed_from_another_port_cannot_read_write_or_s
     replay = _browser(headers=TERMINAL_HEADERS)
     replay.cookies.set("kt_session", stolen)
     assert replay.get("/api/holdings").status_code == 401
-    r = replay.post("/api/kill-switch/activate", json={})
+    r = replay.post("/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "EXIT ALL"})
     assert r.status_code == 401 and _code(r) == "TERMINAL_SESSION_REQUIRED"
     with pytest.raises(WebSocketDisconnect) as closed:
         with replay.websocket_connect(WS_URL, headers={"Origin": TERMINAL_ORIGIN}) as ws:
@@ -385,7 +385,8 @@ def test_r_f3_a_dedicated_hostname_is_exact_not_wildcard(env, monkeypatch):
 
 def test_r_f3_an_unexpected_origin_never_writes_even_with_both_factors(env):
     for origin in ("http://127.0.0.1:9999", "http://kite-terminal.localhost:8000", "null"):
-        r = env.client.post("/api/kill-switch/activate", json={}, headers={"Origin": origin})
+        r = env.client.post("/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "EXIT ALL"},
+                            headers={"Origin": origin})
         assert r.status_code == 403, origin
 
 

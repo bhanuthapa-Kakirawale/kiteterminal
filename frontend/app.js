@@ -100,6 +100,7 @@ const API = {
   },
   getTicket: (id) => fetchJson(`/api/tickets/${id}`),
   getTicketChart: (id) => fetchJson(`/api/tickets/${id}/chart`),
+  getMarginPreview: (id) => fetchJson(`/api/tickets/${id}/margin-preview`),
   createTicket: (body) => fetchJsonMutate("/api/tickets", "POST", body),
   createAlertActionSell: (body) => fetchJsonMutate("/api/tickets/alert-action/sell", "POST", body),
   createAlertActionBuy: (body) => fetchJsonMutate("/api/tickets/alert-action/buy", "POST", body),
@@ -497,6 +498,7 @@ const el = {
   appConfirmCancel: document.getElementById("app-confirm-cancel"),
   themeToggleBtn: document.getElementById("theme-toggle-btn"),
   ticketConfirmExecNote: document.getElementById("ticket-confirm-exec-note"),
+  ticketConfirmMargin: document.getElementById("ticket-confirm-margin"),
   ticketPreview: document.getElementById("ticket-preview"),
   strategyInfo: document.getElementById("strategy-info"),
 };
@@ -918,12 +920,23 @@ function evaluateAlerts(view, totalValue, dayPnl, margins, sessionStatus) {
 
   for (const t of state.tickets) {
     // PK-19: the server's protection status of the ticket's own position.
-    const unprotected = t.lifecycle?.position_id === t.id && t.lifecycle.protection_status === "MISSING";
-    if (unprotected) {
+    const lc = t.lifecycle?.position_id === t.id ? t.lifecycle : null;
+    if (lc && lc.protection_status === "MISSING") {
       alerts.push({
         id: `protection-failed-${t.id}`,
         severity: "urgent",
-        message: `${t.symbol}: no active protective stop — UNPROTECTED position (${t.lifecycle.open_quantity ?? "?"} share(s)), act now`,
+        message: `${t.symbol}: no active protective stop — UNPROTECTED position (${lc.open_quantity ?? "?"} share(s)), act now`,
+        scrollTargetSelector: `tr[data-ticket-id="${t.id}"]`,
+      });
+    } else if (lc && lc.protection_alert) {
+      // Any other protection mismatch: the GTT does not cover exactly the
+      // confirmed filled quantity (or covers it before anything filled).
+      const gtt = lc.gtt_quantity == null ? "?" : lc.gtt_quantity;
+      alerts.push({
+        id: `protection-mismatch-${t.id}`,
+        severity: ["QUANTITY_EXCEEDS_POSITION", "QUANTITY_MISMATCH"].includes(lc.protection_status) ? "urgent" : "warning",
+        message: `${t.symbol}: ${lc.protection_label} — GTT ${lc.kite_gtt_id ?? "none"} covers ${gtt}, `
+          + `confirmed filled ${lc.confirmed_filled_quantity ?? "?"}, held ${lc.open_quantity ?? "?"}`,
         scrollTargetSelector: `tr[data-ticket-id="${t.id}"]`,
       });
     }
@@ -3370,6 +3383,7 @@ function openConfirmDialog(ticket) {
   el.ticketConfirmAmo.hidden = rejectedMode || !needsAmoConsent(ticket);
   el.ticketConfirmAmoCheckbox.checked = false;
   renderRiskCheckSection(ticket.risk_check_results);
+  loadMarginPreview(ticket, rejectedMode);
   // SEC-1 P1-D: a manual / Quick Action buy whose review is no longer current
   // offers Re-review instead of Approve (the server would refuse it anyway).
   const review = !rejectedMode && ticket.review && ticket.review.subject ? ticket.review : null;
@@ -3384,6 +3398,41 @@ function openConfirmDialog(ticket) {
   el.ticketModifyBtn.hidden = !rejectedMode;
   el.ticketArchiveBtn.hidden = !rejectedMode;
   el.ticketConfirmDialog.showModal();
+}
+
+// Margin preflight, shown for a LIVE new entry only: the account's available
+// funds against Kite's own margin figure for this exact order. Display only —
+// the server's final gate enforces the same check at approval.
+function marginPreviewText(m) {
+  if (!m || !m.applicable) return "";
+  const rupees = (v) => (v == null ? "?" : `₹${fmt(v, 2)}`);
+  const parts = [`Funds check: available ${rupees(m.available)}, estimated requirement ${rupees(m.required)}`
+    + ` (Kite margin ${rupees(m.order_margin)} + charges ${rupees(m.charges)}; order value ${rupees(m.order_value)})`];
+  if (m.max_order_notional != null) parts.push(`per-order cap ${rupees(m.max_order_notional)}`);
+  parts.push(m.verdict === "PASS" ? "covered" : `${m.verdict}: ${m.message}`);
+  if (!m.live_entries_enabled) parts.push("LIVE entries are disabled on this terminal");
+  return parts.join(" · ");
+}
+
+async function loadMarginPreview(ticket, rejectedMode) {
+  const box = el.ticketConfirmMargin;
+  if (!box) return;
+  box.hidden = true;
+  box.textContent = "";
+  if (rejectedMode || ticket.closes_ticket_id != null || state.activeConfirmShownMode !== "live") return;
+  try {
+    const res = await API.getMarginPreview(ticket.id);
+    if (activeConfirmTicketId !== ticket.id) return;
+    const text = marginPreviewText(res.data);
+    box.textContent = text;
+    box.hidden = !text;
+    box.classList.toggle("live", !!res.data && res.data.verdict !== "PASS");
+  } catch (e) {
+    if (activeConfirmTicketId !== ticket.id) return;
+    box.textContent = `Funds check unavailable: ${e.message}`;
+    box.hidden = false;
+    box.classList.add("live");
+  }
 }
 
 // Shared by the confirm dialog and the Approvals inbox. Execution failures
@@ -3405,6 +3454,17 @@ const ACCOUNT_SAFETY_TITLES = {
   TICKET_REVIEW_REQUIRED: "This ticket needs a re-review",
   TICKET_REVIEW_CHANGED: "This ticket changed since you looked at it",
   TICKET_EVIDENCE_MISMATCH: "Ticket details were changed outside the app",
+  // LIVE-entry gate and its interim guards (backend/live_entry_gate.py)
+  LIVE_ENTRIES_DISABLED: "LIVE entries are disabled on this terminal",
+  LIVE_ENTRY_ORDER_TYPE_UNSUPPORTED: "LIVE entries must be MARKET orders",
+  LIVE_AMO_UNSUPPORTED: "LIVE AMO entries are not allowed",
+  PRE_EXISTING_SELLABLE_QUANTITY: "This instrument is already held in the account",
+  HOLDINGS_CHECK_UNAVAILABLE: "Existing holdings could not be checked",
+  KITE_REST_PROXY_REQUIRED: "The Kite REST proxy is required for LIVE",
+  // Margin preflight (backend/margin_preflight.py)
+  INSUFFICIENT_FUNDS: "Not enough funds for this order",
+  MARGIN_DATA_UNAVAILABLE: "Margin data could not be checked",
+  MARGIN_PREFLIGHT_UNSUPPORTED: "No margin model for this order",
 };
 
 // The codes of every reason the server gave, not only the first: a review

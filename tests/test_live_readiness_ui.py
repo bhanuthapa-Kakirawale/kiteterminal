@@ -158,7 +158,8 @@ def test_net1_direct_and_invalid_route_texts():
     assert run(["restRouteText", {"mode": "DIRECT", "endpoint": None}],
                ["restRouteText", {"mode": "PROXY", "endpoint": "10.77.0.1:3128"}],
                ["restRouteText", {"mode": "INVALID", "endpoint": None}],
-               ["restRouteText", None]) == ["REST DIRECT", "REST via PROXY 10.77.0.1:3128",
+               ["restRouteText", None]) == ["REST DIRECT — LIVE disabled (proxy required)",
+                                            "REST via PROXY 10.77.0.1:3128",
                                             "REST proxy setting INVALID", ""]
 
 

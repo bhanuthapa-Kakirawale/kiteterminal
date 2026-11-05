@@ -41,6 +41,7 @@ PROTECTION_QUANTITY_MISMATCH = "PROTECTION_QUANTITY_MISMATCH"  # GTT could not b
 POSITION_QUANTITY_REVIEW = "POSITION_QUANTITY_REVIEW"          # open quantity unknown, or negative
 POSSIBLE_DOUBLE_SELL = "POSSIBLE_DOUBLE_SELL"                  # exit filled AND the GTT triggered
 ORPHANED_GTT_AFTER_EXIT = "ORPHANED_GTT_AFTER_EXIT"            # position closed, its GTT delete failed
+GTT_STAGED_BEFORE_FILL = "GTT_STAGED_BEFORE_FILL"              # entry not filled, its sell GTT already live
 
 # Kite -> app findings. A reviewed one stays silent while the broker GTT
 # (quantity, trigger, status) and the app positions it is judged against
@@ -128,6 +129,8 @@ class BrokerSnapshot:
         self.gtts = [g for g in raw if isinstance(g, dict) and g.get("id") is not None]
         if len(self.gtts) != len(raw):
             logger.warning("event=reconciliation.malformed_gtts skipped=%d", len(raw) - len(self.gtts))
+        from backend import gtt_observations
+        gtt_observations.record_book(self.gtts)
 
     def load_held(self, kite) -> None:
         """Shares the broker shows per symbol. Unsettled (T+1) delivery
@@ -409,6 +412,7 @@ def _check_gtt_state(conn: sqlite3.Connection, kite, account, snapshot: BrokerSn
         (account["id"],),
     ).fetchall()
     by_id = {g["id"]: g for g in snapshot.gtts}
+    _check_protection_missing(conn, account)
     checked = set()
     for t in tickets:
         gtt = by_id.get(t["kite_gtt_id"])
@@ -429,12 +433,65 @@ def _check_gtt_state(conn: sqlite3.Connection, kite, account, snapshot: BrokerSn
                 position_state=_position_state(conn, t), suggested_action=CHECK_KITE,
             )
             continue
+        _check_gtt_staged_before_fill(conn, t, gtt)
         _check_gtt_quantity(conn, t, gtt)
         _check_gtt_price(conn, t, gtt)
         checked.add(t["id"])
     for ticket_id in list(_price_seen):
         if ticket_id not in checked:
             _price_seen.pop(ticket_id, None)
+
+
+def _check_protection_missing(conn: sqlite3.Connection, account) -> None:
+    """A live entry the broker accepted that has NO protective GTT at all (the GTT placement failed
+    after the order was accepted, or a recovered order never had one): its shares, or the shares it
+    is about to buy, are unprotected. Previously skipped here because only rows with a kite_gtt_id
+    were checked. Detection only: no GTT is ever created by reconciliation."""
+    rows = conn.execute(
+        "SELECT * FROM trade_tickets WHERE account_id = ? AND status = 'executed' AND mode = 'live' "
+        "AND kite_gtt_id IS NULL AND closed_at IS NULL AND use_gtt = 1 AND kite_order_id IS NOT NULL",
+        (account["id"],),
+    ).fetchall()
+    for t in rows:
+        if execution.is_closing_sell(t):
+            continue
+        held = position_quantity.open_quantity(conn, t["id"])
+        working = position_quantity.entry_still_working(t)
+        if not working and (held is None or held <= 0):
+            continue
+        what = (f"{held} share(s) are held" if held else "the entry order is working (nothing filled yet); whatever "
+                "fills")
+        log_mismatch(
+            conn, t["id"], "order_status", expected="an active protective GTT",
+            actual=f"no protective GTT (held {held})",
+            detail=f"{t['symbol']}: UNPROTECTED — {what} with NO protective GTT (order {t['kite_order_id']}). "
+                   f"Nothing re-creates it automatically: place a stop-loss in Kite now.",
+            issue_code=PROTECTION_MISSING, severity=URGENT, symbol=t["symbol"], gtt_id=None,
+            expected_quantity=held, broker_quantity=0, position_state=_position_state(conn, t),
+            suggested_action=CHECK_KITE,
+        )
+
+
+def _check_gtt_staged_before_fill(conn: sqlite3.Connection, ticket: sqlite3.Row, gtt: dict) -> None:
+    """An entry still working with nothing filled whose sell GTT is already live at the broker (the
+    frozen order path places it on acceptance). It protects nothing, and a GTT acts on the account's
+    holdings: if it triggers before the fill it can sell shares held outside this entry."""
+    if execution.is_closing_sell(ticket) or not position_quantity.entry_still_working(ticket):
+        return
+    if (position_quantity.filled(ticket) or 0) > 0:
+        return
+    covered = _gtt_quantity(gtt)
+    log_mismatch(
+        conn, ticket["id"], "order_status", expected="protection only for confirmed filled quantity",
+        actual=f"GTT {ticket['kite_gtt_id']} active for {covered}, 0 filled",
+        detail=f"{ticket['symbol']}: NOT PROTECTED — entry order {ticket['kite_order_id']} has filled nothing, but "
+               f"its sell GTT {ticket['kite_gtt_id']} is already active for {covered} share(s). It protects nothing "
+               f"yet and, if triggered before the fill, could sell shares held outside this entry. Watch the entry "
+               f"and the GTT in Kite.",
+        issue_code=GTT_STAGED_BEFORE_FILL, severity="warning", symbol=ticket["symbol"], gtt_id=ticket["kite_gtt_id"],
+        expected_quantity=0, broker_quantity=covered, position_state=_position_state(conn, ticket),
+        suggested_action=CHECK_KITE,
+    )
 
 
 def _check_gtt_quantity(conn: sqlite3.Connection, ticket: sqlite3.Row, gtt: dict) -> None:

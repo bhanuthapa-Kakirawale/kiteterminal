@@ -38,8 +38,8 @@
     ENTRY_OPEN: "Entry order at the broker, nothing filled yet. Nothing is owned.",
     ENTRY_PARTIAL: "Entry order still working; the filled shares are a real position already.",
     OPEN: "Shares held; no exit order at the broker.",
-    EXITING: "Exit order at the broker, not filled. The position stays open and protected until Kite reports "
-      + "the fill.",
+    EXITING: "Exit order at the broker, not filled. The position stays open, and keeps its protective GTT, "
+      + "until Kite reports the fill.",
     EXIT_PARTIAL: "Some shares are sold; the rest are still open.",
     CLOSED: "Every share sold — closed on the broker's fill.",
     REJECTED: "Refused before anything filled.",
@@ -49,14 +49,19 @@
   };
 
   const PROTECTION_ICON = {
-    PROTECTED: "🛡", MISSING: "⛔", QUANTITY_MISMATCH: "⚠", PRICE_MISMATCH: "⚠", UNKNOWN: "?", NOT_REQUESTED: "○",
+    PROTECTED: "🛡", MISSING: "⛔", QUANTITY_MISMATCH: "⚠", QUANTITY_EXCEEDS_POSITION: "⛔",
+    NOT_PROTECTED_PENDING_FILL: "⚠", PRICE_MISMATCH: "⚠", UNKNOWN: "?", NOT_REQUESTED: "○",
   };
   const PROTECTION_SEVERITY = {
-    PROTECTED: "ok", MISSING: "critical", QUANTITY_MISMATCH: "critical", PRICE_MISMATCH: "critical",
-    UNKNOWN: "warning", NOT_REQUESTED: "muted",
+    PROTECTED: "ok", MISSING: "critical", QUANTITY_MISMATCH: "critical", QUANTITY_EXCEEDS_POSITION: "critical",
+    NOT_PROTECTED_PENDING_FILL: "warning", PRICE_MISMATCH: "critical", UNKNOWN: "warning", NOT_REQUESTED: "muted",
   };
   const PROTECTION_HINTS = {
-    PROTECTED: "An active protective GTT covers the shares held (last known reconciliation state).",
+    PROTECTED: "An active protective GTT covers exactly the confirmed filled shares held (last known state).",
+    QUANTITY_EXCEEDS_POSITION: "The protective GTT could sell MORE shares than are confirmed held — it acts on all "
+      + "of the account's holdings of this stock. Check it in Kite now.",
+    NOT_PROTECTED_PENDING_FILL: "NOT PROTECTED — nothing has filled, but a sell GTT is already live at Kite. It "
+      + "protects nothing yet and, if it triggers before the fill, could sell shares held outside this entry.",
     MISSING: "UNPROTECTED — no active protective GTT for the shares held. Place a stop-loss in Kite.",
     QUANTITY_MISMATCH: "The protective GTT does not cover exactly the shares held.",
     PRICE_MISMATCH: "The protective GTT's stop at Kite differs from the app's stop.",
@@ -86,7 +91,14 @@
   function protectionBadge(lc) {
     if (!lc || lc.protection_status === "NOT_APPLICABLE") return `<span class="lc-muted">—</span>`;
     const s = lc.protection_status;
-    const gtt = lc.kite_gtt_id ? ` (GTT ${lc.kite_gtt_id})` : "";
+    // The GTT's actual status and quantity (broker-observed, or the app's record) against the
+    // confirmed filled quantity: the two are always shown side by side, never conflated.
+    const seen = lc.gtt_source === "broker" ? `${lc.gtt_status} at Kite, seen ${lc.gtt_observed_at} UTC`
+      : "app record, not yet observed at Kite";
+    const gtt = lc.kite_gtt_id
+      ? ` (GTT ${lc.kite_gtt_id}: ${seen}; covers ${lc.gtt_quantity ?? "?"}; confirmed filled `
+        + `${lc.confirmed_filled_quantity ?? "?"}, held ${lc.open_quantity ?? "?"})`
+      : "";
     return `<span class="lc-prot lc-sev-${PROTECTION_SEVERITY[s] || "muted"}" data-protection="${esc(s)}" `
       + `title="${esc((PROTECTION_HINTS[s] || "") + gtt)}"><span class="lc-icon" aria-hidden="true">`
       + `${PROTECTION_ICON[s] || ""}</span>${esc(lc.protection_label)}</span>`;

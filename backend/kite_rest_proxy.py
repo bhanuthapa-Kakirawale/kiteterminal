@@ -6,7 +6,10 @@ through that proxy, so they leave from its static IP. It is attached only
 to KiteConnect clients (kite_client.create_kite_connect): KiteTicker's
 WebSocket stays direct, and no process-wide HTTP_PROXY / HTTPS_PROXY is set.
 
-Unset or blank: KiteConnect connects directly, as before.
+Unset or blank: KiteConnect connects directly for reads, login and market
+data only. Every broker write is refused locally on the direct route
+(kite_client.DirectRouteKiteConnect), and Live Readiness blocks LIVE: the
+proxy is mandatory for LIVE.
 
 Set but malformed: refused. No client is built, and the launcher will not
 start. A configured proxy is never silently replaced by a direct route.
@@ -121,5 +124,5 @@ def describe(status: dict) -> str:
     if status["mode"] == PROXY:
         return f"Kite REST proxy enabled: {status['endpoint']}"
     if status["mode"] == DIRECT:
-        return f"Kite REST: direct ({ENV_VAR} not set)"
+        return f"Kite REST: direct, read-only ({ENV_VAR} not set): broker writes are refused and LIVE is disabled"
     return status["error"]

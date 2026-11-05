@@ -439,7 +439,9 @@ def test_23_full_entry_fill_changes_nothing_about_protection(env, market_open):
 
     row = ticket_row(env.db, buy_id)
     assert (row["entry_fill_status"], row["filled_quantity"]) == ("filled", 100)
-    assert not _modifies(env) and len(env.kite.calls_to("get_gtts")) == gtt_reads
+    # One GTT-book READ: every filled entry's protection is now verified at the broker, never
+    # assumed (order_monitor._resolve_entry). Still no modification.
+    assert not _modifies(env) and len(env.kite.calls_to("get_gtts")) == gtt_reads + 1
     assert _legs(env, gtt_id) == {100} and _open(env, buy_id) == 100
 
 

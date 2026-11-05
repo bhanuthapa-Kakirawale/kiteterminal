@@ -158,7 +158,8 @@ def test_reconciliation_issues_are_attached_structurally(env):
     p = _by_id(_get(env))[buy_id]
     codes = {i["code"] for i in p["reconciliation_issues"]}
     assert "GTT_QUANTITY_TOO_HIGH" in codes
-    assert p["protection_status"] == "QUANTITY_MISMATCH" and p["review_required"] is True
+    # GTT 100 against 40 held: it exceeds the position (was the generic QUANTITY_MISMATCH).
+    assert p["protection_status"] == "QUANTITY_EXCEEDS_POSITION" and p["review_required"] is True
     assert all({"id", "code", "label", "severity", "detail"} <= set(i) for i in p["reconciliation_issues"])
 
 

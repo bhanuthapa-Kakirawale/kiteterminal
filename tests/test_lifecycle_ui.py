@@ -200,7 +200,7 @@ def test_reconciliation_issue_is_visible(env):
     review, prot, detail = _render(["reviewCell", p], ["protectionBadge", p],
                                    ["positionDetailHtml", _ticket(env, buy_id)])
     assert "GTT quantity too high" in review and 'data-issue="GTT_QUANTITY_TOO_HIGH"' in review
-    assert "GTT QTY MISMATCH" in prot
+    assert "GTT EXCEEDS POSITION" in prot and "covers 100; confirmed filled 40, held 40" in prot
     assert "Position" in detail and "NEEDS REVIEW" in detail
 
 

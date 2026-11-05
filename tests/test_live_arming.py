@@ -17,6 +17,7 @@ FakeKite and a temporary database only.
 """
 
 import ast
+import types
 from pathlib import Path
 
 import pytest
@@ -253,8 +254,12 @@ def _fake_login(monkeypatch):
     from backend import kite_client
 
     class FakeKiteConnect:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
+            # NET-1: built by the production factory, which passes proxies= and sets
+            # reqsession.trust_env when KITE_REST_PROXY is configured (conftest `env` does).
             self.api_key = api_key
+            self.proxies = kwargs.get("proxies")
+            self.reqsession = types.SimpleNamespace(trust_env=True)
 
         def generate_session(self, request_token, api_secret):
             return {"access_token": "tok", "public_token": "pub", "user_id": "DT0001", "user_name": "Demo Trader"}

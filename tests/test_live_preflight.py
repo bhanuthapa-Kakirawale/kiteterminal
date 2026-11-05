@@ -244,8 +244,18 @@ def test_07d_one_snapshot_one_call_per_read_and_it_is_reused(ready):
 
 # ---------------------------------------------------------------- STATIC IP (8-10)
 
+def _no_egress_observation(env) -> None:
+    conn = env.db.get_connection()
+    try:
+        conn.execute("UPDATE live_readiness SET egress_ip = NULL, egress_checked_at = NULL")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_08_verified_static_ip_passes(ready, monkeypatch):
     from backend import live_preflight
+    _no_egress_observation(ready)
     r = ready.client.post("/api/live-readiness/static-ip", json={"ip": PUBLIC_IP, "confirm": True})
     assert r.status_code == 200 and r.json()["data"]["status"] == "USER_CONFIRMED"
     monkeypatch.setattr(live_preflight, "_fetch_egress_ip", lambda: PUBLIC_IP)
@@ -253,12 +263,18 @@ def test_08_verified_static_ip_passes(ready, monkeypatch):
     assert r.json()["data"]["status"] == "VERIFIED"
     check = _check(_evaluate(), "STATIC_IP")
     assert check["status"] == "PASS" and check["detail"]["state"] == "VERIFIED"
+    assert check["detail"]["egress_proven_via_proxy"] is True
 
 
-def test_08b_user_confirmed_without_observation_passes_with_a_recommendation(ready):
+def test_08b_user_confirmed_without_observation_now_needs_the_proxied_check(ready):
+    """Inverted (final order-path remediation): the user's attestation alone no longer passes.
+    LIVE needs proof that the configured proxy is the intended endpoint: an outbound-IP
+    observation taken through it that matches the whitelisted static IP."""
+    _no_egress_observation(ready)
     check = _check(_evaluate(), "STATIC_IP")
-    assert check["status"] == "PASS" and check["detail"]["state"] == "USER_CONFIRMED"
-    assert "Optional" in check["message"]
+    assert check["status"] == "USER_ACTION" and check["blocking"] is True
+    assert check["detail"]["state"] == "USER_CONFIRMED" and check["detail"]["egress_proven_via_proxy"] is False
+    assert "Run the outbound-IP check" in check["message"]
 
 
 def test_09_unknown_static_ip_is_action_required_and_blocks(ready):

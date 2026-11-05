@@ -125,11 +125,35 @@ def emergency_exit_confirm(req: EmergencyExitConfirmRequest, kite: KiteConnect =
                 results.append(_isolated_failure(conn, account, pos, attempt.get("ticket_id"), e))
 
         _attach_critical_finding_warnings(conn, results)
+        not_exitable = _unknown_entries(conn, account)
         summary = {status: sum(r["status"] == status for r in results) for status in _SUMMARY_STATUSES}
+        summary["not_exitable_unknown"] = len(not_exitable)
         _log_summary_event(conn, account, _summary_detail(positions, results, summary))
-        return {"data": {"count": len(positions), "results": results, "summary": summary}}
+        return {"data": {"count": len(positions), "results": results, "summary": summary,
+                         "not_exitable_unknown": not_exitable}}
     finally:
         conn.close()
+
+
+def _unknown_entries(conn, account) -> list[dict]:
+    """Live entries whose broker outcome is UNKNOWN or needs review: they may be real positions
+    the app cannot see, so Emergency Exit cannot sell them (it never sells a quantity it cannot
+    prove). Listed in the response instead of being silently left out. Read-only."""
+    try:
+        rows = conn.execute(
+            "SELECT id, symbol, quantity, submission_state, order_tag FROM trade_tickets WHERE account_id = ? "
+            "AND mode = 'live' AND status = 'confirmed' AND closes_ticket_id IS NULL "
+            "AND submission_state IN (?, ?, ?) ORDER BY id",
+            (account["id"], execution.UNKNOWN, execution.NEEDS_REVIEW, execution.SUBMITTING),
+        ).fetchall()
+    except Exception:
+        logger.exception("Emergency Exit could not list entries of unknown outcome")
+        return []
+    return [{"ticket_id": r["id"], "symbol": r["symbol"], "quantity": r["quantity"],
+             "submission_state": r["submission_state"], "order_tag": r["order_tag"],
+             "message": f"Entry #{r['id']} {r['symbol']} has an UNKNOWN broker outcome (tag {r['order_tag']}): "
+                        f"Emergency Exit cannot sell a quantity it cannot prove. Check Kite's order book and "
+                        f"positions for this tag and exit there if it exists."} for r in rows]
 
 
 def _attach_critical_finding_warnings(conn, results: list) -> None:

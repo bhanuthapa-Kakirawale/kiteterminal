@@ -67,7 +67,11 @@ def _client(monkeypatch, value):
 @pytest.mark.parametrize("value", [None, "", "enabled", " Enabled "])
 def test_writes_are_enabled_by_default(monkeypatch, sent, value):
     kite = _client(monkeypatch, value)
-    assert type(kite) is KiteConnect and kite_client.broker_writes_enabled()
+    # The switch enables writes; on the DIRECT route (no KITE_REST_PROXY) the client still refuses
+    # them (proxy mandatory), and with the proxy it is a plain KiteConnect.
+    assert type(kite) is kite_client.DirectRouteKiteConnect and kite_client.broker_writes_enabled()
+    monkeypatch.setenv("KITE_REST_PROXY", "http://10.77.0.1:3128")
+    assert type(kite_client.create_kite_connect("test_api_key")) is KiteConnect
 
 
 @pytest.mark.parametrize("value", ["disabled", "off", "DISABLED", "disabeld", "0", "no"])

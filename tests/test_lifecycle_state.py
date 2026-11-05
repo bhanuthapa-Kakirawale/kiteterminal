@@ -83,7 +83,10 @@ def test_3_submitted_live_entry_is_entry_open(env, market_open):
     assert t["ticket_state"]["code"] == "ORDER_WORKING"
     assert lc["lifecycle_state"] == "ENTRY_OPEN"  # ... but nothing is owned yet
     assert (lc["requested_quantity"], lc["filled_quantity"], lc["open_quantity"]) == (100, 0, 0)
-    assert lc["protection_status"] == "PROTECTED" and lc["protection_quantity"] == 100
+    # Inverted (final order-path remediation): an accepted entry with nothing filled is NOT
+    # protected, although its sell GTT for the full 100 is already live (frozen execution.py).
+    assert lc["protection_status"] == "NOT_PROTECTED_PENDING_FILL" and lc["protection_quantity"] == 100
+    assert (lc["gtt_quantity"], lc["confirmed_filled_quantity"], lc["protection_alert"]) == (100, 0, True)
     assert "EXIT" not in lc["allowed_actions"]
     assert {"CANCEL_ORDER", "EMERGENCY_EXIT"} <= set(lc["allowed_actions"])
     assert buy_id in _positions(env)
@@ -335,8 +338,11 @@ def test_20_gtt_quantity_and_price_mismatch_are_reflected(env):
     buy_id, _ = _held_position(env, 40, gtt_quantity=100)  # PK-16: the GTT covers more than is held
     _reconcile()
     lc = _lc(env, buy_id)
-    assert lc["protection_status"] == "QUANTITY_MISMATCH"
-    assert lc["protection_label"] == "GTT QTY MISMATCH" and lc["severity"] == "critical"
+    # The broker-observed GTT (100) exceeds the confirmed held quantity (40): it could sell shares
+    # held outside this position. Named for what it is (was the generic QUANTITY_MISMATCH).
+    assert lc["protection_status"] == "QUANTITY_EXCEEDS_POSITION"
+    assert lc["protection_label"] == "GTT EXCEEDS POSITION" and lc["severity"] == "critical"
+    assert (lc["gtt_quantity"], lc["gtt_source"], lc["open_quantity"]) == (100, "broker", 40)
     [issue] = [i for i in lc["reconciliation_issues"] if i["code"] == "GTT_QUANTITY_TOO_HIGH"]
     assert (issue["expected_quantity"], issue["broker_quantity"]) == (40, 100)
 

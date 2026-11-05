@@ -12,7 +12,7 @@ from backend import (
     config, execution, instruments, kite_client, market, order_monitor, paper_broker, position_quantity,
     reconciliation, risk_engine,
 )
-from backend import obs, worker_health
+from backend import gtt_observations, obs, worker_health
 from backend.accounts import get_default_account
 from backend.db import get_connection
 from backend.ticker import ticker_manager
@@ -138,6 +138,7 @@ def _tick_mode(conn: sqlite3.Connection, kite, tickets: list[sqlite3.Row]) -> No
     gtt_book = {g["id"]: g for g in raw_book if isinstance(g, dict) and g.get("id") is not None}
     if len(gtt_book) != len(raw_book):
         logger.warning("event=trailing.malformed_gtts skipped=%d", len(raw_book) - len(gtt_book))
+    gtt_observations.record_book(gtt_book.values())
     gtt_status = {gtt_id: g.get("status", "active") for gtt_id, g in gtt_book.items()}
     ltp_data = _trailing_ltps(kite, tickets, gtt_status)
 

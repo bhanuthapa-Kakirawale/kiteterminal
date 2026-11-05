@@ -14,6 +14,10 @@ from backend.redaction import register_secret
 
 logger = logging.getLogger(__name__)
 
+# The SDK class itself, bound at import: tests and the demo replace the module name KiteConnect
+# with stand-ins, and only a real client is ever narrowed (_narrow).
+_SDK_KITE_CONNECT = KiteConnect
+
 from backend.trading_calendar import IST  # PK-22C: one IST definition
 
 
@@ -90,7 +94,48 @@ def _restrict_if_writes_disabled(kite: KiteConnect) -> KiteConnect:
     still the one KiteConnect(...) built above (same proxy route and session); only its class, and so
     its _request, changes. Construction stays literal in the factory (test_14d)."""
     if not broker_writes_enabled():
-        kite.__class__ = ReadOnlyKiteConnect
+        _narrow(kite, ReadOnlyKiteConnect)
+    return kite
+
+
+def _narrow(kite, cls) -> None:
+    """Swap a real KiteConnect's class for a restricted subclass (same object, same session and
+    route). Only a real KiteConnect is narrowed: a stand-in that is not one (a test or demo double)
+    keeps its own methods; giving it the SDK's request path would only break it."""
+    if isinstance(kite, _SDK_KITE_CONNECT):
+        kite.__class__ = cls
+
+
+# ---- no direct route for broker writes (proxy mandatory for LIVE) ------------------------------
+#
+# Without KITE_REST_PROXY the client is built direct, for reads, market data, login and dry run
+# only. Every broker write (an order, a GTT, a cancel, an order-margin calculation; anything that
+# is not a GET, except the login token exchange) is refused inside this process before any request
+# is made, whoever calls it: a route, a background worker, Emergency Exit. A PermissionException
+# subclass, so the order paths record a definite refusal (nothing was sent), never an UNKNOWN. The
+# writes-disabled switch above, when set, still wins (ReadOnlyKiteConnect).
+class DirectRouteWritesRefused(PermissionException):
+    """A broker write refused locally because no Kite REST proxy is configured. Nothing was sent."""
+
+    def __init__(self, route: str, method: str):
+        super().__init__(f"No Kite REST proxy is configured ({kite_rest_proxy.ENV_VAR}): {method} {route} was "
+                         f"refused locally and never sent to Kite. Broker writes go only through the proxy; "
+                         f"use Kite web or the Kite app directly if you must act now.", code=403)
+
+
+class DirectRouteKiteConnect(KiteConnect):
+    """A direct-route KiteConnect: it can log in and read, never write."""
+
+    def _request(self, route, method, *args, **kwargs):
+        if str(method).upper() != "GET" and route not in _WRITES_DISABLED_ALLOWED_ROUTES:
+            logger.warning("event=broker_write.refused route=%s method=%s: no %s configured",
+                           route, str(method).upper(), kite_rest_proxy.ENV_VAR)
+            raise DirectRouteWritesRefused(route, str(method).upper())
+        return super()._request(route, method, *args, **kwargs)
+
+
+def _no_writes_on_direct_route(kite: KiteConnect) -> KiteConnect:
+    _narrow(kite, DirectRouteKiteConnect)
     return kite
 
 
@@ -100,11 +145,13 @@ def create_kite_connect(api_key: str) -> KiteConnect:
     data, orders, GTTs) goes through that proxy and nowhere else: an invalid
     value raises KiteRestProxyError before any client exists, and the session
     ignores environment proxy settings (HTTP(S)_PROXY, NO_PROXY, netrc) so
-    nothing can bypass or redirect the configured route. KiteTicker is not
-    built here and stays direct."""
+    nothing can bypass or redirect the configured route. Unset, the client is
+    direct and read-only (DirectRouteKiteConnect). KiteTicker is not built
+    here and stays direct."""
     proxy = kite_rest_proxy.from_env()
     if proxy is None:
-        return _restrict_if_writes_disabled(KiteConnect(api_key=api_key))
+        # Direct: reads only. No broker write ever leaves this machine without the proxy.
+        return _restrict_if_writes_disabled(_no_writes_on_direct_route(KiteConnect(api_key=api_key)))
     kite = KiteConnect(api_key=api_key, proxies=proxy.requests_proxies)
     kite.reqsession.trust_env = False
     return _restrict_if_writes_disabled(kite)

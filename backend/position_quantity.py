@@ -326,6 +326,8 @@ def sync_protection(conn: sqlite3.Connection, kite, position_id: int, reason: st
             return mismatch(f"GTT {gtt_id} covers {was}; resize to {desired} failed",
                             f"protective GTT {gtt_id} covers {was} share(s) but {desired} are open, and resizing it "
                             f"FAILED ({type(e).__name__}: {e}) ({reason}).")
+        from backend import gtt_observations
+        gtt_observations.record_resize(gtt_id, desired)
         was = _legs_text(current)
         message = f"Protective GTT {gtt_id} resized from {was} to {desired} share(s) ({reason})."
         _log_event(conn, position_id, "modified", message)

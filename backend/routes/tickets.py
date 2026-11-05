@@ -8,7 +8,8 @@ from kiteconnect import KiteConnect
 from kiteconnect.exceptions import KiteException
 
 from backend import (
-    account_safety, execution, instruments, kite_chart, lifecycle, live_arming, paper_broker, position_quantity,
+    account_safety, execution, instruments, kite_chart, lifecycle, live_arming, live_entry_gate, paper_broker,
+    position_quantity,
     reconciliation,
     risk_engine,
     signal_chart,
@@ -951,14 +952,15 @@ def _account_safety_precheck(conn: sqlite3.Connection, account: sqlite3.Row, tic
 
 
 def _account_safety_final_gate(conn: sqlite3.Connection, account: sqlite3.Row, kite: KiteConnect,
-                               ticket: sqlite3.Row, ctx: risk_engine.PortfolioContext | None) -> None:
+                               ticket: sqlite3.Row, ctx: risk_engine.PortfolioContext | None,
+                               variety: str | None = None) -> None:
     """PK-12, after the claim and risk revalidation, immediately before the
     broker call. A refusal withdraws the claim (nothing was sent): the ticket
     returns to 'pending_confirmation' so it can be approved once the
     condition clears — or is rejected if the market has already crossed its
     stop."""
     decision = account_safety.final_gate(conn, account["id"], ticket, kite,
-                                         ctx.portfolio_value if ctx is not None else None)
+                                         ctx.portfolio_value if ctx is not None else None, variety=variety)
     if decision.passed:
         return
     reasons = "; ".join(f"{f.code}: {f.message}" for f in decision.failures)
@@ -972,6 +974,18 @@ def _account_safety_final_gate(conn: sqlite3.Connection, account: sqlite3.Row, k
     account_safety.log_refusal(conn, account["id"], ticket, ticket["mode"], "before broker call", decision.failures)
     _end_claim(conn, ticket, account["id"], status, event_type, detail)
     _raise_account_safety(decision.failures)
+
+
+def _refuse_disabled_live_entry(conn: sqlite3.Connection, account: sqlite3.Row, ticket: sqlite3.Row) -> None:
+    """Backstop of live_entry_gate.refusal immediately before the broker call. The claim is
+    withdrawn (nothing was sent) and the ticket awaits approval again."""
+    failure = live_entry_gate.refusal(ticket, ticket["mode"])
+    if failure is None:
+        return
+    account_safety.log_refusal(conn, account["id"], ticket, ticket["mode"], "before broker call", [failure])
+    _end_claim(conn, ticket, account["id"], "pending_confirmation", "modified",
+               f"Refused before the broker call — {failure.code}: {failure.message}")
+    _raise_account_safety([failure])
 
 
 def _refuse_daily_entry_limit(conn: sqlite3.Connection, account: sqlite3.Row, ticket: sqlite3.Row) -> None:
@@ -1170,10 +1184,13 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
         ctx = _revalidate_at_confirm(conn, account, kite, ticket)
     if new_entry:
         # PK-12: the account safety gate has the last word before the broker.
-        _account_safety_final_gate(conn, account, kite, ticket, ctx)
+        _account_safety_final_gate(conn, account, kite, ticket, ctx, variety)
     # The last look at the database before the broker call: a write that landed during
     # revalidation refuses the execution instead of leaving tampered content behind.
     _verify_claimed_content(conn, account, ticket, "pre_broker")
+    # The LIVE-entry hard gate's last copy, adjacent to the only execute_ticket call: whatever path
+    # reached this point, a LIVE new entry is never sent while entries are disabled.
+    _refuse_disabled_live_entry(conn, account, ticket)
     # PK-20: the broker of the ticket's own mode — Kite for live, the paper
     # broker (on this request's connection, so the paper order is written in
     # the same transaction as the ticket's outcome) for dry run.
@@ -1296,6 +1313,36 @@ def _reconcile_late_result(conn: sqlite3.Connection, claimed: sqlite3.Row, resul
                 actual=f"confirming request also received order {result.kite_order_id}", detail=detail,
             )
     conn.commit()
+
+
+@router.get("/api/tickets/{ticket_id}/margin-preview")
+def margin_preview(ticket_id: int, kite: KiteConnect = Depends(require_trading_account)):
+    """The margin preflight's figures for a LIVE new entry, shown in the confirm dialog: available
+    funds, Kite's own margin for this exact order, charges, the order value and the per-order cap.
+    Read-only: one LTP read, one funds read and Kite's order-margin calculation (a POST that places
+    nothing). The final gate repeats the check at approval; this never authorises anything."""
+    account = get_trading_account()
+    conn = get_connection()
+    try:
+        ticket = _get_ticket_or_404(conn, ticket_id, account["id"])
+        if execution.is_closing_sell(ticket):
+            return {"data": {"applicable": False, "reason": "An exit sells shares already held: no margin is needed."}}
+        mode = execution.get_execution_mode()
+        if mode != "live":
+            return {"data": {"applicable": False,
+                             "reason": "Dry run: the paper broker uses no funds; no margin check applies."}}
+        settings = risk_engine.get_settings(conn, account["id"])
+    finally:
+        conn.close()
+    try:
+        ltp = account_safety.fetch_ltp(kite, ticket)
+    except Exception:
+        ltp = None
+    from backend import margin_preflight
+    result = margin_preflight.evaluate(kite, ticket, account_safety.VARIETY_REGULAR, ltp)
+    return {"data": {"applicable": True, **result, "reference_price": ltp,
+                     "max_order_notional": settings["max_order_notional"],
+                     "live_entries_enabled": live_entry_gate.entries_enabled()}}
 
 
 @router.post("/api/tickets/{ticket_id}/confirm")

@@ -467,6 +467,9 @@ def test_21b_absolute_lifetime_expiry_cannot_be_kept_alive_by_activity(clock, en
 def _kite_replies(method: str, path: str):
     if path == "/user/margins":
         return {"equity": {"net": 1_000_000.0, "available": {"collateral": 0.0}}}
+    if path == "/user/margins/equity":
+        return {"enabled": True, "net": 1_000_000.0,
+                "available": {"collateral": 0.0, "cash": 1_000_000.0, "live_balance": 1_000_000.0}}
     if path == "/portfolio/holdings":
         return []
     if path == "/portfolio/positions":
@@ -496,10 +499,29 @@ def _only_proxied_reads(wire) -> None:
 
 
 def test_22_writes_disabled_live_confirm_sends_no_order(writes_disabled, wire, market_open):  # noqa: F811
+    """Since the margin preflight, a writes-disabled live entry is refused one step earlier: Kite's
+    order-margin calculation is a POST, refused locally like every write, so the gate fails closed
+    (MARGIN_DATA_UNAVAILABLE) before the order. Nothing but proxied GETs reaches the wire."""
     env = writes_disabled
     set_mode(env.db, "live")
     t = _create(env)
     assert t["status"] == "pending_confirmation", t
+    r = _confirm(env, t["id"])
+    assert r.status_code == 503 and r.json()["detail"]["error_code"] == "MARGIN_DATA_UNAVAILABLE", r.text
+    assert "BrokerWritesDisabled" in r.json()["detail"]["message"]
+    assert ticket_row(env.db, t["id"])["status"] == "pending_confirmation"
+    _only_proxied_reads(wire)
+
+
+def test_22a_writes_disabled_order_itself_is_refused_locally(writes_disabled, wire, market_open,  # noqa: F811
+                                                             monkeypatch):
+    """The original end-to-end assertion, with the margin preflight passed in-test: the order call
+    itself is refused inside the process and recorded as a definite rejection."""
+    from backend import margin_preflight
+    monkeypatch.setattr(margin_preflight, "check", lambda kite, ticket, variety, ltp: ([], {}))
+    env = writes_disabled
+    set_mode(env.db, "live")
+    t = _create(env)
     r = _confirm(env, t["id"])
     assert r.status_code == 200, r.text
     data = r.json()["data"]

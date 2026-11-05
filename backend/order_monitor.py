@@ -579,11 +579,17 @@ def _resolve_entry(conn: sqlite3.Connection, kite, ticket: sqlite3.Row, order: d
             msg += _protection_note(sync, None)
             severity = "urgent" if sync.urgent else severity
         msg += _close_if_sold_out(conn, kite, ticket["id"], filled)
-        if (ticket["submission_state"] == execution.ADOPTED and ticket["use_gtt"]
-                and not _gtt_is_active(kite, ticket["kite_gtt_id"])):
-            # A recovered entry never had its protection placed by this app
-            # (see _adopt): verify it, never assume it.
-            warning = (f"{ticket['symbol']}: recovered entry {ticket['kite_order_id']} is now FILLED with NO active "
+        still_open = conn.execute("SELECT closed_at FROM trade_tickets WHERE id = ?",
+                                  (ticket["id"],)).fetchone()["closed_at"] is None
+        if still_open and ticket["use_gtt"] and not _gtt_is_active(kite, ticket["kite_gtt_id"]):
+            # Every filled entry's protection is verified at the broker, never
+            # assumed: a recovered entry never had its GTT placed by this app
+            # (see _adopt), and an entry whose GTT placement failed after the
+            # order was accepted (protection_failed) has none either — even
+            # when it fills straight to COMPLETE. No GTT is created here: a
+            # GTT carries no tag, so a retry could duplicate protection.
+            what = "recovered entry" if ticket["submission_state"] == execution.ADOPTED else "entry"
+            warning = (f"{ticket['symbol']}: {what} {ticket['kite_order_id']} is now FILLED with NO active "
                        f"protective GTT — UNPROTECTED POSITION, place a stop-loss in Kite now.")
             _log_event(conn, ticket["id"], "protection_failed", warning)
             reconciliation.log_mismatch(

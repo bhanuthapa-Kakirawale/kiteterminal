@@ -73,7 +73,7 @@
     if (!route || !route.mode) return "";
     if (route.mode === "PROXY") return `REST via PROXY ${route.endpoint}`;
     if (route.mode === "INVALID") return "REST proxy setting INVALID";
-    return "REST DIRECT";
+    return "REST DIRECT — LIVE disabled (proxy required)";
   }
 
   function viewModel(data) {

@@ -1,3 +1,4 @@
+import os
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -170,6 +171,14 @@ def seed_ohlc(db, instrument_token: int, symbol: str, candles: list[dict]) -> No
 TEST_STATIC_IP = "203.0.113.10"
 GENEROUS_NOTIONAL = 1_000_000_000.0
 GENEROUS_DAILY_LOSS = 1_000_000_000.0
+# The proxy is mandatory for LIVE (account_safety.check_rest_route, live_preflight KITE_REST_ROUTE),
+# and arming needs an outbound-IP observation taken through it (live_preflight.egress_proof). The
+# env fixture configures this value and seeds that observation. It is never contacted: env tests
+# run on FakeKite, and the discard port on loopback would refuse anything that tried. The proxy
+# tests (test_kite_rest_proxy.py, test_proxy_mandatory.py) set their own values.
+TEST_REST_PROXY = "http://127.0.0.1:9"
+
+_REAL_INTERIM: dict = {}
 
 
 def seed_live_prerequisites(db) -> None:
@@ -178,11 +187,20 @@ def seed_live_prerequisites(db) -> None:
         account_id = conn.execute("SELECT id FROM accounts WHERE is_default = 1").fetchone()["id"]
         conn.execute("UPDATE risk_settings SET max_order_notional = ?, max_daily_loss_amount = ? WHERE account_id = ?",
                      (GENEROUS_NOTIONAL, GENEROUS_DAILY_LOSS, account_id))
-        conn.execute("INSERT OR REPLACE INTO live_readiness (account_id, static_ip, static_ip_confirmed_at) "
-                     "VALUES (?, ?, datetime('now'))", (account_id, TEST_STATIC_IP))
+        conn.execute("INSERT OR REPLACE INTO live_readiness (account_id, static_ip, static_ip_confirmed_at, "
+                     "egress_ip, egress_checked_at) VALUES (?, ?, datetime('now'), ?, datetime('now'))",
+                     (account_id, TEST_STATIC_IP, TEST_STATIC_IP))
         conn.commit()
+        checked_at = conn.execute("SELECT egress_checked_at FROM live_readiness WHERE account_id = ?",
+                                  (account_id,)).fetchone()["egress_checked_at"]
     finally:
         conn.close()
+    from backend import kite_rest_proxy, live_preflight
+    live_preflight.reset_egress_routes()
+    route = kite_rest_proxy.route_status()
+    if route["mode"] != kite_rest_proxy.PROXY:
+        route = {"mode": kite_rest_proxy.PROXY, "endpoint": kite_rest_proxy.parse(TEST_REST_PROXY).display}
+    live_preflight.record_egress_route(account_id, checked_at, route)
 
 
 def clear_live_prerequisites(db) -> None:
@@ -193,6 +211,33 @@ def clear_live_prerequisites(db) -> None:
         conn.commit()
     finally:
         conn.close()
+    from backend import live_preflight
+    live_preflight.reset_egress_routes()
+
+
+def open_live_entry_gate(monkeypatch) -> None:
+    """The LIVE-entry hard gate (backend/live_entry_gate.py) refuses every LIVE new entry in the
+    production build. Most of the suite tests the order path BEHIND that gate (claims, risk
+    revalidation, account safety, the broker call, fills), so the env fixture lifts it in-process,
+    exactly like the generous limits above. test_live_entry_gate.py tests the gate at its
+    production value (and that the source constant is False)."""
+    from backend import live_entry_gate
+    monkeypatch.setattr(live_entry_gate, "LIVE_ENTRIES_ENABLED", True)
+    # The two interim guards too: much of the suite was written against LIMIT live entries and
+    # several entries of one symbol (the order path behind the guards still supports both).
+    # test_presellable_guard.py and test_live_entry_gate.py restore the real guards
+    # (restore_interim_guards). The margin preflight stays active for every test.
+    _REAL_INTERIM.setdefault("market_rule", live_entry_gate.check_market_regular_only)
+    _REAL_INTERIM.setdefault("presellable", live_entry_gate.check_no_presellable_quantity)
+    monkeypatch.setattr(live_entry_gate, "check_market_regular_only", lambda ticket, mode, variety: [])
+    monkeypatch.setattr(live_entry_gate, "check_no_presellable_quantity",
+                        lambda conn, account_id, ticket, kite, mode: ([], {}))
+
+
+def restore_interim_guards(monkeypatch) -> None:
+    from backend import live_entry_gate
+    monkeypatch.setattr(live_entry_gate, "check_market_regular_only", _REAL_INTERIM["market_rule"])
+    monkeypatch.setattr(live_entry_gate, "check_no_presellable_quantity", _REAL_INTERIM["presellable"])
 
 
 # SEC-1: a live NEW entry also needs the live state it rests on, re-checked
@@ -275,6 +320,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(crypto, "ENV_PATH", tmp_path / ".env")
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     monkeypatch.setattr(ui_prefs, "PREFS_PATH", tmp_path / "ui_prefs.json")
+    if not (os.environ.get("KITE_REST_PROXY") or "").strip():  # a test's own proxy fixture may have run first
+        monkeypatch.setenv("KITE_REST_PROXY", TEST_REST_PROXY)
     db.init_db()
 
     conn = db.get_connection()
@@ -293,6 +340,9 @@ def env(tmp_path, monkeypatch):
     finally:
         conn.close()
     seed_live_prerequisites(db)
+    open_live_entry_gate(monkeypatch)
+    from backend import gtt_observations
+    gtt_observations.reset()
 
     fake = FakeKite(
         holdings=[{

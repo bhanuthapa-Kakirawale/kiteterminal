@@ -125,7 +125,7 @@ def test_idle_expiry_locks_reads_and_writes(clock, env):
     assert env.client.get("/api/holdings").status_code == 200
     clock.advance(1)
     _refused(env.client.get("/api/holdings"), security.EXPIRED_IDLE)
-    _refused(env.client.post("/api/kill-switch/activate", json={}), security.EXPIRED_IDLE)
+    _refused(env.client.post("/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "EXIT ALL"}), security.EXPIRED_IDLE)
     assert not security.terminal_credential_valid(cookie)
 
 
@@ -207,7 +207,7 @@ def test_an_expired_pair_never_works_again_even_after_a_new_login(clock, env):
                               "Origin": TERMINAL_ORIGIN})
     stale.cookies.set("kt_session", old_cookie)
     assert stale.get("/api/holdings").status_code == 401
-    assert stale.post("/api/kill-switch/activate", json={}).status_code == 401
+    assert stale.post("/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "EXIT ALL"}).status_code == 401
     assert env.client.get("/api/holdings").status_code == 200
 
 

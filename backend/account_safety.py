@@ -24,6 +24,17 @@ Controls (one small function each):
                                                           complete, no critical finding, critical
                                                           workers healthy, paper/live isolated,
                                                           calendar covered; both orchestrators)
+  G    LIVE-entry hard gate    live_entry_gate.refusal   live (every LIVE new entry refused
+                                                          while the frozen order path places its
+                                                          GTT before the fill; first, in both
+                                                          orchestrators and again before the
+                                                          broker call in routes/tickets.py)
+  G1   regular MARKET only     live_entry_gate.check_market_regular_only  live (interim)
+  G2   no pre-sellable qty     live_entry_gate.check_no_presellable_quantity  live, final gate
+                                                          (interim; fresh broker reads, fail closed)
+  M    margin preflight        margin_preflight.check    live, final gate (fresh funds + Kite's
+                                                          order-margin calculation, fail closed)
+  N    REST proxy route        check_rest_route          live (KITE_REST_PROXY must be configured)
   R    manual ticket review    check_ticket_review       both modes (SEC-1 P1-D: a manual /
                                                           Quick-Action BUY entry was reviewed in
                                                           the current NSE session window and Kite
@@ -96,6 +107,7 @@ TICKET_REVIEW_REQUIRED = "TICKET_REVIEW_REQUIRED"
 TICKET_REVIEW_CHANGED = "TICKET_REVIEW_CHANGED"
 TICKET_EVIDENCE_MISMATCH = "TICKET_EVIDENCE_MISMATCH"
 TICKET_REVIEW_NOT_APPLICABLE = "TICKET_REVIEW_NOT_APPLICABLE"
+KITE_REST_PROXY_REQUIRED = "KITE_REST_PROXY_REQUIRED"
 
 VARIETY_REGULAR = "regular"
 VARIETY_AMO = "amo"
@@ -473,6 +485,10 @@ def check_live_prerequisites(conn: sqlite3.Connection, account_id: int, settings
         missing.append(f"static IP check FAILED ({ip['message']})")
     elif ip["status"] not in live_preflight.STATIC_IP_ACCEPTABLE:
         missing.append("the Kite static IP has not been confirmed on the Live Readiness page")
+    else:
+        proof = live_preflight.egress_proof(conn, account_id)
+        if not proof["proven"]:
+            missing.append(proof["message"])
     unknown = live_preflight.unresolved_live_submissions(conn, account_id, now.astimezone(timezone.utc))
     if unknown:
         ids = ", ".join(f"#{u['id']}" for u in unknown[:5])
@@ -482,6 +498,21 @@ def check_live_prerequisites(conn: sqlite3.Connection, account_id: int, settings
     return SafetyFailure(LIVE_PREREQUISITE_MISSING,
                          "Live entry refused — live-trading prerequisite(s) missing: " + "; ".join(missing)
                          + ". See Live Readiness. Nothing was executed; exits are still allowed.")
+
+
+def check_rest_route() -> SafetyFailure | None:
+    """A live new entry needs the configured Kite REST proxy (NET-1): with
+    KITE_REST_PROXY unset or invalid the REST client refuses every broker
+    write anyway (kite_client.DirectRouteKiteConnect); this refuses earlier,
+    with the reason, and never falls back to a direct route."""
+    from backend import kite_rest_proxy
+    route = kite_rest_proxy.route_status()
+    if route["mode"] == kite_rest_proxy.PROXY:
+        return None
+    why = route["error"] if route["mode"] == kite_rest_proxy.INVALID else f"{kite_rest_proxy.ENV_VAR} is not set"
+    return SafetyFailure(KITE_REST_PROXY_REQUIRED,
+                         f"Live entry refused — the Kite REST proxy is required for LIVE ({why}). Broker writes are "
+                         f"never sent directly. Nothing was executed.")
 
 
 def check_live_armed(conn: sqlite3.Connection, account_id: int) -> SafetyFailure | None:
@@ -871,6 +902,9 @@ def precheck(conn: sqlite3.Connection, account_id: int, ticket: sqlite3.Row, mod
     decision.add(check_trading_lock(state))
     live = mode == "live"
     if live:
+        from backend import live_entry_gate
+        decision.add(live_entry_gate.refusal(ticket, mode))
+        decision.add(check_rest_route())
         decision.add(check_live_armed(conn, account_id))
         decision.add(check_live_prerequisites(conn, account_id, settings, now))
         for failure in check_live_critical_state(conn, account_id, now):
@@ -891,11 +925,16 @@ def precheck(conn: sqlite3.Connection, account_id: int, ticket: sqlite3.Row, mod
     variety, failure = decide_variety(now, allow_amo)
     decision.add(failure)
     decision.variety = variety
+    if live:
+        from backend import live_entry_gate
+        for failure in live_entry_gate.check_market_regular_only(ticket, mode, variety):
+            decision.add(failure)
     return decision
 
 
 def final_gate(conn: sqlite3.Connection, account_id: int, ticket: sqlite3.Row, kite: KiteConnect,
-               portfolio_value: float | None, now: datetime | None = None) -> SafetyDecision:
+               portfolio_value: float | None, now: datetime | None = None,
+               variety: str | None = None) -> SafetyDecision:
     """After the claim and risk revalidation, immediately before the broker
     call. Re-checks what may have changed meanwhile, then — only if nothing
     failed — makes the single LTP call for the price checks. An LTP that
@@ -913,9 +952,19 @@ def final_gate(conn: sqlite3.Connection, account_id: int, ticket: sqlite3.Row, k
         decision.add(failure)
     if ticket["mode"] != "live":
         return decision
+    from backend import live_entry_gate, margin_preflight
+    # The hard gate first: nothing below, not even a broker read, runs for a
+    # LIVE entry while entries are disabled.
+    decision.add(live_entry_gate.refusal(ticket, ticket["mode"]))
+    if not decision.passed:
+        return decision
     settings = risk_engine.get_settings(conn, account_id)
+    decision.add(check_rest_route())
     decision.add(check_breaker(state))
     decision.add(check_live_armed(conn, account_id))
+    decision.add(check_notional(ticket, settings))
+    for failure in live_entry_gate.check_market_regular_only(ticket, ticket["mode"], variety):
+        decision.add(failure)
     decision.add(check_daily_loss(conn, account_id, settings, now, portfolio_value))
     # SEC-1: re-evaluated here as well: reconciliation can raise a critical
     # finding, or a worker can stall, between the pre-check and this point.
@@ -934,6 +983,18 @@ def final_gate(conn: sqlite3.Connection, account_id: int, ticket: sqlite3.Row, k
                                    f"market, so nothing was executed.", http_status=503))
         return decision
     for failure in check_price_sanity(ticket, ltp, settings):
+        decision.add(failure)
+    if not decision.passed:
+        return decision
+    # Interim: no pre-existing sellable quantity the entry's GTT could sell.
+    failures, _ = live_entry_gate.check_no_presellable_quantity(conn, account_id, ticket, kite, ticket["mode"])
+    for failure in failures:
+        decision.add(failure)
+    if not decision.passed:
+        return decision
+    # The account's funds against Kite's own margin figure for this order.
+    failures, _ = margin_preflight.check(kite, ticket, variety or VARIETY_REGULAR, ltp)
+    for failure in failures:
         decision.add(failure)
     return decision
 

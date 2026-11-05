@@ -17,6 +17,7 @@ import logging
 import re
 import shutil
 import subprocess
+import types
 from pathlib import Path
 
 import pytest
@@ -265,8 +266,12 @@ def fake_login(monkeypatch):
     seen = {"request_tokens": [], "set_access_token": []}
 
     class FakeKiteConnect:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
+            # NET-1: built by the production factory, which passes proxies= and sets
+            # reqsession.trust_env when KITE_REST_PROXY is configured (conftest `env` does).
             self.api_key = api_key
+            self.proxies = kwargs.get("proxies")
+            self.reqsession = types.SimpleNamespace(trust_env=True)
 
         def login_url(self):
             return f"https://kite.zerodha.com/connect/login?api_key={self.api_key}&v=3"

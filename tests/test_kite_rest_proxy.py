@@ -107,6 +107,13 @@ def constructed(monkeypatch):
 @pytest.fixture
 def proxy_env(monkeypatch):
     monkeypatch.setenv("KITE_REST_PROXY", PROXY_URL)
+    # LIVE needs the outbound-IP observation to have been taken through the CONFIGURED proxy
+    # (live_preflight.egress_proof). conftest `env` seeded one through its own test proxy; with
+    # this endpoint configured instead it is re-recorded as taken through this one, as re-running
+    # the outbound-IP check would. Tests of the proof itself are in test_proxy_mandatory.py.
+    from backend import kite_rest_proxy, live_preflight
+    for account, seen in list(live_preflight._egress_routes.items()):
+        live_preflight.record_egress_route(account, seen["checked_at"], kite_rest_proxy.route_status())
 
 
 def _with_token(env):
@@ -235,7 +242,8 @@ def test_08c_startup_logs_only_the_sanitized_endpoint(caplog):
     assert "Kite REST proxy enabled: 10.77.0.1:3128" in caplog.text
     with caplog.at_level("INFO"):
         enforce_runtime_policy(env={}, argv=["python"], allowed_hosts={"127.0.0.1"})
-    assert "Kite REST: direct (KITE_REST_PROXY not set)" in caplog.text
+    assert "Kite REST: direct, read-only (KITE_REST_PROXY not set)" in caplog.text
+    assert "broker writes are refused and LIVE is disabled" in caplog.text
 
 
 def test_08d_launcher_refuses_an_invalid_proxy(monkeypatch, capsys):
@@ -561,11 +569,17 @@ def test_21_healthy_proxy_passes_and_readiness_can_be_ready(ready, proxy_env):
     assert result["overall_status"] == "READY", result["blocking_codes"]
 
 
-def test_21b_no_proxy_is_an_advisory_warning_and_readiness_is_unchanged(ready):
+def test_21b_no_proxy_blocks_live_readiness(ready, monkeypatch):
+    """Inverted (final order-path remediation): the GCP proxy is mandatory for LIVE. Without it the
+    REST client refuses every broker write locally, and Live Readiness shows a blocker, not an
+    advisory warning."""
+    monkeypatch.delenv("KITE_REST_PROXY", raising=False)
     result = _evaluate()
     route = _check(result, "KITE_REST_ROUTE")
-    assert route["status"] == "WARN" and route["blocking"] is False
-    assert result["overall_status"] == "READY" and result["rest_route"] == {"mode": "DIRECT", "endpoint": None}
+    assert route["status"] == "FAIL" and route["blocking"] is True
+    assert "REST proxy required for LIVE" in route["message"]
+    assert result["overall_status"] == "NOT_READY" and "KITE_REST_ROUTE" in result["blocking_codes"]
+    assert result["rest_route"] == {"mode": "DIRECT", "endpoint": None}
 
 
 def test_22_broker_check_reports_proxy_routing(ready, proxy_env):
@@ -712,6 +726,7 @@ def test_23e_outbound_ip_check_proxy_down_fails_closed(ready, monkeypatch, no_di
 
 def test_23c_outbound_ip_check_without_proxy_is_unchanged(ready, monkeypatch):
     import urllib.request
+    monkeypatch.delenv("KITE_REST_PROXY", raising=False)
     used = []
     monkeypatch.setattr(urllib.request, "build_opener", lambda *h: used.append(h))
     monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout=None: _Reply(TEST_STATIC_IP))
@@ -735,10 +750,12 @@ def test_24_dry_run_works_with_a_proxy_and_never_mutates_the_broker(env, proxy_e
 def test_25_direct_mode_requests_carry_no_configured_proxy(env, wire, monkeypatch):
     _with_token(env)
     monkeypatch.setattr(kite_client, "get_kite", REAL_GET_KITE)
+    monkeypatch.delenv("KITE_REST_PROXY", raising=False)
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         monkeypatch.delenv(name, raising=False)
     kite = kite_client.get_kite()
     assert kite.proxies == {} and kite.reqsession.trust_env is True
+    assert isinstance(kite, kite_client.DirectRouteKiteConnect)  # direct: reads only
     kite.profile()
     assert wire.sends[0]["host"] == "api.kite.trade"
     assert not {"http", "https"} & set(wire.sends[0]["proxies"])
