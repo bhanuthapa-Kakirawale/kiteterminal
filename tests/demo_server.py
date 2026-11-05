@@ -522,6 +522,28 @@ def install_review_controls(app, fake) -> None:
     def demo_now():
         return pinned["at"] if pinned["at"] is not None else real_now()
     trading_calendar.now_ist = demo_now
+    started_utc = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    def align_seed_signals_to(trade_day_at) -> None:
+        """The demo's strategy signals were produced by the real scan when the demo was seeded, so
+        they carry the seed instant's created_at. Pinning the clock to `trade_day` (the trading
+        day those signals are current on) re-dates exactly those seed-time signals to that
+        morning, before the pinned time: "blocked today" then means the pinned day for the server
+        and the browser alike, whatever hour or day the demo was seeded (after 15:30 IST, on a
+        weekend or a holiday the seed day and the pinned day differ). Signals created after the
+        server started are never touched; nothing else about a ticket changes."""
+        morning = min(_dt(trade_day.year, trade_day.month, trade_day.day, 8, 45, tzinfo=trading_calendar.IST),
+                      trade_day_at - timedelta(minutes=1))
+        stamp = morning.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        conn = db.get_connection()
+        try:
+            conn.execute(
+                "UPDATE trade_tickets SET created_at = ? WHERE source = 'strategy' AND closes_ticket_id IS NULL "
+                "AND entry_evaluation IS NOT NULL AND status IN ('pending_confirmation', 'risk_rejected') "
+                "AND created_at <= ?", (stamp, started_utc))
+            conn.commit()
+        finally:
+            conn.close()
 
     @app.post("/api/demo/clock")
     def demo_clock(body: dict = Body(...)):
@@ -529,6 +551,7 @@ def install_review_controls(app, fake) -> None:
             if body.get("time") is not None:
                 hh, mm = (int(x) for x in str(body["time"]).split(":"))
                 pinned["at"] = _dt(trade_day.year, trade_day.month, trade_day.day, hh, mm, tzinfo=trading_calendar.IST)
+                align_seed_signals_to(pinned["at"])
             elif body.get("ist") is not None:
                 parsed = _dt.fromisoformat(str(body["ist"]))
                 pinned["at"] = parsed.replace(tzinfo=trading_calendar.IST) if parsed.tzinfo is None else parsed

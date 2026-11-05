@@ -36,7 +36,18 @@ Both browser scripts can run at any hour. Start the demo with
 server's trading clock (`POST /api/demo/clock`, demo only) and the browser's
 clock (Playwright `page.clock`) to 11:00 IST on the trading day after the
 demo's seeded session. Without it, on a weekend or after hours the browser
-says "market closed" and the first approval opens the AMO dialog instead.
+says "market closed" and the first approval opens the AMO dialog instead
+(since 2026-11-05 that is a named FAIL after 10 s, not a stall, and
+`e2e_results.json` is still written).
+
+Pinning to that trading day also re-dates the demo's seed-time strategy
+signals (the real scan's tickets, including the risk-blocked TCS and
+NEWLISTCO) to 08:45 IST on it. Previously, a demo seeded after 15:30 IST, on
+a weekend or on a holiday kept the seed day's `created_at` while the pinned
+browser clock showed the next trading day, so "blocked today" was empty and
+the blocked-list check failed (53/54). The assertions are unchanged. A
+`--keep-db` restart re-dates again to its own trading day. `e2e_ui.py` also
+checks that the browser's day equals the server's pinned trading day.
 
 Since SEC-1 P1-F every write needs the terminal credential that a Kite
 login issues; since P2-G it has two factors (the HttpOnly cookie and the
