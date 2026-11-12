@@ -68,6 +68,33 @@ SCRUBBED_PREFIX = "KITE_"
 # in the user profile). The suite points KT_INSTALLATION_REGISTRY_DIR at a temporary directory (conftest); nothing
 # may read or write the real one. Computed here from LOCALAPPDATA, independent of that override.
 REAL_REGISTRY_DIR = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / ".local" / "share")) / "KiteTerminal"
+REGISTRY_ENV = "KT_INSTALLATION_REGISTRY_DIR"
+
+
+def configured_registry_dirs() -> list[Path]:
+    """Post-V12 closure (2026-11-12): the operator's production registry directory, when it is configured as a
+    persistent Windows environment variable (user or machine). Read from the Windows registry, NOT from this
+    process's environment: conftest replaces the process value with a temporary directory, and child processes
+    inherit that temporary value, which must stay writable. Relative or empty values are ignored (the application
+    refuses them anyway)."""
+    if os.name != "nt":
+        return []
+    import winreg
+    found = []
+    for hive, key in ((winreg.HKEY_CURRENT_USER, r"Environment"),
+                      (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")):
+        try:
+            with winreg.OpenKey(hive, key) as handle:
+                value, _kind = winreg.QueryValueEx(handle, REGISTRY_ENV)
+        except OSError:
+            continue
+        path = Path(os.path.expandvars(str(value))) if value else None
+        if path is not None and path.is_absolute():
+            found.append(path)
+    return found
+
+
+CONFIGURED_REGISTRY_DIRS = configured_registry_dirs()
 
 
 class RealAccountDataAccess(PermissionError):
@@ -115,6 +142,7 @@ _ENV_DIRS = {os.path.normcase(str(d)) for d in REAL_ENV_DIRS}
 _ENV_TEMPLATES = {os.path.normcase(t) for t in ENV_TEMPLATES}
 _UI_PREFS = os.path.normcase(str(REAL_UI_PREFS))
 _REGISTRY = os.path.normcase(str(REAL_REGISTRY_DIR))
+_REGISTRIES = (_REGISTRY, *(os.path.normcase(os.path.abspath(p)) for p in CONFIGURED_REGISTRY_DIRS))
 
 
 def _is_real_env(parent: str, name: str) -> bool:
@@ -134,7 +162,7 @@ def is_protected(path) -> bool:
     parent, name = os.path.split(normalised)
     if parent == _DB_DIR and name.startswith(os.path.normcase(REAL_DB_PREFIX)):
         return True
-    if normalised == _REGISTRY or normalised.startswith(_REGISTRY + os.sep):
+    if any(normalised == r or normalised.startswith(r + os.sep) for r in _REGISTRIES):
         return True
     return _is_real_env(parent, name) or normalised == _UI_PREFS
 
@@ -148,7 +176,8 @@ def _is_decoy(path) -> bool:
 # a protected file is never renamed, replaced or deleted, and nothing is created in the real registry.
 _WATCHED = {"open": 1, "sqlite3.connect": 1, "shutil.copyfile": 2, "os.rename": 2, "os.remove": 1, "os.mkdir": 1}
 # A protected path always contains one of these (lower-cased); a decoy is checked separately.
-_NEEDLES = (REAL_DB_PREFIX.lower(), ENV_NAME, REAL_UI_PREFS.name.lower(), REAL_REGISTRY_DIR.name.lower())
+_NEEDLES = (REAL_DB_PREFIX.lower(), ENV_NAME, REAL_UI_PREFS.name.lower(), REAL_REGISTRY_DIR.name.lower(),
+            *(p.name.lower() for p in CONFIGURED_REGISTRY_DIRS if p.name))
 
 
 def _could_be_protected(candidate) -> bool:

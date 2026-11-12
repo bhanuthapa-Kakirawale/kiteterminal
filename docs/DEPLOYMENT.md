@@ -362,6 +362,14 @@ The rule above is now enforced (`docs/PHASE_2_DESIGN_REVIEW.md` §7,
   the database and `%LOCALAPPDATA%\KiteTerminal\installations\` (no account
   data). The recovery for each state is in
   `output/audits/v12_final_readiness_2026-11-11/OPERATOR_RUNBOOK.md` §4.4.
+- **Installation registry under Microsoft Store Python.** Windows redirects a
+  Store (MSIX-packaged) interpreter's writes under `%LOCALAPPDATA%`, so such a
+  `.venv` never writes the registry there: set the user environment variable
+  `KT_INSTALLATION_REGISTRY_DIR` to a directory outside the repository, the
+  Python installation and AppData (e.g. `%USERPROFILE%\KiteTerminal\installations`),
+  or build `.venv` from python.org Python. Check with
+  `python -m backend.installation_state --probe`. The registry is evidence, not
+  a gate: a start never fails on it. Details: `docs/INSTALLATION_REGISTRY.md`.
 - **Older builds.** Migration v11 makes every pre-Phase-2 build refuse the
   database (`DATABASE_SCHEMA_UNSUPPORTED`). Builds that take no lock are
   therefore fenced out too.
@@ -466,6 +474,12 @@ the app stopped:
    `schema: v10 of v11`.
 4. Record the backup's size and SHA-256 (PowerShell: `Get-FileHash <file>`),
    and keep a copy off this machine.
+
+*Historical (v10 → v11, done).* Steps 2–3 open the backup normally, so SQLite
+leaves `-wal`/`-shm` files beside it. To inspect a backup today, especially an
+off-machine one, use only `verify-backup --backup <file>` and
+`preflight-v12 --db <file>`: both open it immutable and read-only, and nothing
+is written beside it (runbook §1.5).
 
 The first start then migrates to v11. It also writes its own verified
 `kite_terminal.db.pre_schema_v11_bak`. After that, an older build refuses the

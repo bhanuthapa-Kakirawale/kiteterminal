@@ -43,3 +43,7 @@ logs/
 
 # Audit / readiness evidence reports (V12 final readiness and later): local evidence, never committed.
 output/
+
+# Post-V12 closure: everything the terminal and db_maintenance write beside the database (installation record,
+# migrate-v12 / restore / rollback audits, verification records, in-progress markers): operational evidence.
+backend/kite_terminal.db*

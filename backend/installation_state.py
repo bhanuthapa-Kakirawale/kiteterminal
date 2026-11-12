@@ -7,7 +7,10 @@ before. Evidence of a prior installation:
   * the installation record beside the database (<db>.installation.json);
   * the installation REGISTRY record, kept in the user profile (%LOCALAPPDATA%\\KiteTerminal\\installations\\<hash of
     the canonical database path>.json), so it survives the deletion of the database, of its directory or of the whole
-    repository folder (overridable with KT_INSTALLATION_REGISTRY_DIR; the test suite points it at a temporary dir);
+    repository folder (overridable with KT_INSTALLATION_REGISTRY_DIR; the test suite points it at a temporary dir).
+    Under Microsoft Store (MSIX-packaged) Python the default location is redirected by Windows and is never written:
+    KT_INSTALLATION_REGISTRY_DIR must name a directory outside AppData (see "the registry location" below and
+    docs/INSTALLATION_REGISTRY.md);
   * any sibling file the terminal or its maintenance commands leave beside an established database: <db>-wal/-shm/
     -journal, <db>.*_bak*, <db>.*_orig*, <db>.*_audit_*.json, <db>.failed_restore_*, <db>.restore_staging_*
     (checked by NAME only, never opened). NOT <db>.instance.lock: the instance lock creates it before init_db on
@@ -41,6 +44,9 @@ import logging
 import os
 import secrets
 import sqlite3
+import itertools
+import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -164,6 +170,137 @@ def registry_dir() -> Path:
 
 def registry_file(path) -> Path:
     return registry_dir() / f"{hashlib.sha256(canonical(path).encode('utf-8')).hexdigest()[:40]}.json"
+
+
+# ---- the registry location (post-V12 closure, 2026-11-12) -------------------------------------------------------
+# Microsoft Store Python runs as an MSIX-PACKAGED app, and Windows virtualizes a packaged app's writes under the user's
+# AppData (%LOCALAPPDATA%, %APPDATA%): files it creates there land in the package's private
+# %LOCALAPPDATA%\Packages\<package family>\LocalCache\..., are visible only to that package, and are deleted when the
+# package is reset or uninstalled. The default registry directory is under %LOCALAPPDATA%, so under Store Python:
+#   (a) os.replace of the temporary record onto its final name fails (WinError 17, ERROR_NOT_SAME_DEVICE: observed on
+#       the real migration and on every start since, 2026-11-12), leaving a .tmp file in LocalCache; and
+#   (b) even a record that did land there would not be the durable, interpreter-independent evidence the registry
+#       exists to be.
+# So a packaged interpreter never writes the registry under AppData: it needs an explicit KT_INSTALLATION_REGISTRY_DIR
+# outside it (or a python.org interpreter). Nothing falls back to another directory on its own. The temp directory is
+# not virtualized (verified 2026-11-12: a file written and renamed there by Store Python is visible at its real path to
+# an unpackaged process), which is why the test suite's temporary registry works under Store Python.
+# Reads are unchanged: assess() reads whatever registry_dir() names, so a start behaves exactly as before.
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+_ERROR_INSUFFICIENT_BUFFER = 122
+_APPMODEL_ERROR_NO_PACKAGE = 15700
+REGISTRY_REMEDIATION = (
+    f"Set the user environment variable {REGISTRY_ENV} to an absolute directory on a fixed local drive, outside the "
+    "repository, outside the Python installation and outside %LOCALAPPDATA% / %APPDATA% (for example "
+    "%USERPROFILE%\\KiteTerminal\\installations), then open a NEW console so the terminal and every db_maintenance "
+    "command see the same value; or rebuild .venv from a python.org Python. Check it with `python -m "
+    "backend.installation_state --probe`. The database and the record beside it are not affected "
+    "(docs/INSTALLATION_REGISTRY.md).")
+
+
+class InstallationRegistryUnavailable(OSError):
+    """The registry record was NOT written: its directory is unsuitable, or the write itself failed. Raised before
+    anything is created in an unsuitable directory. An OSError, so every caller's existing handling (the
+    installation.record_failed log, the audit's 'NOT WRITTEN') applies unchanged."""
+    error_code = "INSTALLATION_REGISTRY_UNAVAILABLE"
+
+
+def packaged_process() -> bool:
+    """True when this interpreter runs as an MSIX-packaged app (Microsoft Store Python). GetCurrentPackageFullName
+    answers ERROR_INSUFFICIENT_BUFFER for a packaged process and APPMODEL_ERROR_NO_PACKAGE for any other; when the
+    API is unavailable, the interpreter's install path decides (Store Python lives under ...\\WindowsApps\\)."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        length = ctypes.c_uint32(0)
+        rc = ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(length), None)
+    except (AttributeError, OSError):
+        rc = None
+    if rc == _ERROR_INSUFFICIENT_BUFFER:
+        return True
+    if rc == _APPMODEL_ERROR_NO_PACKAGE:
+        return False
+    return any(f"{os.sep}windowsapps{os.sep}" in os.path.normcase(f"{p}{os.sep}")
+               for p in (sys.base_prefix, getattr(sys, "_base_executable", "") or ""))
+
+
+_realpath = os.path.realpath   # a seam for the tests (the MSIX redirection cannot be produced on demand)
+
+
+def _forms(path) -> set[str]:
+    """Both spellings of a path: as written (absolute, normalised) and as resolved. Both are needed: for a packaged
+    process os.path.realpath FOLLOWS the MSIX redirection (observed 2026-11-12: %LOCALAPPDATA%\\KiteTerminal resolved
+    to D:\\WpSystem\\<SID>\\AppData\\Local\\Packages\\<family>\\LocalCache\\Local\\KiteTerminal, on another volume,
+    which is exactly why the rename failed with ERROR_NOT_SAME_DEVICE), so the resolved form alone hides it."""
+    text = os.fspath(path)
+    return {os.path.normcase(os.path.abspath(text)), os.path.normcase(_realpath(text))}
+
+
+def _inside(child: str, parent: str) -> bool:
+    try:
+        return os.path.commonpath([child, parent]) == parent
+    except ValueError:  # different drives
+        return False
+
+
+def _inside_any(path, parents) -> str | None:
+    """The first of `parents` (each in both spellings) that contains `path` (in either spelling), or None."""
+    mine = _forms(path)
+    for parent in parents:
+        if parent and any(_inside(m, p) for m in mine for p in _forms(parent)):
+            return str(parent)
+    return None
+
+
+def _python_installation_dirs() -> list[str]:
+    dirs = {sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix, os.path.dirname(sys.executable)}
+    base_executable = getattr(sys, "_base_executable", None)
+    if base_executable:
+        dirs.add(os.path.dirname(base_executable))
+    return sorted(d for d in dirs if d)
+
+
+def _redirected_roots() -> list[str]:
+    """The directories Windows redirects for a packaged process: the user's AppData (Local and Roaming)."""
+    return [os.environ[v] for v in ("LOCALAPPDATA", "APPDATA") if os.environ.get(v)]
+
+
+def _temp_roots() -> list[str]:
+    """The temp directories, from the environment only. NOT tempfile.gettempdir(): its first call creates and
+    deletes a probe file in the temp directory, and this module's location rules must stay pure path logic."""
+    return [os.environ[v] for v in ("TMPDIR", "TEMP", "TMP") if os.environ.get(v)]
+
+
+def _resolves_into_package_cache(path) -> bool:
+    """The resolved path lies in a packaged app's private store (...\\Packages\\<family>\\LocalCache\\...)."""
+    parts = os.path.normcase(_realpath(os.fspath(path))).split(os.sep)
+    return any(parts[i] == "packages" and parts[i + 2] == "localcache" for i in range(len(parts) - 2))
+
+
+def registry_location_problem(directory=None) -> str | None:
+    """Why the registry record may NOT be written in `directory` (default: registry_dir()), or None when it may.
+    Path rules only: nothing is created or opened."""
+    override = os.environ.get(REGISTRY_ENV)
+    directory = Path(directory) if directory is not None else registry_dir()
+    source = f"{REGISTRY_ENV}={override!r}" if override else "the default registry directory"
+    if not directory.is_absolute():
+        return f"{source} is not an absolute path (it would depend on the current directory)"
+    if _inside_any(directory, [REPO_ROOT]):
+        return (f"{source} ({directory}) is inside the repository ({REPO_ROOT}); the registry must survive the "
+                "deletion of the repository folder")
+    python_dir = _inside_any(directory, _python_installation_dirs())
+    if python_dir:
+        return f"{source} ({directory}) is inside the Python installation ({python_dir})"
+    if packaged_process():
+        root = None if _inside_any(directory, _temp_roots()) else _inside_any(directory, _redirected_roots())
+        if root or _resolves_into_package_cache(directory):
+            return (f"{source} ({directory}) is under {root or 'a packaged app store'}, which Windows redirects for "
+                    f"this Microsoft Store (MSIX-packaged) Python ({sys.base_prefix}) into the package's private "
+                    f"LocalCache (here: {_realpath(os.fspath(directory))}): the record cannot be renamed into place "
+                    "there (WinError 17) and would not survive a reset of that Python")
+    return None
 
 
 def record_file(path) -> Path:
@@ -397,11 +534,77 @@ def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+_REPLACE_ATTEMPTS = 20
+_REPLACE_DELAY_S = 0.05
+
+
+def _replace(source: Path, target: Path) -> None:
+    """os.replace, retried briefly while Windows reports a sharing violation (another process is reading the target
+    at that instant: a concurrent start or command). Any other error is raised at once; so is the test-suite guard
+    (a PermissionError subclass), which is never retried or swallowed."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError as e:
+            if type(e) is not PermissionError or attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_DELAY_S)
+
+
+_TEMPORARY_SEQUENCE = itertools.count(1)   # next() is atomic under the GIL: unique per call within the process
+
+
+def _create_temporary(target: Path):
+    """An exclusively created temporary beside `target`: <name>.tmp<pid>.<n>. Unique per call (pid + a per-process
+    sequence, so concurrent threads never share one); a leftover of a crashed process that had the same pid is skipped,
+    never overwritten. Kept short: the name stays within MAX_PATH wherever the old <name>.tmp<pid> did, give or take
+    a few characters."""
+    for _ in range(1000):
+        temporary = target.with_name(f"{target.name}.tmp{os.getpid()}.{next(_TEMPORARY_SEQUENCE)}")
+        try:
+            return temporary, open(temporary, "x", encoding="utf-8")
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"no free temporary name beside {target}")
+
+
 def _atomic_write_json(target: Path, data: dict) -> None:
+    """Write a temporary file, fsync it, rename it onto `target`: a reader sees the old record or the new one, never a
+    partial one. The temporary name is unique per call, so concurrent writers never share one, and it is removed when
+    the write or the rename fails, so a failure leaves nothing behind."""
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f"{target.name}.tmp{os.getpid()}")
-    temporary.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-    os.replace(temporary, target)
+    temporary, handle = _create_temporary(target)
+    try:
+        with handle:
+            handle.write(json.dumps(data, indent=2, default=str))
+            handle.flush()
+            os.fsync(handle.fileno())
+        _replace(temporary, target)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _write_registry(target: Path, data: dict) -> None:
+    """The registry record, only in a suitable directory (registry_location_problem): refused before anything is
+    created otherwise. Any failure is raised as InstallationRegistryUnavailable naming the cause and the fix."""
+    problem = registry_location_problem(target.parent)
+    if problem:
+        raise InstallationRegistryUnavailable(
+            f"{InstallationRegistryUnavailable.error_code}: the installation registry record was NOT written: "
+            f"{problem}. {REGISTRY_REMEDIATION}")
+    try:
+        _atomic_write_json(target, data)
+    except OSError as e:
+        if isinstance(e, PermissionError) and type(e).__name__ != "PermissionError":
+            raise  # the test-suite guard (a PermissionError subclass) is never re-labelled
+        raise InstallationRegistryUnavailable(
+            f"{InstallationRegistryUnavailable.error_code}: the installation registry record was NOT written to "
+            f"{target} ({type(e).__name__}: {e}). {REGISTRY_REMEDIATION}") from e
 
 
 def _sqlite_newest(conn) -> list | None:
@@ -456,8 +659,9 @@ def record(path, *, by: str, conn=None, new_installation: bool = False, stamp_ap
     history.append({"at": _now(), "by": by, "st_ino": identity.get("st_ino"), "schema_newest": newest})
     data["history"] = history
     _atomic_write_json(record_file(path), data)
-    _atomic_write_json(registry_file(path), data)
-    logger.info("event=installation.recorded by=%s db=%s new=%s", by, path.name, new_installation)
+    _write_registry(registry_file(path), data)
+    logger.info("event=installation.recorded by=%s db=%s new=%s registry=%s", by, path.name, new_installation,
+                registry_dir())
     return data
 
 
@@ -523,3 +727,88 @@ def clear_marker(marker: Path) -> None:
         marker.unlink()
     except FileNotFoundError:
         pass
+
+
+# ---- operator check: python -m backend.installation_state [--db FILE] [--probe] ----------------------------------
+
+DEFAULT_DB = Path(__file__).resolve().parent / "kite_terminal.db"   # the terminal's database (backend/db.py DB_PATH)
+_COMPARED = ("install_id", "application_id", "canonical_path")
+
+
+def check_registry(db_path=None, *, probe: bool = False) -> dict:
+    """The registry's state for `db_path` (default: the terminal's database). Reads the two JSON records only (ids,
+    paths, timestamps); NEVER opens the database. probe=True also writes and removes one probe file in the registry
+    directory with the same atomic write the records use (creating the directory when it is missing), which proves
+    the directory is writable and not redirected. Verdict OK only when the registry record exists, is readable and
+    names the same installation as the record beside the database."""
+    db_path = Path(db_path) if db_path is not None else DEFAULT_DB
+    directory = registry_dir()
+    problem = registry_location_problem(directory)
+    result = {"interpreter": sys.executable, "python_installation": sys.base_prefix,
+              "store_python_packaged": packaged_process(), "override": os.environ.get(REGISTRY_ENV) or None,
+              "registry_dir": str(directory), "location": problem or "OK", "database": str(db_path),
+              "registry_file": str(registry_file(db_path)), "record_file": str(record_file(db_path))}
+    if probe:
+        if problem:
+            result["probe"] = "NOT RUN (location refused)"
+        else:
+            probe_file = directory / f"kt_registry_probe_{os.getpid()}_{secrets.token_hex(4)}.check"
+            try:
+                _atomic_write_json(probe_file, {"probe": True})
+                result["probe"] = "OK" if _read_json(probe_file) == {"probe": True} else "FAILED (read back differs)"
+            except (OSError, ValueError) as e:
+                result["probe"] = f"FAILED ({type(e).__name__}: {e})"
+            finally:
+                try:
+                    probe_file.unlink()
+                except OSError:
+                    pass
+    records = {}
+    for name, source in (("registry_record", registry_file(db_path)), ("beside_db_record", record_file(db_path))):
+        try:
+            data = _read_json(source)
+        except (OSError, ValueError) as e:
+            records[name] = f"UNREADABLE ({type(e).__name__}: {e})"
+            continue
+        records[name] = None if data is None else dict(
+            {k: data.get(k) for k in _COMPARED}, observed_at=(data.get("last_known") or {}).get("observed_at"))
+    result.update(records)
+    registry, beside = records["registry_record"], records["beside_db_record"]
+    if problem:
+        verdict = "LOCATION_REFUSED"
+    elif str(result.get("probe", "")).startswith("FAILED"):
+        verdict = "PROBE_FAILED"
+    elif isinstance(registry, str) or isinstance(beside, str):
+        verdict = "RECORD_UNREADABLE"
+    elif registry is None:
+        verdict = "NOT_WRITTEN"
+    elif beside is not None and any(registry[k] != beside[k] for k in _COMPARED):
+        verdict = "MISMATCH"
+    else:
+        verdict = "OK"
+    result["verdict"] = verdict
+    return result
+
+
+def main(argv=None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="python -m backend.installation_state",
+        description="Check the installation registry location and record. Never opens the database.")
+    parser.add_argument("--db", type=Path, default=None, help="database file (default: the terminal's)")
+    parser.add_argument("--probe", action="store_true",
+                        help="also write and remove one probe file in the registry directory")
+    args = parser.parse_args(argv)
+    result = check_registry(args.db, probe=args.probe)
+    for key, value in result.items():
+        print(f"{key + ':':<22} {value}")
+    if result["verdict"] == "LOCATION_REFUSED":
+        print(REGISTRY_REMEDIATION)
+    elif result["verdict"] == "NOT_WRITTEN":
+        print("The location is usable; the record is written by the next terminal start (log: "
+              "event=installation.recorded ... registry=<this directory>).")
+    return 0 if result["verdict"] == "OK" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

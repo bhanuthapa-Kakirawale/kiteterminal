@@ -135,9 +135,24 @@ def test_the_other_clis_never_touch_the_app_database(module):
         assert forbidden not in source, (module, forbidden)
 
 
+def test_the_installation_registry_check_never_opens_a_database():
+    """Post-V12 closure (2026-11-12): `python -m backend.installation_state` reads the two JSON installation records
+    only. Its code path (main -> check_registry) calls nothing that opens a database or takes the instance lock;
+    test_installation_registry_location.py r12 proves the same at run time."""
+    source = (REPO / "backend" / "installation_state.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    for name in ("main", "check_registry"):
+        calls = {getattr(c.func, "attr", getattr(c.func, "id", "")) for c in ast.walk(functions[name])
+                 if isinstance(c, ast.Call)}
+        for forbidden in ("connect", "assess", "_sqlite_facts", "get_connection", "init_db", "record", "lock"):
+            assert forbidden not in calls, (name, forbidden)
+
+
 def test_every_backend_entry_point_is_audited():
     """A new `__main__` in backend/ must be added to this audit (and to the Phase 2 report)."""
     audited = {"db_maintenance", "live_preflight", "nse_calendar_monitor", "smart_money_validation",
-               "trading_calendar", "volume_research", "server"}
+               "trading_calendar", "volume_research", "server",
+               "installation_state"}   # post-V12 closure: read-only registry check, audited above
     found = {p.stem for p in (REPO / "backend").rglob("*.py") if '__name__ == "__main__"' in p.read_text(encoding="utf-8")}
     assert found == audited
