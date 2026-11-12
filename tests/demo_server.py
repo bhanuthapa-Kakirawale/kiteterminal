@@ -20,8 +20,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cryptography.fernet import Fernet  # noqa: E402
 
-# Set before backend.main runs load_dotenv(), which never overrides existing
-# variables — so the real .env (and its keys) is never used by the demo.
+import real_data_guard  # noqa: E402
+
+# F-0: this process imports backend.main, whose load_dotenv() would read the
+# real .env. The same guard as the pytest suite (tests/real_data_guard.py):
+# the loaders are neutralised before any backend import, and the real
+# database, .env and UI preferences cannot be opened.
+real_data_guard.install()
+real_data_guard.neutralise_dotenv()
+
+# Sentinel values, set before any backend code reads them, so the demo never
+# runs on real keys (and backend.main's load_dotenv() has nothing to add).
 os.environ["KITE_TERMINAL_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
 os.environ["KITE_API_KEY"] = "demo_api_key"
 os.environ["KITE_API_SECRET"] = "demo_api_secret"
@@ -719,13 +728,23 @@ def main() -> None:
     workdir = Path(args.workdir or tempfile.mkdtemp(prefix="kite-demo-"))
     workdir.mkdir(parents=True, exist_ok=True)
 
-    from backend import crypto, db, instruments, kite_client, market, ui_prefs
+    from backend import crypto, db, installation_state, instruments, kite_client, market, ui_prefs
     db.DB_PATH = workdir / "demo.db"
     crypto.ENV_PATH = workdir / ".env"
     ui_prefs.PREFS_PATH = workdir / "ui_prefs.json"
+    # The demo's installation registry stays in its own work directory (never the user profile's).
+    os.environ.setdefault(installation_state.REGISTRY_ENV, str(workdir / "installation_registry"))
     restarted = args.keep_db and db.DB_PATH.exists()
     if db.DB_PATH.exists() and not restarted:
         db.DB_PATH.unlink()
+    if not restarted:
+        # A deliberate reset of the throwaway demo database: its own installation records and sidecars go too, so
+        # the next start is a genuine first run (backend/installation_state.py would otherwise refuse it as an
+        # established installation whose database went missing).
+        installation_state.forget(db.DB_PATH)
+        for sibling in workdir.glob("demo.db[.-]*"):
+            if sibling.is_file():
+                sibling.unlink()
     if restarted:
         # The encryption key is per process here; a restart must decrypt what the first run stored.
         key_file = workdir / "demo.key"
@@ -738,6 +757,7 @@ def main() -> None:
         market.is_market_open = lambda at=None: True
     fake, closes = build_fake(market)
     seed_holdings(fake, closes)
+    kite_client.fence_broker(fake)  # Phase 2: the write fence a real client gets (owner-only broker writes)
     kite_client.get_kite = lambda account_id=None: fake
     instruments.refresh_instrument_cache_if_stale = lambda *a, **k: False
     from backend.ticker import ticker_manager

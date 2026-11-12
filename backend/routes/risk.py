@@ -6,6 +6,7 @@ from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
 from backend.models import ACCOUNT_SAFETY_SETTING_FIELDS, RiskSettingsUpdateRequest, SectorMappingUpsertRequest
+from backend.instance_lock import WRITE_AUTHORITY
 
 router = APIRouter()
 
@@ -20,7 +21,7 @@ def get_settings(kite: KiteConnect = Depends(require_trading_account)):
         conn.close()
 
 
-@router.post("/api/risk/settings")
+@router.post("/api/risk/settings", dependencies=WRITE_AUTHORITY)
 def save_settings(req: RiskSettingsUpdateRequest, kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
     fields = req.model_dump()
@@ -48,12 +49,12 @@ def list_sector_mappings(kite: KiteConnect = Depends(require_trading_account)):
     return {"data": sector_mapping.list_mappings()}
 
 
-@router.post("/api/risk/sector-mappings")
+@router.post("/api/risk/sector-mappings", dependencies=WRITE_AUTHORITY)
 def save_sector_mapping(req: SectorMappingUpsertRequest, kite: KiteConnect = Depends(require_trading_account)):
     return {"data": sector_mapping.upsert_sector(req.symbol.strip().upper(), req.sector.strip())}
 
 
-@router.delete("/api/risk/sector-mappings/{symbol}")
+@router.delete("/api/risk/sector-mappings/{symbol}", dependencies=WRITE_AUTHORITY)
 def delete_sector_mapping(symbol: str, kite: KiteConnect = Depends(require_trading_account)):
     sector_mapping.delete_sector(symbol.strip().upper())
     return {"data": {"deleted": True}}

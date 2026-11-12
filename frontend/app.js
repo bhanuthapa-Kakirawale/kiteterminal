@@ -73,6 +73,7 @@ async function fetchJsonMutate(url, method, body) {
 const RECONCILIATION_GTT_CODES = new Set([
   "ORPHAN_GTT", "GTT_ON_CLOSED_POSITION", "GTT_QUANTITY_TOO_HIGH", "GTT_QUANTITY_TOO_LOW", "GTT_MISSING",
   "GTT_PRICE_MISMATCH", "MULTIPLE_ACTIVE_GTTS", "UNLINKED_POSSIBLE_GTT", "AMBIGUOUS_GTT_OWNERSHIP",
+  "GTT_CANCEL_FAILED", "GTT_CANCEL_OUTCOME_UNKNOWN",
 ]);
 
 const API = {
@@ -921,20 +922,21 @@ function evaluateAlerts(view, totalValue, dayPnl, margins, sessionStatus) {
   for (const t of state.tickets) {
     // PK-19: the server's protection status of the ticket's own position.
     const lc = t.lifecycle?.position_id === t.id ? t.lifecycle : null;
-    if (lc && lc.protection_status === "MISSING") {
+    if (lc && lc.protection_status === "NOT_PROTECTED") {
       alerts.push({
         id: `protection-failed-${t.id}`,
         severity: "urgent",
-        message: `${t.symbol}: no active protective stop — UNPROTECTED position (${lc.open_quantity ?? "?"} share(s)), act now`,
+        message: `${t.symbol}: NOT PROTECTED (${lc.protection_reason_label || "no correct active GTT"}) — `
+          + `${lc.open_quantity ?? "?"} share(s) held, act now`,
         scrollTargetSelector: `tr[data-ticket-id="${t.id}"]`,
       });
     } else if (lc && lc.protection_alert) {
-      // Any other protection mismatch: the GTT does not cover exactly the
-      // confirmed filled quantity (or covers it before anything filled).
-      const gtt = lc.gtt_quantity == null ? "?" : lc.gtt_quantity;
+      // Not proven either way (UNVERIFIED / STALE / UNKNOWN), or an entry still waiting
+      // for its fill: a warning, never shown as protected.
+      const gtt = lc.gtt_quantity == null ? "not observed" : lc.gtt_quantity;
       alerts.push({
         id: `protection-mismatch-${t.id}`,
-        severity: ["QUANTITY_EXCEEDS_POSITION", "QUANTITY_MISMATCH"].includes(lc.protection_status) ? "urgent" : "warning",
+        severity: "warning",
         message: `${t.symbol}: ${lc.protection_label} — GTT ${lc.kite_gtt_id ?? "none"} covers ${gtt}, `
           + `confirmed filled ${lc.confirmed_filled_quantity ?? "?"}, held ${lc.open_quantity ?? "?"}`,
         scrollTargetSelector: `tr[data-ticket-id="${t.id}"]`,

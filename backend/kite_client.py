@@ -1,13 +1,14 @@
 import logging
 import os
 from datetime import datetime
+from types import MethodType
 
 from cryptography.fernet import InvalidToken
 from fastapi import Depends, HTTPException
 from kiteconnect import KiteConnect
 from kiteconnect.exceptions import PermissionException
 
-from backend import crypto, kite_rest_proxy
+from backend import crypto, instance_lock, kite_rest_proxy
 from backend.accounts import get_account, get_default_account, get_trading_account
 from backend.db import get_connection
 from backend.redaction import register_secret
@@ -139,6 +140,75 @@ def _no_writes_on_direct_route(kite: KiteConnect) -> KiteConnect:
     return kite
 
 
+# ---- Phase 2 write fence: only the database owner may send a broker write --------------------------
+#
+# docs/PHASE_2_DESIGN_REVIEW.md §7.3. Every client the factory builds gets an instance-level _request
+# that, for anything but a GET, first asks instance_lock.broker_write(): a process that is not the
+# owner of the database (a second instance, a CLI, a test without the ownership grant, a process that
+# lost its epoch or is shutting down) is refused with InstanceNotOwner, a PermissionException subclass
+# (a definite rejection: nothing was sent), and the write is counted as in flight otherwise. It runs
+# AHEAD of the class's own _request, so it composes with DirectRouteKiteConnect/ReadOnlyKiteConnect
+# and also covers the plain proxied KiteConnect - and so every SDK write method, including the login
+# token exchange and those called from the frozen execution.py and strategy_engine.py. The client's
+# class is unchanged. A non-SDK broker (a test or demo double) gets the same check around its write
+# methods (fence_broker); the paper broker checks it in its own write methods.
+BROKER_WRITE_METHODS = (
+    "place_order", "modify_order", "cancel_order", "exit_order", "place_gtt", "modify_gtt", "delete_gtt",
+    "convert_position", "order_margins", "basket_order_margins", "place_mf_order", "cancel_mf_order",
+    "place_mf_sip", "modify_mf_sip", "cancel_mf_sip", "invalidate_access_token", "invalidate_refresh_token",
+    "generate_session", "renew_access_token",
+)
+_FENCE_MARK = "_kt_write_fence"
+
+
+def _fenced_request(self, route, method, *args, **kwargs):
+    request = type(self)._request  # resolved per call: the class may be narrowed after fencing
+    if str(method).upper() == "GET":
+        return request(self, route, method, *args, **kwargs)
+    with instance_lock.broker_write(route, method):
+        return request(self, route, method, *args, **kwargs)
+
+
+def _guarded_write(broker, name: str, own):
+    def write(*args, **kwargs):
+        with instance_lock.broker_write(name, "WRITE"):
+            target = own if own is not None else getattr(type(broker), name).__get__(broker, type(broker))
+            return target(*args, **kwargs)
+    write.__name__ = name
+    write.__wrapped_broker_write__ = True
+    return write
+
+
+def fence_broker(broker):
+    """Installs the write fence on this broker object (idempotent; identity and class unchanged)."""
+    if vars(broker).get(_FENCE_MARK):
+        return broker
+    if isinstance(broker, _SDK_KITE_CONNECT):
+        broker._request = MethodType(_fenced_request, broker)
+    else:
+        for name in BROKER_WRITE_METHODS:
+            own = vars(broker).get(name)
+            if own is None and not callable(getattr(type(broker), name, None)):
+                continue
+            setattr(broker, name, _guarded_write(broker, name, own))
+    setattr(broker, _FENCE_MARK, True)
+    return broker
+
+
+# ---- U6 M1: no HTTP redirect is ever followed (docs/U6_MITIGATION_REPORT.md) -----------------------
+#
+# kiteconnect asks requests to follow redirects on every request (hard-coded), and requests follows 30:
+# a 307/308 resends the same method and body (an order, a GTT) to the Location URL, and a 301/302/303
+# turns it into another request, all without the caller ever seeing the 3xx. With max_redirects = 0 the
+# first 3xx raises requests.TooManyRedirects before anything is resent. It is a RequestException, so a
+# write's outcome is recorded as UNKNOWN (never retried), exactly like a timeout; reads fail as a broker
+# read failure. Kite's REST API is not known to redirect any request (reads included).
+def _no_redirects(kite):
+    if isinstance(kite, _SDK_KITE_CONNECT):  # a test or demo stand-in has no requests session
+        kite.reqsession.max_redirects = 0
+    return kite
+
+
 def create_kite_connect(api_key: str) -> KiteConnect:
     """NET-1: the one place a KiteConnect REST client is built. With
     KITE_REST_PROXY set, every request it makes (login, reads, historical
@@ -151,10 +221,12 @@ def create_kite_connect(api_key: str) -> KiteConnect:
     proxy = kite_rest_proxy.from_env()
     if proxy is None:
         # Direct: reads only. No broker write ever leaves this machine without the proxy.
-        return _restrict_if_writes_disabled(_no_writes_on_direct_route(KiteConnect(api_key=api_key)))
+        return fence_broker(_restrict_if_writes_disabled(_no_writes_on_direct_route(
+            _no_redirects(KiteConnect(api_key=api_key)))))
     kite = KiteConnect(api_key=api_key, proxies=proxy.requests_proxies)
     kite.reqsession.trust_env = False
-    return _restrict_if_writes_disabled(kite)
+    kite.reqsession.max_redirects = 0  # U6 M1: see _no_redirects
+    return fence_broker(_restrict_if_writes_disabled(kite))
 
 
 def _resolve_account(account_id: int | None):

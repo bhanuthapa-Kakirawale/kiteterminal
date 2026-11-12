@@ -320,6 +320,68 @@ the same tickets. Therefore:
 - under a supervisor (systemd, NSSM, Task Scheduler), configure restart on
   crash, not multiple instances.
 
+### Single instance: enforced since Phase 2
+
+The rule above is now enforced (`docs/PHASE_2_DESIGN_REVIEW.md` §7,
+`docs/PHASE_2_IMPLEMENTATION_REPORT.md`):
+
+- **Instance lock.** The first thing a starting process does after the runtime
+  checks is take an exclusive OS lock on `<database>.instance.lock` (for
+  example `backend/kite_terminal.db.instance.lock`, git-ignored). It is taken
+  before any migration. The operating system releases it when the process
+  exits or dies, so a crash never leaves a stale lock. Liveness is never
+  decided by a PID.
+- **A second copy is read-only.** It runs no migration, no loops and no
+  ticker. Its `/` shows a status page naming the owner process (pid, host,
+  start time, heartbeat). Every other request, including `/login` and
+  `/callback`, answers `503 ANOTHER_INSTANCE_RUNNING`. On the same port it
+  then fails to bind and exits.
+- **Fencing epoch.** The owner increments `app_instance.epoch` once per start
+  and checks it in every coordination write and in a heartbeat every 15 s. A
+  process whose epoch is no longer current (possible only if the lock was
+  bypassed) drops its authority for good: `INSTANCE_LOCK_LOST`. Its loops
+  stop, its write routes answer 503 and its broker writes are refused. Restart
+  it.
+- **Local drive only.** The database must be on a fixed local drive. A UNC
+  path, a mapped network drive or a removable drive is refused, and the
+  process stays read-only (`DATABASE_NOT_ON_LOCAL_DRIVE`). A database under a
+  OneDrive folder is a warning: move it out of synced folders. Every
+  maintenance command that writes the database applies a stricter check
+  first (`backend/storage_classification.py`): USB/SD disks reported as
+  fixed, subst/junction/symlink targets, mapped drives, cloud-synced folders
+  and any storage that cannot be established are refused
+  (`STORAGE_NOT_FIXED_LOCAL`). Check with
+  `python -m backend.db_maintenance storage-check`.
+- **Installation identity.** A start refuses (before any write) a database
+  that is not the one this installation last used: missing although the
+  installation existed, zero bytes, an empty SQLite file, corrupt, replaced,
+  moved, older than last seen, or mid-maintenance
+  (`DATABASE_INSTALLATION_STATE_REFUSED`, `backend/installation_state.py`).
+  Only a true first run, with no evidence of an earlier installation, creates
+  a new database. The records are `kite_terminal.db.installation.json` beside
+  the database and `%LOCALAPPDATA%\KiteTerminal\installations\` (no account
+  data). The recovery for each state is in
+  `output/audits/v12_final_readiness_2026-11-11/OPERATOR_RUNBOOK.md` §4.4.
+- **Older builds.** Migration v11 makes every pre-Phase-2 build refuse the
+  database (`DATABASE_SCHEMA_UNSUPPORTED`). Builds that take no lock are
+  therefore fenced out too.
+- **Startup restriction.** Every start begins RESTRICTED: new live entries are
+  refused until the read-only startup reconciliation (Stage 1) has passed and
+  no restriction reason remains. Exits, cancellations, Emergency Exit and
+  protection upkeep are never affected. See the runbook,
+  `docs/DMB_KITE_OPERATIONAL_RUNBOOK.md` §10.
+- **Maintenance commands.** `analyze`, `vacuum`, `migrate`,
+  `rollback-schema-v11`, `migrate-v12`, `rollback-schema-v12`,
+  `restore-backup`, `init-fresh` and `acknowledge-database` take the same lock
+  and refuse while the terminal runs. `status`, `integrity`, `backup`,
+  `verify-backup`, `storage-check` and `preflight-v12` open the database
+  read-only, or not at all.
+- **Limits.** The lock cannot see a copy of the database on another machine,
+  or through a path the lock does not cover. That case is caught by the epoch
+  and the heartbeat (`INSTANCE_CONFLICT`, URGENT). A broker request already
+  sent cannot be recalled by any local mechanism. The existing
+  ambiguous-outcome handling (never re-sending) covers it.
+
 ## OAuth (Kite login)
 
 - `/login` and `/callback` are ordinary GET routes. They pass the Host check
@@ -387,7 +449,36 @@ before they can be approved (`docs/SEC1_P1D_REPORT.md`). v9
 start of this version leaves `kite_terminal.db.pre_schema_v9_bak` and needs
 no other action.
 
-Maintenance (stop the app first for `vacuum`):
+**v10** (`ticket_integrity_audit`) and **v11** (`phase2_instance_coordination`,
+Phase 2) follow. The current schema is **v11**. v11 adds only five Phase 2
+tables: `app_instance`, `app_instance_history`, `broker_reads`,
+`startup_reconciliation_runs` and `account_restriction`. It changes no existing
+table.
+
+**Before the first start of a Phase 2 build**, back up the real database, with
+the app stopped:
+
+1. `python -m backend.db_maintenance backup`. It writes
+   `kite_terminal.db.manual_<time>_bak` and runs `integrity_check` on it.
+2. `python -m backend.db_maintenance integrity --db <that backup>` must print
+   `integrity_check: ok` and `foreign_key_check: 0 violation(s)`.
+3. `python -m backend.db_maintenance status --db <that backup>` must show
+   `schema: v10 of v11`.
+4. Record the backup's size and SHA-256 (PowerShell: `Get-FileHash <file>`),
+   and keep a copy off this machine.
+
+The first start then migrates to v11. It also writes its own verified
+`kite_terminal.db.pre_schema_v11_bak`. After that, an older build refuses the
+database. To go back, either:
+
+- stop the app and run
+  `python -m backend.db_maintenance rollback-schema-v11 --confirm`. This drops
+  only the five Phase 2 tables and keeps every trading row, after another
+  verified backup (`…pre_rollback_v11_bak`); or
+- restore the backup. This loses every trade recorded after it.
+
+Maintenance (stop the app first for `vacuum`; the writing commands refuse
+while it runs):
 
 ```
 python -m backend.db_maintenance status      # schema version, pending migrations, size
@@ -396,7 +487,29 @@ python -m backend.db_maintenance backup      # online backup to kite_terminal.db
 python -m backend.db_maintenance analyze     # refresh query-planner statistics
 python -m backend.db_maintenance vacuum      # compact the file (app stopped!)
 python -m backend.db_maintenance migrate     # apply pending migrations without starting the server (app stopped!)
+python -m backend.db_maintenance rollback-schema-v11 --confirm   # undo v11 for an older build (app stopped!)
+python -m backend.db_maintenance preflight-v12 --db <backup>     # read-only DD-6 / R2-4 preflight (never the live file)
+python -m backend.db_maintenance storage-check [--backup <dir>] # read-only: fixed local disk? separate backup disk?
+python -m backend.db_maintenance backup --dest <external dir>   # verified backup + verification record on another disk
+python -m backend.db_maintenance verify-backup --backup <file>  # read-only verification record (no contents written)
+python -m backend.db_maintenance migrate-v12 --authorize-v12 --offsite-record <record.json>
+                                                                # the ONLY way v12 is applied (app stopped!)
+python -m backend.db_maintenance rollback-schema-v12 --confirm   # undo v12 while its journal is empty (app stopped!)
+python -m backend.db_maintenance restore-backup --backup <file> --confirm   # WAL/SHM-safe restore (app stopped!)
+python -m backend.db_maintenance init-fresh --confirm-new-installation      # explicit new database (app stopped!)
+python -m backend.db_maintenance acknowledge-database --confirm  # re-bind after an inspected replacement or move
 ```
+
+Migration v12 (Phase 3) is **registered** in this build but has **not** been applied to the real database. A
+normal start (and `migrate`) refuses a database holding data that still needs v12, with
+`DATABASE_MIGRATION_AUTHORIZATION_REQUIRED`, before writing anything. Migrating the real database is a separate,
+explicit authorization. `migrate-v12` also requires a fresh (under 12 h) PASS record of an **off-machine** backup
+(`backup --dest` to an external disk or another computer's share), which it re-verifies live and binds to the exact
+database content. A second partition of the same physical disk (this machine's `E:`) is not off-machine. Never
+restore a backup by copying files over `kite_terminal.db`: a stale `kite_terminal.db-wal` would be replayed onto
+it. Use `restore-backup`. Procedure, result codes and recovery:
+`output/audits/v12_final_readiness_2026-11-11/OPERATOR_RUNBOOK.md` (supersedes
+`docs/PHASE_3_V12_REGISTRATION_RUNBOOK_DRAFT.md` where they differ).
 
 `migrate` (LIVE-0) runs exactly the application's own initialisation — the
 verified pre-migration backup, the migrations, the startup invariants — with

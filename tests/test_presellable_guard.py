@@ -149,7 +149,7 @@ def test_10_market_only_is_not_proof_a_market_entry_can_stay_pending_with_its_gt
     assert r.status_code == 200, r.text
     lc = env.client.get(f"/api/tickets/{t['id']}").json()["data"]["lifecycle"]
     assert lc["lifecycle_state"] == "ENTRY_OPEN"
-    assert lc["protection_status"] == "NOT_PROTECTED_PENDING_FILL" and lc["protection_alert"] is True
+    assert lc["protection_status"] == "PENDING_FILL" and lc["protection_alert"] is True
     # ...and while it is pending, a second entry for the same instrument is refused: the open
     # order and the active GTT are both pre-existing quantity for it.
     t2 = _create(env)

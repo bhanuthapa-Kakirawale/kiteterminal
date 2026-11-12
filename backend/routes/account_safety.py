@@ -11,6 +11,7 @@ from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
 from backend.models import BreakerResetRequest, TradingLockRequest
+from backend.instance_lock import WRITE_AUTHORITY
 
 router = APIRouter()
 
@@ -25,7 +26,7 @@ def get_status(kite: KiteConnect = Depends(require_trading_account)):
         conn.close()
 
 
-@router.post("/api/account-safety/trading-lock")
+@router.post("/api/account-safety/trading-lock", dependencies=WRITE_AUTHORITY)
 def set_trading_lock(req: TradingLockRequest, kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
     conn = get_connection()
@@ -36,7 +37,7 @@ def set_trading_lock(req: TradingLockRequest, kite: KiteConnect = Depends(requir
         conn.close()
 
 
-@router.post("/api/account-safety/breaker/reset")
+@router.post("/api/account-safety/breaker/reset", dependencies=WRITE_AUTHORITY)
 def reset_breaker(req: BreakerResetRequest, kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
     conn = get_connection()

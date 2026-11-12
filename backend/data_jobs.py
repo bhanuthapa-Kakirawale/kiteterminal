@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from backend import config, indicators, kite_client, ohlc, worker_health
+from backend import config, indicators, instance_lock, kite_client, ohlc, worker_health
 from backend.accounts import get_default_account
 from backend.watchlist import symbols_in_holdings_or_watchlist
 
@@ -66,6 +66,9 @@ async def run_job_worker() -> None:
     while True:
         job_type, instrument_token, symbol = await queue.get()
         _pending_keys.discard((job_type, instrument_token))
+        if not instance_lock.loop_may_run("data_jobs"):  # Phase 2: only the database owner
+            queue.task_done()
+            return
         try:
             with worker_health.cycle("data_jobs"):
                 try:

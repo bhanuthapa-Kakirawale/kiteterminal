@@ -12,7 +12,7 @@ from backend import (
     config, execution, instruments, kite_client, market, order_monitor, paper_broker, position_quantity,
     reconciliation, risk_engine,
 )
-from backend import gtt_observations, obs, worker_health
+from backend import gtt_observations, instance_lock, obs, worker_health
 from backend.accounts import get_default_account
 from backend.db import get_connection
 from backend.ticker import ticker_manager
@@ -36,6 +36,8 @@ _last_active_count = 0
 async def run_trailing_loop() -> None:
     cycle_no = 0
     while True:
+        if not instance_lock.loop_may_run("trailing"):  # Phase 2: only the database owner
+            return
         cycle_no += 1
         with obs.correlation(f"tr-{cycle_no}"):  # PK-22E
             try:
@@ -138,7 +140,8 @@ def _tick_mode(conn: sqlite3.Connection, kite, tickets: list[sqlite3.Row]) -> No
     gtt_book = {g["id"]: g for g in raw_book if isinstance(g, dict) and g.get("id") is not None}
     if len(gtt_book) != len(raw_book):
         logger.warning("event=trailing.malformed_gtts skipped=%d", len(raw_book) - len(gtt_book))
-    gtt_observations.record_book(gtt_book.values())
+    gtt_observations.record_book(gtt_book.values(),
+                                 expected=[t["kite_gtt_id"] for t in tickets if t["kite_gtt_id"] is not None])
     gtt_status = {gtt_id: g.get("status", "active") for gtt_id, g in gtt_book.items()}
     ltp_data = _trailing_ltps(kite, tickets, gtt_status)
 

@@ -306,3 +306,74 @@ Run sequentially, FakeKite and throwaway databases only; no real broker request,
 | NSE 2027 monitor (live, read-only) | `NOT_PUBLISHED` at 2026-11-03T11:26Z |
 | Frozen PK-25 files (13 hash-pinned + `research/pk25/*`) | byte-identical |
 | DMB's 17 pre-existing modified/untracked paths | byte-identical, unstaged diff identical, nothing staged from them |
+
+## 10. Single instance and the startup restriction (Phase 2)
+
+Source: `docs/PHASE_2_DESIGN_REVIEW.md` and `docs/PHASE_2_IMPLEMENTATION_REPORT.md`. The live gate stays off (`LIVE_ENTRIES_ENABLED = False`). Everything here can only add refusals of new live entries.
+
+### 10.1 What you will see
+
+| Situation | What the terminal shows | What to do |
+|---|---|---|
+| A second copy started (another window, shortcut, scheduled task, another port) | It serves a read-only status page at `/` naming the owner (pid, host, start time, heartbeat). Every other request returns `503 ANOTHER_INSTANCE_RUNNING`, including Kite login. | Use the running instance. To switch instances, stop the owner first, then start the new one. |
+| Owner crashed or was killed | The next start runs normally. It may wait up to 60 s (the lease) when the crashed process's heartbeat was recent. It starts RESTRICTED with `PREVIOUS_INSTANCE_UNCLEAN`. | Nothing: Stage 1 runs automatically. Check System Diagnostics → `instance`. |
+| `INSTANCE_LOCK_LOST` (URGENT log, 503 on writes) | This process found another epoch in the database. It no longer writes anything, its loops stop and broker writes are refused. Reads still work. | Find the other writer: another machine, a synced or network folder, a copy of the database. Stop it. Restart this process. |
+| `INSTANCE_CONFLICT` (URGENT) | A writer the lock cannot see advanced the heartbeat. The process stays read-only. | Same as above. Never run the database from OneDrive, a network share or two machines. |
+| `DATABASE_NOT_ON_LOCAL_DRIVE` | Read-only; the lock cannot be trusted there. | Move the database to a fixed local drive. |
+| `ACCOUNT_RESTRICTED` on a live entry | The entry is refused; the ticket stays approvable. Exits, cancels and Emergency Exit work normally. | Read the reasons (System Diagnostics → `instance.restriction`, or Live Readiness, where it shows as a warning). Fix the cause; the restriction clears by itself. |
+
+### 10.2 Restriction reasons and how each clears
+
+| Reason | Cleared when |
+|---|---|
+| `STARTUP_RECONCILIATION_INCOMPLETE` | a Stage 1 run passes in this process, after the last login and the last resume. Stage 1 retries automatically (30 s, 60 s, 120 s, then every 5 min) and re-runs on every login and resume. |
+| `PREVIOUS_INSTANCE_UNCLEAN` | Stage 1 passes. |
+| `NO_SESSION` | log in to Kite, then Stage 1 passes. |
+| `PROXY_UNAVAILABLE` | the Kite REST proxy (`KITE_REST_PROXY`) is configured and reachable, then Stage 1 passes. |
+| `BROKER_READ_FAILED` | one complete read of orders, GTTs, holdings and positions within 30 s. |
+| `BROKER_DATA_INCONSISTENT` | a later complete read without the contradiction. Examples: an app position the broker does not list; a filled entry not yet in positions after 60 s; a triggered GTT whose order is missing. |
+| `BROKER_READ_STALE` | a fresh complete read: the reconciliation loop, every 3 min, keeps it fresh. |
+| `UNRESOLVED_OPERATION` | every live entry or exit with an unknown, needs-review or predecessor-claimed outcome is resolved. The order monitor resolves them by tag; never by re-sending. |
+| `RECONCILIATION_REQUIRED` | positions with unknown or negative quantity, or unconfirmed fills, are resolved. |
+| `CLEANUP_REQUIRED` | unresolved `GTT_CANCEL_FAILED` / `GTT_CANCEL_OUTCOME_UNKNOWN` findings are reviewed. |
+| `HEARTBEAT_STALE` | the next successful heartbeat. A prolonged SQLite lock is the usual cause. |
+| `RESUMED_AFTER_SUSPEND` | a Stage 1 run that starts after the resume passes. GTT observations are marked stale on resume. |
+| `INSTANCE_LOCK_LOST` / `INSTANCE_CONFLICT` | never in this process: restart after fixing the cause. |
+
+Stage 2 (automatic recovery writes) is deliberately empty in Phase 2: no reconciliation ever sends a broker write.
+
+### 10.3 Migration v11, backup and rollback
+
+Do this once, before the first start of a Phase 2 build, with the app stopped:
+
+1. `python -m backend.db_maintenance backup`.
+2. Verify the backup:
+   - `python -m backend.db_maintenance integrity --db <backup>` must show `ok` and 0 FK violations;
+   - `python -m backend.db_maintenance status --db <backup>` must show `v10 of v11`.
+3. Record its size and SHA-256 (`Get-FileHash`), and copy it off the machine.
+
+The first start migrates to v11 and leaves `kite_terminal.db.pre_schema_v11_bak`. After that, an older build refuses the database (`DATABASE_SCHEMA_UNSUPPORTED`). To go back to an older build:
+
+1. Stop the app.
+2. Run `python -m backend.db_maintenance rollback-schema-v11 --confirm`. It drops only the Phase 2 tables, keeps every trading row, and writes `…pre_rollback_v11_bak` first.
+
+Restoring the backup instead loses every trade recorded after it.
+
+### 10.4 Maintenance while the terminal runs
+
+`analyze`, `vacuum`, `migrate`, `rollback-schema-v11`, `migrate-v12`, `rollback-schema-v12`, `restore-backup`, `init-fresh` and `acknowledge-database` refuse while the terminal holds the lock (exit code 3, `ANOTHER_INSTANCE_RUNNING`). `status`, `integrity`, `backup`, `verify-backup`, `storage-check` and `preflight-v12` are read-only and may run at any time. Every command that writes the database first refuses a target that is not on an internal fixed local disk (`STORAGE_NOT_FIXED_LOCAL`).
+
+### 10.5 Migration v12 and restoring a backup
+
+Migration v12 is **registered** in this build and has **not** been applied to the real database. Migrating the real database is a separate, explicit authorization. In this build:
+
+- a start refuses a v11 database with `DATABASE_MIGRATION_AUTHORIZATION_REQUIRED` and writes nothing;
+- only `python -m backend.db_maintenance migrate-v12 --authorize-v12 --offsite-record <record.json>` applies v12, with the app stopped. The record comes from `backup --dest <external disk or another computer's share>` and is under 12 h old; the command re-verifies that backup live. `E:\backup` on this machine is on the same physical disk as the database and does **not** count;
+- `rollback-schema-v12 --confirm` undoes v12 only while its journal is empty;
+- a start refuses a database that is missing, empty, corrupt, replaced, moved or mid-maintenance (`DATABASE_INSTALLATION_STATE_REFUSED`). It never re-creates an established installation's database as a new one.
+
+The complete operator procedure, GO/NO-GO decision tree and recovery for every result: `output/audits/v12_final_readiness_2026-11-11/OPERATOR_RUNBOOK.md` and `GO_NO_GO_CHECKLIST.md`.
+
+**Never restore a backup by copying it over `kite_terminal.db`.** A leftover `kite_terminal.db-wal` would be replayed onto the restored file, and the result can pass `integrity_check` while holding the wrong data. Use `python -m backend.db_maintenance restore-backup --backup <file> --confirm`. It verifies the backup, moves the original database with its sidecars aside as one set, and puts the original back if the restore does not verify.
+
+Any exit code 4 means: do not start the app; follow §9 of `docs/PHASE_3_V12_REGISTRATION_RUNBOOK_DRAFT.md`.

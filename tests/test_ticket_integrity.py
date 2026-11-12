@@ -52,7 +52,8 @@ def test_the_categories_cover_exactly_the_p1d_digest_fields():
 
 
 def test_migration_v10_creates_the_append_only_audit_table(env):
-    assert env.db.LATEST_SCHEMA_VERSION == 10
+    import schema_builds   # Phase 2 registered v11 after this v10 audit table (v12: the registration pin)
+    assert env.db.LATEST_SCHEMA_VERSION == schema_builds.expected_latest()
     conn = env.db.get_connection()
     try:
         triggers = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' "

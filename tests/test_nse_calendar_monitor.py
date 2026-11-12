@@ -64,7 +64,11 @@ def test_only_official_nse_https_urls_are_fetched():
 
 
 def test_the_cli_prints_and_exits_with_the_status(capsys, monkeypatch):
-    monkeypatch.setattr(mon, "_fetch", lambda url, timeout=20.0: _master("26-Jan-2026"))
+    # check()'s `fetch=_fetch` default was bound at definition, so patching mon._fetch alone left
+    # the CLI on the real network (found by the Phase 0 network guard). Patch the default it uses.
+    fake = lambda url, timeout=20.0: _master("26-Jan-2026")  # noqa: E731
+    monkeypatch.setattr(mon, "_fetch", fake)
+    monkeypatch.setitem(mon.check.__kwdefaults__, "fetch", fake)
     assert mon.main(["check", "--year", "2027"]) == 10
     assert "NOT_PUBLISHED" in capsys.readouterr().out
     assert mon.main(["check", "--year", "2026", "--json"]) == 0

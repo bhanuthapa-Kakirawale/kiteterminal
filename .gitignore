@@ -25,8 +25,14 @@ backend/kite_terminal*_bak
 *.sqlite3
 *.bak
 *_bak
+# SQLite sidecars of a backup (a read-only open of a WAL-mode backup creates them): account data too.
+*_bak-wal
+*_bak-shm
+*_bak-journal
 
 backend/ui_prefs.json
+# Phase 2: the single-instance lock file (<DB_PATH>.instance.lock)
+backend/*.instance.lock
 
 # Captured live broker payloads (debugging) must never be committed.
 captures/
@@ -34,3 +40,6 @@ captures/
 
 # PK-22E: rotating application logs (python -m backend.server)
 logs/
+
+# Audit / readiness evidence reports (V12 final readiness and later): local evidence, never committed.
+output/

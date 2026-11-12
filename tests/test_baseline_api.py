@@ -271,6 +271,7 @@ def test_emergency_exit(env):
     preview = env.client.get("/api/kill-switch/emergency-exit-preview").json()["data"]
     assert preview == []  # dry-run positions are never "open" positions
     live_id = _insert_ticket(env.db, mode="live")
+    env.kite.set_holding("TCS", 5)  # E3: the broker holds what the app's position says
     preview = env.client.get("/api/kill-switch/emergency-exit-preview").json()["data"]
     assert [p["ticket_id"] for p in preview] == [live_id]
     bad = env.client.post("/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "exit"})

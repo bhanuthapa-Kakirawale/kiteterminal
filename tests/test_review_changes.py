@@ -411,7 +411,8 @@ def test_position_check_counts_unsettled_and_ignores_surplus(env):
     _insert_ticket(env.db, entry_fill_status="filled")
 
     def run_with(holding_qty, t1_qty):
-        env.kite._holdings = [{"tradingsymbol": "TCS", "quantity": holding_qty, "t1_quantity": t1_qty}]
+        env.kite._holdings = [{"tradingsymbol": "TCS", "exchange": "NSE", "quantity": holding_qty,
+                               "t1_quantity": t1_qty}]
         conn = _conn(env)
         try:
             reconciliation._check_position_state(conn, env.kite, get_default_account(conn))

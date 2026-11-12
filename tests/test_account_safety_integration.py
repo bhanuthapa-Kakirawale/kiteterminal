@@ -249,7 +249,9 @@ def _block_every_entry_control(env, monkeypatch):
     r = _confirm(env, _entry(env))
     assert r.status_code == 409
     assert [f["code"] for f in r.json()["detail"]["failures"]] == [
-        "TRADING_LOCKED", "LIVE_PREREQUISITE_MISSING", "DAILY_LOSS_LIMIT", "DAILY_ENTRY_LIMIT", "MAX_NOTIONAL_EXCEEDED",
+        "TRADING_LOCKED", "LIVE_PREREQUISITE_MISSING",
+        "ACCOUNT_RESTRICTED",  # Phase 2: the UNKNOWN ticket is also an UNRESOLVED_OPERATION
+        "DAILY_LOSS_LIMIT", "DAILY_ENTRY_LIMIT", "MAX_NOTIONAL_EXCEEDED",
         "BROKER_CIRCUIT_OPEN", "AMO_CONFIRMATION_REQUIRED"]
 
 

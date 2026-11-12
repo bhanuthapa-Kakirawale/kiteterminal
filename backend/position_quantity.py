@@ -291,7 +291,10 @@ def sync_protection(conn: sqlite3.Connection, kite, position_id: int, reason: st
             gtt = gtt_book[gtt_id]
         else:
             try:
-                gtt = next((g for g in kite.get_gtts() if g["id"] == gtt_id), None)
+                book = [g for g in kite.get_gtts() if isinstance(g, dict) and g.get("id") is not None]
+                from backend import gtt_observations
+                gtt_observations.record_book(book, expected=[gtt_id])
+                gtt = next((g for g in book if g["id"] == gtt_id), None)
             except Exception as e:
                 return mismatch("GTT book unreadable",
                                 f"the GTT book could not be read to resize protective GTT {gtt_id} to {desired} "
@@ -326,12 +329,32 @@ def sync_protection(conn: sqlite3.Connection, kite, position_id: int, reason: st
             return mismatch(f"GTT {gtt_id} covers {was}; resize to {desired} failed",
                             f"protective GTT {gtt_id} covers {was} share(s) but {desired} are open, and resizing it "
                             f"FAILED ({type(e).__name__}: {e}) ({reason}).")
-        from backend import gtt_observations
-        gtt_observations.record_resize(gtt_id, desired)
         was = _legs_text(current)
         message = f"Protective GTT {gtt_id} resized from {was} to {desired} share(s) ({reason})."
+        message += _verify_resize(kite, gtt_id, desired)
         _log_event(conn, position_id, "modified", message)
         return SyncResult("resized", message)
+
+
+def _verify_resize(kite, gtt_id, desired: int) -> str:
+    """S2: Kite accepting a modify is not proof of what the GTT now covers. What was seen
+    before is invalidated and the book is read back once: only that read is recorded as an
+    observation. If it cannot be read the GTT is simply unobserved (UNVERIFIED), never
+    assumed resized. A read, never a write: nothing is retried or re-sent."""
+    from backend import gtt_observations
+    gtt_observations.invalidate(gtt_id)
+    try:
+        book = [g for g in kite.get_gtts() if isinstance(g, dict) and g.get("id") is not None]
+    except Exception as e:
+        return (f" The resize could not be verified at the broker ({type(e).__name__}: {e}); its protection "
+                f"shows UNVERIFIED until the GTT book is read again.")
+    gtt_observations.record_book(book, expected=[gtt_id])
+    seen = gtt_observations.get(gtt_id) or {}
+    legs = [leg["quantity"] for leg in seen.get("legs") or []]
+    if seen.get("status") == "active" and legs and all(q == desired for q in legs):
+        return " Verified at the broker."
+    return (f" The broker's GTT book now shows it {seen.get('status') or 'missing'} with legs "
+            f"{_legs_text(legs)} — not the {desired} requested; check it in Kite.")
 
 
 # ---- closing a flat position -------------------------------------------------
@@ -407,7 +430,10 @@ def remove_protective_gtt(conn: sqlite3.Connection, kite, exit_ticket_id: int | 
     gtt_id, symbol = position["kite_gtt_id"], position["symbol"]
     order_id = exit_ticket["kite_order_id"] if exit_ticket is not None else None
     try:
-        status = next((g.get("status", "active") for g in kite.get_gtts() if g["id"] == gtt_id), "missing")
+        book = [g for g in kite.get_gtts() if isinstance(g, dict) and g.get("id") is not None]
+        from backend import gtt_observations
+        gtt_observations.record_book(book, expected=[gtt_id])
+        status = next((g.get("status", "active") for g in book if g["id"] == gtt_id), "missing")
     except Exception:
         status = None  # cannot tell: still try to remove it
 
@@ -425,22 +451,22 @@ def remove_protective_gtt(conn: sqlite3.Connection, kite, exit_ticket_id: int | 
         return f" {detail}", True
     if status not in ("active", None):
         return f" Protective GTT {gtt_id} was already {status} at Kite.", False
-    try:
-        kite.delete_gtt(gtt_id)
-    except Exception as e:
-        from backend import reconciliation
-        detail = (f"ORPHANED GTT: {symbol} — exit order {order_id} filled and the position is closed, but removing "
-                  f"its protective GTT {gtt_id} FAILED ({type(e).__name__}: {e}). It could still fire against shares "
-                  f"that are gone — delete it in Kite NOW.")
-        reconciliation.log_mismatch(conn, position_id, "order_status", expected=f"GTT {gtt_id} removed",
-                                    actual=f"GTT {gtt_id} delete failed after exit fill", detail=detail,
-                                    issue_code=reconciliation.ORPHANED_GTT_AFTER_EXIT,
-                                    severity=reconciliation.URGENT, symbol=symbol, gtt_id=gtt_id)
+    # C4: the delete is verified by a read-back; only a confirmed cancellation clears the GTT.
+    from backend import gtt_cancellation
+    outcome = gtt_cancellation.cancel(kite, gtt_id)
+    if not outcome.confirmed:
+        context = f"exit order {order_id} filled and the position is closed"
+        gtt_cancellation.record_finding(conn, outcome, ticket_id=position_id, symbol=symbol, context=context)
+        detail = (f"{'ORPHANED GTT' if outcome.state == gtt_cancellation.FAILED else 'GTT CANCELLATION UNKNOWN'}: "
+                  f"{symbol} — {context}, but its protective GTT {gtt_id} was NOT confirmed cancelled "
+                  f"({outcome.state}): {outcome.detail} It could still fire against shares that are gone — check "
+                  f"and delete it in Kite NOW.")
         _log_event(conn, position_id, "modified", detail)
         return f" {detail}", True
     conn.execute("UPDATE trade_tickets SET kite_gtt_id = NULL WHERE id = ?", (position_id,))
-    _log_event(conn, position_id, "modified", f"Protective GTT {gtt_id} removed after exit order {order_id} filled.")
-    return f" Protective GTT {gtt_id} removed.", False
+    _log_event(conn, position_id, "modified",
+               f"Protective GTT {gtt_id} cancelled after exit order {order_id} filled ({outcome.detail})")
+    return f" Protective GTT {gtt_id} cancelled (confirmed by the broker).", False
 
 
 def describe(position, open_qty: int | None) -> str:

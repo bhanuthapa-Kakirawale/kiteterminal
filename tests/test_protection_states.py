@@ -5,10 +5,10 @@ quantity as soon as Kite ACCEPTS the entry. Acceptance is not a fill, and a GTT 
 account's holdings, not on the entry. So, everywhere the terminal reports protection:
 
 - a position is PROTECTED only when shares are confirmed held and an active GTT covers exactly
-  them; never an accepted entry that has filled nothing (NOT_PROTECTED_PENDING_FILL), never a GTT
+  them; never an accepted entry that has filled nothing (PENDING_FILL), never a GTT
   that could sell more than is confirmed held (QUANTITY_EXCEEDS_POSITION);
-- the GTT's actual status and quantity (broker-observed when a loop has read the GTT book, else
-  the app's record) are shown next to the confirmed filled quantity;
+- the GTT's actual status and quantity (broker-observed only; the app's record is shown as the
+  record, never as protection) are shown next to the confirmed filled quantity;
 - every mismatch or missing protection is alerted (reconciliation finding and/or broadcast);
 - nothing ever creates a GTT except the frozen order path itself: no retry, no re-creation after a
   failure, never as a side effect of an exit or Emergency Exit;
@@ -74,12 +74,14 @@ def test_01_an_accepted_unfilled_entry_is_never_protected(env, market_open):
     buy_id, _, gtt_id = _place_entry(env, 100)
     lc = _lc(env, buy_id)
     assert lc["lifecycle_state"] == "ENTRY_OPEN"
-    assert lc["protection_status"] == "NOT_PROTECTED_PENDING_FILL"
-    assert lc["protection_label"].startswith("NOT PROTECTED")
-    assert (lc["kite_gtt_id"], lc["gtt_quantity"], lc["confirmed_filled_quantity"], lc["open_quantity"]) == (
+    # S2/S3: PENDING_FILL, never PROTECTED, and never reported as an unprotected open position.
+    assert (lc["protection_status"], lc["protection_reason"]) == ("PENDING_FILL", "GTT_BEFORE_FILL")
+    assert lc["protection_label"] == "PENDING FILL"
+    assert (lc["kite_gtt_id"], lc["gtt_recorded_quantity"], lc["confirmed_filled_quantity"], lc["open_quantity"]) == (
         gtt_id, 100, 0, 0)
-    assert lc["gtt_source"] == "app_record" and lc["protection_alert"] is True
-    assert "PROTECTION_NOT_PROTECTED_PENDING_FILL" in lc["attention_reasons"]
+    # The app's record is never presented as a broker observation.
+    assert (lc["gtt_source"], lc["gtt_quantity"]) == (None, None) and lc["protection_alert"] is True
+    assert "PROTECTION_PENDING_FILL" in lc["attention_reasons"]
 
 
 def test_02_the_broker_observed_gtt_is_shown_once_a_loop_has_read_the_book(env, market_open):
@@ -88,7 +90,7 @@ def test_02_the_broker_observed_gtt_is_shown_once_a_loop_has_read_the_book(env, 
     lc = _lc(env, buy_id)
     assert (lc["gtt_source"], lc["gtt_status"], lc["gtt_quantity"]) == ("broker", "active", 100)
     assert lc["gtt_observed_at"] is not None
-    assert lc["protection_status"] == "NOT_PROTECTED_PENDING_FILL"
+    assert lc["protection_status"] == "PENDING_FILL"
 
 
 def test_03_reconciliation_flags_a_gtt_live_before_the_fill_as_a_warning_not_critical(env, market_open):
@@ -122,7 +124,8 @@ def test_05_a_partial_fill_whose_resize_failed_is_never_protected(env, market_op
     _monitor(env)
     assert _legs(env, gtt_id) == {100}
     lc = _lc(env, buy_id)
-    assert lc["protection_status"] == "QUANTITY_EXCEEDS_POSITION" and lc["severity"] == "critical"
+    assert (lc["protection_status"], lc["protection_reason"]) == ("NOT_PROTECTED", "QUANTITY_EXCEEDS_POSITION")
+    assert lc["severity"] == "critical"
     assert (lc["gtt_quantity"], lc["confirmed_filled_quantity"]) == (100, 40)
     assert "PROTECTION_QUANTITY_MISMATCH" in {f["issue_code"] for f in _findings(env, buy_id)}
 
@@ -132,7 +135,9 @@ def test_05b_without_a_broker_observation_the_failed_resize_is_still_a_mismatch(
     env.kite.raise_on_next("modify_gtt", NetworkException("timeout"))
     _fill(env, order_id, 40)
     _monitor(env)
-    assert _lc(env, buy_id)["protection_status"] == "QUANTITY_MISMATCH"
+    # The resize's own read of the book is an observation: 100 covered, 40 held.
+    lc = _lc(env, buy_id)
+    assert (lc["protection_status"], lc["protection_reason"]) == ("NOT_PROTECTED", "QUANTITY_EXCEEDS_POSITION")
 
 
 def test_06_a_full_fill_is_protected_and_verified_at_the_broker(env, market_open):
@@ -151,7 +156,8 @@ def test_07_a_triggered_gtt_seen_at_the_broker_is_not_protection(env, market_ope
     gtt_id = ticket_row(env.db, buy_id)["kite_gtt_id"]
     env.kite.set_gtt_status(gtt_id, "triggered")
     gtt_observations.record_book(env.kite.get_gtts())
-    assert _lc(env, buy_id)["protection_status"] == "MISSING"
+    lc = _lc(env, buy_id)
+    assert (lc["protection_status"], lc["protection_reason"]) == ("NOT_PROTECTED", "GTT_NOT_ACTIVE")
 
 
 # ---------------------------------------------------------------- GTT creation failed after acceptance
@@ -159,7 +165,10 @@ def test_07_a_triggered_gtt_seen_at_the_broker_is_not_protection(env, market_ope
 def test_08_failed_gtt_on_an_unfilled_entry_is_unprotected_and_flagged(env, market_open):
     buy_id, _ = _entry_with_failed_gtt(env)
     assert "protection_failed" in _events(env, buy_id)
-    assert _lc(env, buy_id)["protection_status"] == "MISSING"
+    # S2/S3: nothing has filled, so there is no open position to call unprotected: PENDING_FILL,
+    # with the missing GTT stated as the reason (and its finding alerted below).
+    lc = _lc(env, buy_id)
+    assert (lc["protection_status"], lc["protection_reason"]) == ("PENDING_FILL", "NO_GTT")
     _reconcile()
     [missing] = [f for f in _findings(env, buy_id) if f["issue_code"] == "PROTECTION_MISSING"]
     assert missing["severity"] == "urgent"
@@ -177,7 +186,8 @@ def test_09_failed_gtt_then_a_fill_straight_to_complete_raises_an_urgent_alert(e
     assert _events(env, buy_id).count("protection_failed") >= 2
     assert any(f["issue_code"] == "PROTECTION_MISSING" and f["severity"] == "urgent" for f in _findings(env, buy_id))
     lc = _lc(env, buy_id)
-    assert lc["protection_status"] == "MISSING" and lc["open_quantity"] == 100
+    assert (lc["protection_status"], lc["protection_reason"]) == ("NOT_PROTECTED", "NO_GTT")
+    assert lc["open_quantity"] == 100
     assert len(env.kite.calls_to("place_gtt")) == 1         # nothing re-created it
 
 
@@ -223,12 +233,13 @@ def test_12_an_ambiguous_entry_is_never_resubmitted_and_never_gets_a_gtt_by_itse
     _fill(env, order_id, 5, status="COMPLETE")
     _monitor(env)
     assert any(f["issue_code"] == "PROTECTION_MISSING" for f in _findings(env, t["id"]))
-    assert _lc(env, t["id"])["protection_status"] == "MISSING"
+    assert (_lc(env, t["id"])["protection_status"], _lc(env, t["id"])["protection_reason"]) == (
+        "NOT_PROTECTED", "NO_GTT")
     assert env.kite.calls_to("place_gtt") == []
 
 
 def test_13_summary_counts_every_protection_alert(env, market_open):
-    _place_entry(env, 100)                        # NOT_PROTECTED_PENDING_FILL
+    _place_entry(env, 100)                        # PENDING_FILL
     r = env.client.get("/api/app-positions?view=active")
     assert r.status_code == 200, r.text
     summary = r.json()["summary"]

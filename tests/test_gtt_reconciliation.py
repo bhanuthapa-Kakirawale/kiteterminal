@@ -13,6 +13,7 @@ No sleeps; broker state is driven through FakeKite; nothing reaches Zerodha.
 
 import json
 
+import pytest
 from kiteconnect.exceptions import InputException, NetworkException
 
 from conftest import ticket_row
@@ -306,6 +307,7 @@ def test_13b_14_single_plausible_gtt_is_reported_never_relinked(env):
     assert ticket_row(env.db, buy_id)["kite_gtt_id"] is None  # no fuzzy reassignment, ever
 
 
+@pytest.mark.v11_database   # two tickets sharing a GTT id: possible only before v12's unique index (DD-6)
 def test_14b_same_gtt_id_on_two_positions_is_ambiguous(env):
     a_id, gtt_id = _position(env, quantity=20)
     b_id, _ = _position(env, quantity=20, gtt=False, kite_gtt_id=gtt_id)

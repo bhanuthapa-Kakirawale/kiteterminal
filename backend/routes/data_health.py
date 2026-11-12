@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException
 
 from backend import data_jobs, ohlc_integrity
 from backend.db import get_connection
+from backend.instance_lock import WRITE_AUTHORITY
 
 router = APIRouter()
 
@@ -25,7 +26,7 @@ def history_health():
         conn.close()
 
 
-@router.post("/api/data/history/{instrument_token}/rebuild", status_code=202)
+@router.post("/api/data/history/{instrument_token}/rebuild", status_code=202, dependencies=WRITE_AUTHORITY)
 async def rebuild_history(instrument_token: int):
     conn = get_connection()
     try:

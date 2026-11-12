@@ -6,6 +6,7 @@ from typing import Literal
 from backend.accounts import get_default_account
 from backend.db import get_connection
 from backend.kite_client import require_kite
+from backend.instance_lock import WRITE_AUTHORITY
 
 router = APIRouter()
 
@@ -46,7 +47,7 @@ def get_dashboard_panels(screen: str = "dashboard", kite: KiteConnect = Depends(
         conn.close()
 
 
-@router.put("/api/dashboard-panels")
+@router.put("/api/dashboard-panels", dependencies=WRITE_AUTHORITY)
 def save_dashboard_panels(req: PanelsUpdateRequest, screen: str = "dashboard", kite: KiteConnect = Depends(require_kite)):
     # Full-replace, not a per-field patch: the frontend always holds the
     # complete current layout in memory, so every interaction (drag reorder,

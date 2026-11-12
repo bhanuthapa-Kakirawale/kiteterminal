@@ -28,6 +28,7 @@ from backend.models import (
     TicketRejectRequest,
 )
 from backend.ticker import ticker_manager
+from backend.instance_lock import WRITE_AUTHORITY
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -287,13 +288,13 @@ def _stamp_review(conn: sqlite3.Connection, ticket_id: int, account_id: int, wit
                  (*columns.values(), ticket_id, account_id))
 
 
-@router.post("/api/tickets", status_code=201)
+@router.post("/api/tickets", status_code=201, dependencies=WRITE_AUTHORITY)
 def create_ticket(req: TicketCreateRequest, kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
     return {"data": _create_ticket_internal(req, kite, account, source="manual")}
 
 
-@router.post("/api/tickets/alert-action/buy", status_code=201)
+@router.post("/api/tickets/alert-action/buy", status_code=201, dependencies=WRITE_AUTHORITY)
 def create_alert_action_buy(req: TicketCreateRequest, kite: KiteConnect = Depends(require_trading_account)):
     # Quick Action popup's "Buy more (average down)" action. Full risk
     # engine runs, no skip logic — this is risk-ADDING, unlike the sell
@@ -309,7 +310,7 @@ def create_alert_action_buy(req: TicketCreateRequest, kite: KiteConnect = Depend
     return {"data": _create_ticket_internal(req, kite, account, source="alert_action")}
 
 
-@router.post("/api/tickets/alert-action/sell", status_code=201)
+@router.post("/api/tickets/alert-action/sell", status_code=201, dependencies=WRITE_AUTHORITY)
 def create_alert_action_sell(req: AlertActionSellRequest, kite: KiteConnect = Depends(require_trading_account)):
     # Quick Action popup's "Sell to cut loss" / "Sell to reduce exposure"
     # action. Unlike a normal manual ticket, this always reduces/exits a
@@ -517,7 +518,7 @@ def get_ticket(ticket_id: int, kite: KiteConnect = Depends(require_trading_accou
         conn.close()
 
 
-@router.get("/api/tickets/{ticket_id}/chart")
+@router.get("/api/tickets/{ticket_id}/chart", dependencies=WRITE_AUTHORITY)
 def get_ticket_chart(ticket_id: int, kite: KiteConnect = Depends(require_trading_account)):
     """Everything the Signal Detail view needs, in one payload: candles and
     indicator series from ohlc_daily, the ticket's already-tick-snapped
@@ -557,7 +558,7 @@ def get_ticket_chart(ticket_id: int, kite: KiteConnect = Depends(require_trading
         conn.close()
 
 
-@router.post("/api/tickets/{ticket_id}/reject")
+@router.post("/api/tickets/{ticket_id}/reject", dependencies=WRITE_AUTHORITY)
 def reject_ticket(ticket_id: int, req: TicketRejectRequest, kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
     conn = get_connection()
@@ -580,7 +581,7 @@ def reject_ticket(ticket_id: int, req: TicketRejectRequest, kite: KiteConnect = 
         conn.close()
 
 
-@router.post("/api/tickets/{ticket_id}/revert-rejection")
+@router.post("/api/tickets/{ticket_id}/revert-rejection", dependencies=WRITE_AUTHORITY)
 def revert_rejection(ticket_id: int, kite: KiteConnect = Depends(require_trading_account)):
     """Undo a mistaken reject: puts the ticket back through risk checks so it
     lands back wherever a fresh ticket would (pending_confirmation or
@@ -619,7 +620,7 @@ def revert_rejection(ticket_id: int, kite: KiteConnect = Depends(require_trading
         conn.close()
 
 
-@router.post("/api/tickets/{ticket_id}/re-review")
+@router.post("/api/tickets/{ticket_id}/re-review", dependencies=WRITE_AUTHORITY)
 def re_review_ticket(ticket_id: int, kite: KiteConnect = Depends(require_trading_account)):
     """SEC-1 P1-D: the explicit human re-review of a manual / Quick-Action
     BUY entry whose review is no longer current (an NSE open/close or a new
@@ -724,7 +725,7 @@ def _claim_mode(conn: sqlite3.Connection, ticket: sqlite3.Row, account_id: int) 
     a real SELL. Exit creation stamps the inherited mode; this is the
     backstop. Race-free: an executed position's mode is never rewritten."""
     if ticket["closes_ticket_id"] is None:
-        return execution.get_execution_mode(), ""
+        return _require_valid_mode(ticket, execution.get_execution_mode(), "the terminal's execution mode"), ""
     position = conn.execute(
         "SELECT mode FROM trade_tickets WHERE id = ? AND account_id = ?",
         (ticket["closes_ticket_id"], account_id),
@@ -744,7 +745,23 @@ def _claim_mode(conn: sqlite3.Connection, ticket: sqlite3.Row, account_id: int) 
         })
     # Exits created before PK-3 carry no mode yet; they inherit it here.
     how = "stamped at creation" if ticket["mode"] is not None else "assigned at claim"
-    return position["mode"], f" — inherited from position #{ticket['closes_ticket_id']} ({how})"
+    mode = _require_valid_mode(ticket, position["mode"], f"position #{ticket['closes_ticket_id']}'s mode")
+    return mode, f" — inherited from position #{ticket['closes_ticket_id']} ({how})"
+
+
+def _require_valid_mode(ticket: sqlite3.Row, mode, what: str) -> str:
+    """G7: only exactly 'dry_run' or 'live' may be claimed. NULL, malformed or
+    unrecognised modes are refused (409) before the claim: nothing is written,
+    nothing is sent, and no live gate is skipped because a mode merely failed
+    to equal 'live'. paper_broker.check_mode / broker_for enforce the same rule
+    again at the broker boundary."""
+    if not paper_broker.is_valid_mode(mode):
+        raise HTTPException(409, {
+            "error_code": "INVALID_EXECUTION_MODE",
+            "message": f"Ticket {ticket['id']}: {what} is {mode!r}, not exactly 'dry_run' or 'live'. Broker writes "
+                       f"are refused for an unrecognised mode. Nothing was executed.",
+        })
+    return mode
 
 
 def _require_displayed_mode(ticket: sqlite3.Row, mode: str, expected_mode: str | None) -> None:
@@ -1194,14 +1211,23 @@ def confirm_and_execute_ticket(conn: sqlite3.Connection, account: sqlite3.Row, k
     # PK-20: the broker of the ticket's own mode — Kite for live, the paper
     # broker (on this request's connection, so the paper order is written in
     # the same transaction as the ticket's outcome) for dry run.
-    broker = paper_broker.broker_for(ticket["mode"], kite, conn, account["id"])
     try:
-        result = execution.execute_ticket(broker, ticket, entry_variety=variety)
-    except Exception as e:
-        # We cannot tell how far execution got, so this is an UNKNOWN
-        # outcome — never a 500 that leaves the ticket for nobody to follow up.
-        logger.exception("Execution of ticket %d raised", ticket_id)
-        result = execution.unknown_result(ticket, e)
+        broker = paper_broker.broker_for(ticket["mode"], kite, conn, account["id"])
+    except paper_broker.InvalidTradingMode as e:
+        # G7: the claimed row's mode is not exactly 'dry_run' / 'live' (it cannot be, after
+        # _claim_mode, unless the row changed). Refused before any broker call: a definite
+        # failure, never an UNKNOWN the order monitor would go looking for.
+        broker, result = None, execution.ExecutionResult(
+            success=False, kite_order_id=None, kite_gtt_id=None, status="failed", event_type="execution_failed",
+            message=f"{e} Refused before any broker call.")
+    if broker is not None:
+        try:
+            result = execution.execute_ticket(broker, ticket, entry_variety=variety)
+        except Exception as e:
+            # We cannot tell how far execution got, so this is an UNKNOWN
+            # outcome — never a 500 that leaves the ticket for nobody to follow up.
+            logger.exception("Execution of ticket %d raised", ticket_id)
+            result = execution.unknown_result(ticket, e)
 
     won = _record_execution_result(conn, ticket, result)
     if won:
@@ -1261,14 +1287,33 @@ def _record_execution_result(conn: sqlite3.Connection, ticket: sqlite3.Row, resu
         # The order is 'pending' until order_monitor.py sees the broker's —
         # or the paper broker's — fill. Nothing is ever filled here: no fill
         # price, time or quantity is known yet (PK-13, PK-20).
-        return execution.update_ticket_if(
-            conn, ticket["id"], status_in=("confirmed",), submission_state_in=claimed,
+        columns = dict(
             status=result.status, kite_order_id=result.kite_order_id, kite_gtt_id=result.kite_gtt_id,
             current_stop_loss=ticket["stop_loss"], executed_at=execution.utc_now_sql(),
             order_variety=result.order_variety, entry_fill_status=result.entry_fill_status,
             filled_price=None, filled_at=None, filled_quantity=0,
             submission_state=execution.ACKNOWLEDGED,
         )
+        # DD-6: a GTT protects at most one ticket. If the broker returned a GTT id another ticket already holds, the
+        # order is real and must still be tracked: the same compare-and-set is written without the GTT link and the
+        # unlinked broker GTT is flagged for a human, never a 500 that leaves a broker GTT nobody follows. Checked
+        # first (any schema), with migration 12's unique GTT index as the backstop for a race:
+        # its IntegrityError fails that one statement only, nothing else in this transaction is lost.
+        holder = _gtt_holder(conn, result.kite_gtt_id, ticket["id"])
+        if holder is None:
+            try:
+                return execution.update_ticket_if(
+                    conn, ticket["id"], status_in=("confirmed",), submission_state_in=claimed, **columns)
+            except sqlite3.IntegrityError:
+                holder = _gtt_holder(conn, result.kite_gtt_id, ticket["id"])
+                if holder is None:
+                    raise  # not the GTT index: an integrity failure this code does not know how to handle
+        won = execution.update_ticket_if(
+            conn, ticket["id"], status_in=("confirmed",), submission_state_in=claimed,
+            **dict(columns, kite_gtt_id=None))
+        if won:
+            _flag_unlinked_duplicate_gtt(conn, ticket, result, holder)
+        return won
     if result.event_type == "submission_unknown":
         # Status stays 'confirmed': still owned by execution, never
         # confirmable again, and now followed up by order_monitor.
@@ -1284,6 +1329,33 @@ def _record_execution_result(conn: sqlite3.Connection, ticket: sqlite3.Row, resu
     )
 
 
+def _gtt_holder(conn: sqlite3.Connection, gtt_id, ticket_id: int):
+    """The other ticket already linked to broker GTT `gtt_id`, or None."""
+    if gtt_id is None:
+        return None
+    return conn.execute("SELECT id, symbol FROM trade_tickets WHERE kite_gtt_id = ? AND id != ? ORDER BY id LIMIT 1",
+                        (gtt_id, ticket_id)).fetchone()
+
+
+def _flag_unlinked_duplicate_gtt(conn: sqlite3.Connection, ticket, result: execution.ExecutionResult, holder) -> None:
+    """The broker placed GTT result.kite_gtt_id for this ticket's order, but another ticket already holds that id,
+    so it was NOT linked here (DD-6: a GTT protects at most one ticket). Recorded on the ticket and as an urgent
+    reconciliation finding: the GTT exists at the broker and nothing in the terminal follows it."""
+    detail = (f"The broker returned GTT {result.kite_gtt_id} for this ticket's order {result.kite_order_id}, but ticket "
+              f"{holder['id']} ({holder['symbol']}) is already linked to that GTT id. It was NOT linked to this "
+              f"ticket. Check both positions' stops in Kite.")
+    _log_event(conn, ticket["id"], "modified", detail)
+    reconciliation.log_mismatch(
+        conn, ticket["id"], "order_status",
+        expected=f"broker GTT {result.kite_gtt_id} linked to exactly one ticket",
+        actual=f"GTT {result.kite_gtt_id} returned for ticket {ticket['id']} is already linked to ticket {holder['id']}",
+        detail=detail, issue_code=reconciliation.AMBIGUOUS_GTT_OWNERSHIP, severity=reconciliation.URGENT,
+        symbol=ticket["symbol"], gtt_id=result.kite_gtt_id, suggested_action=reconciliation.CHECK_KITE,
+    )
+    log_event(logger, "approval.gtt_not_linked_duplicate", "warning", ticket_id=ticket["id"],
+              gtt_id=result.kite_gtt_id, holder_ticket_id=holder["id"])
+
+
 def _reconcile_late_result(conn: sqlite3.Connection, claimed: sqlite3.Row, result: execution.ExecutionResult) -> None:
     """This request's broker result arrived after order_monitor had already
     resolved the ticket, so the monitor's state stands. The one thing the
@@ -1292,15 +1364,26 @@ def _reconcile_late_result(conn: sqlite3.Connection, claimed: sqlite3.Row, resul
     nothing is overwritten. Anything else is kept as evidence."""
     current = conn.execute("SELECT * FROM trade_tickets WHERE id = ?", (claimed["id"],)).fetchone()
     attached = False
+    holder = None
     if result.kite_order_id is not None and result.kite_gtt_id is not None:
-        attached = conn.execute(
-            "UPDATE trade_tickets SET kite_gtt_id = ? WHERE id = ? AND kite_order_id = ? AND kite_gtt_id IS NULL",
-            (result.kite_gtt_id, claimed["id"], result.kite_order_id),
-        ).rowcount == 1
+        # DD-6: a GTT protects at most one ticket. The NOT EXISTS guard keeps that on any schema (one statement,
+        # so no other write can interleave); the IntegrityError backstop covers migration 12's unique GTT index.
+        try:
+            attached = conn.execute(
+                "UPDATE trade_tickets SET kite_gtt_id = ? WHERE id = ? AND kite_order_id = ? AND kite_gtt_id IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM trade_tickets WHERE kite_gtt_id = ? AND id != ?)",
+                (result.kite_gtt_id, claimed["id"], result.kite_order_id, result.kite_gtt_id, claimed["id"]),
+            ).rowcount == 1
+        except sqlite3.IntegrityError:
+            attached = False
+        if not attached:
+            holder = _gtt_holder(conn, result.kite_gtt_id, claimed["id"])
     if attached:
         _log_event(conn, claimed["id"], "modified",
                    f"Protective GTT {result.kite_gtt_id}, placed by the confirming request, attached to "
                    f"recovered order {result.kite_order_id}.")
+    elif holder is not None and current["kite_gtt_id"] is None:
+        _flag_unlinked_duplicate_gtt(conn, current, result, holder)
     else:
         detail = (f"Late broker result for this submission, received after the order monitor had resolved it "
                   f"(status '{current['status']}', submission {current['submission_state']}); not applied: "
@@ -1345,7 +1428,7 @@ def margin_preview(ticket_id: int, kite: KiteConnect = Depends(require_trading_a
                      "live_entries_enabled": live_entry_gate.entries_enabled()}}
 
 
-@router.post("/api/tickets/{ticket_id}/confirm")
+@router.post("/api/tickets/{ticket_id}/confirm", dependencies=WRITE_AUTHORITY)
 def confirm_ticket(ticket_id: int, req: TicketConfirmRequest | None = None,
                    kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
@@ -1360,7 +1443,7 @@ def confirm_ticket(ticket_id: int, req: TicketConfirmRequest | None = None,
         conn.close()
 
 
-@router.post("/api/tickets/cancel-all-pending")
+@router.post("/api/tickets/cancel-all-pending", dependencies=WRITE_AUTHORITY)
 def cancel_all_pending(kite: KiteConnect = Depends(require_trading_account)):
     """Kill-switch action (Phase 8, Part A.2): rejects every ticket
     currently in draft or pending_confirmation status in one action."""
@@ -1397,7 +1480,7 @@ def cancel_all_pending(kite: KiteConnect = Depends(require_trading_account)):
         conn.close()
 
 
-@router.post("/api/tickets/{ticket_id}/start_trailing")
+@router.post("/api/tickets/{ticket_id}/start_trailing", dependencies=WRITE_AUTHORITY)
 def start_trailing(ticket_id: int, kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
     conn = get_connection()
@@ -1456,7 +1539,7 @@ def _diff_summary(old: sqlite3.Row, new: TicketEditRequest) -> str:
     return "; ".join(changes) if changes else "(no fields changed)"
 
 
-@router.put("/api/tickets/{ticket_id}")
+@router.put("/api/tickets/{ticket_id}", dependencies=WRITE_AUTHORITY)
 def edit_ticket(ticket_id: int, req: TicketEditRequest, kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
     conn = get_connection()
@@ -1530,7 +1613,7 @@ def edit_ticket(ticket_id: int, req: TicketEditRequest, kite: KiteConnect = Depe
         conn.close()
 
 
-@router.delete("/api/tickets/{ticket_id}")
+@router.delete("/api/tickets/{ticket_id}", dependencies=WRITE_AUTHORITY)
 def delete_ticket(ticket_id: int, kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
     conn = get_connection()

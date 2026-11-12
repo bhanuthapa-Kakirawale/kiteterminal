@@ -31,11 +31,13 @@ from backend import (
     config,
     data_jobs,
     db,
+    instance_lock,
     instruments,
     kite_client,
     order_monitor,
     reconciliation,
     sector_mapping,
+    startup_reconciliation,
     trailing_engine,
     version,
     workers,
@@ -111,12 +113,42 @@ async def on_startup():
     obs.install_file_logging()  # again, in case the server replaced its handlers
     install_log_redaction()
     server.enforce_runtime_policy()
+    # Phase 2 (docs/PHASE_2_DESIGN_REVIEW.md §8.2): the OS instance lock BEFORE init_db. A process that
+    # cannot take it (another instance owns the database), or whose database is not on a fixed local
+    # drive, is read-only: no init_db (no migration, no invariant, no key minting), no ticker, no loops;
+    # a status page, and 503 for every write (login and callback included).
+    role = instance_lock.acquire(db.DB_PATH)
+    if role != instance_lock.LOCKED and role != instance_lock.OWNER:
+        log_event(logger, "startup.read_only", role=role, code=instance_lock.refusal_code())
+        return
     # A database written by newer code is refused here, before any loop
-    # starts (DATABASE_SCHEMA_UNSUPPORTED, PK-22A).
-    init_db()
+    # starts (DATABASE_SCHEMA_UNSUPPORTED, PK-22A). Migrations now run under the lock.
+    try:
+        init_db()
+    except (db.DatabaseMigrationAuthorizationRequired, db.DatabaseInstallationStateRefused) as e:
+        # A registered migration that needs explicit operator authorization (v12) is pending, or the database of
+        # an established installation is missing / empty / replaced / mid-maintenance (V12 final readiness,
+        # Phase C): init_db refused before any write. Release the lock and abort startup; no takeover, loop,
+        # ticker or broker session.
+        instance_lock.release()
+        log_event(logger, "startup.refused", severity="critical", code=e.error_code)
+        logger.critical("%s", e)
+        raise
+    except BaseException:
+        instance_lock.release()
+        raise
     log_event(logger, "startup.database", schema_version=db.LATEST_SCHEMA_VERSION,
               applied_migrations=",".join(map(str, db.last_init.get("applied_migrations", []))) or "none",
               startup_row_changes=db.last_init.get("startup_row_changes"))
+    # The fenced epoch takeover; it persists RESTRICTED(STARTUP_RECONCILIATION_INCOMPLETE [,
+    # PREVIOUS_INSTANCE_UNCLEAN]) in the same transaction, before any loop starts. After an unclean
+    # predecessor it waits out the lease (at most INSTANCE_LEASE_SECONDS).
+    takeover = await asyncio.to_thread(instance_lock.takeover)
+    if takeover.get("conflict"):
+        log_event(logger, "startup.read_only", role=instance_lock.CONFLICT, code=instance_lock.INSTANCE_CONFLICT)
+        return
+    log_event(logger, "startup.instance", epoch=takeover["epoch"],
+              previous_instance_unclean=takeover.get("previous_unclean"))
     # PK-14: every watched/traded symbol gets its static sector before any
     # risk check runs — no Kite session needed. Never overwrites a manual one.
     try:
@@ -136,8 +168,14 @@ async def on_startup():
     except Exception:
         logger.exception("Failed to start ticker/instrument cache on startup")
 
-    # PK-22F: started through the supervisor — never twice in one process.
+    # PK-22F: started through the supervisor — never twice in one process. They start before Stage 1
+    # on purpose (§8.2): they do today's exposure-reducing upkeep, which RESTRICTED never blocks, and
+    # each checks write authority at the start of every cycle.
     workers.supervisor.start(_BACKGROUND_LOOPS)
+    workers.supervisor.start({"instance_heartbeat": instance_lock.run_heartbeat_loop})
+    # Stage 1 (read-only) startup reconciliation, retried until it passes; new live entries stay
+    # refused until it has passed and every restriction reason is clear. Stage 2 is empty in Phase 2.
+    startup_reconciliation.request_run("startup")
     # A due autopilot run syncs market data as its first step; otherwise
     # refresh holdings/watchlist history once at startup.
     try:
@@ -152,10 +190,15 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    # Phase 2 §7.6: authority drops first (the fence refuses new broker writes, routes return 503).
+    instance_lock.begin_shutdown()
     ticker_manager.stop()
     # Cancel AND await every loop and tracked task (bounded), so nothing
     # keeps running after the app reports it has stopped.
     await workers.supervisor.stop(timeout=config.WORKER_SHUTDOWN_TIMEOUT_SECONDS)
+    # Wait (bounded) for a broker write still in flight, record the shutdown (unclean if one was),
+    # then release the instance lock.
+    await asyncio.to_thread(instance_lock.finish_shutdown)
 
 
 app.include_router(auth.router)
@@ -188,6 +231,9 @@ app.include_router(dmb_inbox_routes.router)
 # (DNS rebinding, reads and writes, PK-18), then the cross-origin write and
 # WebSocket check (P0-8), then the per-launch terminal credential every write
 # and WebSocket handshake must carry (SEC-1 P1-F). All answer before routing.
+# Innermost (Phase 2): a read-only process (another instance owns the database) serves a status page
+# and refuses everything else; an owner passes straight through.
+app.add_middleware(instance_lock.InstanceOwnershipGuard)
 app.add_middleware(TerminalCredentialGuard)
 app.add_middleware(TerminalOriginGuard)
 app.add_middleware(TrustedHostGuard)

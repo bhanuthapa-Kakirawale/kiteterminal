@@ -78,7 +78,8 @@ from datetime import datetime, timedelta, timezone
 from kiteconnect.exceptions import TokenException
 
 from backend import (
-    config, execution, kite_client, obs, paper_broker, position_quantity, reconciliation, risk_engine, worker_health,
+    config, execution, instance_lock, kite_client, obs, paper_broker, position_quantity, reconciliation, risk_engine,
+    worker_health,
 )
 from backend.obs import log_event
 from backend.accounts import get_default_account
@@ -100,6 +101,8 @@ def _utc_now() -> datetime:
 async def run_order_monitor_loop() -> None:
     cycle_no = 0
     while True:
+        if not instance_lock.loop_may_run("order_monitor"):  # Phase 2: only the database owner
+            return
         cycle_no += 1
         # PK-22E/F: one correlation id per cycle; health recorded per cycle.
         # The live and paper halves fail independently.
@@ -454,9 +457,12 @@ def _gtt_is_active(kite, gtt_id) -> bool:
     if gtt_id is None:
         return False
     try:
-        return any(g["id"] == gtt_id and g.get("status", "active") == "active" for g in kite.get_gtts())
+        book = [g for g in kite.get_gtts() if isinstance(g, dict) and g.get("id") is not None]
     except Exception:
         return False  # cannot verify protection, so do not assume it
+    from backend import gtt_observations
+    gtt_observations.record_book(book, expected=[gtt_id])
+    return any(g["id"] == gtt_id and g.get("status", "active") == "active" for g in book)
 
 
 # ---- pending-order resolution ----------------------------------------------
@@ -624,17 +630,26 @@ def _resolve_entry(conn: sqlite3.Connection, kite, ticket: sqlite3.Row, order: d
 
     if not _claim_pending(conn, ticket, "status = 'cancelled', entry_fill_status = ?", (status.lower(),)):
         return None
-    gtt_note = ""
+    gtt_note, severity = "", "warning"
     if ticket["kite_gtt_id"] is not None:
-        try:
-            kite.delete_gtt(ticket["kite_gtt_id"])
+        # C4: only a cancellation the broker confirms clears the GTT; a failed or
+        # unconfirmed one keeps the id (reconciliation keeps watching it), records a
+        # persistent finding and is alerted as urgent.
+        from backend import gtt_cancellation
+        outcome = gtt_cancellation.cancel(kite, ticket["kite_gtt_id"])
+        if outcome.confirmed:
             conn.execute("UPDATE trade_tickets SET kite_gtt_id = NULL WHERE id = ?", (ticket["id"],))
-            gtt_note = f" Its protective GTT {ticket['kite_gtt_id']} was removed."
-        except Exception as e:
-            gtt_note = f" Removing its protective GTT {ticket['kite_gtt_id']} FAILED ({e}) — delete it in Kite."
-    msg =f"{ticket['symbol']}: entry order {status.lower()} — {reason}. The position never opened.{gtt_note}"
+            gtt_note = f" Its protective GTT {ticket['kite_gtt_id']} was cancelled ({outcome.detail})"
+        else:
+            gtt_cancellation.record_finding(
+                conn, outcome, ticket_id=ticket["id"], symbol=ticket["symbol"],
+                context=f"entry order {ticket['kite_order_id']} {status.lower()} with nothing filled")
+            severity = "urgent"
+            gtt_note = (f" Its protective GTT {ticket['kite_gtt_id']} was NOT confirmed cancelled "
+                        f"({outcome.state}): {outcome.detail} Delete it in Kite now.")
+    msg = f"{ticket['symbol']}: entry order {status.lower()} — {reason}. The position never opened.{gtt_note}"
     _log_event(conn, ticket["id"], "rejected", msg)
-    return {**base, "severity": "warning", "message": msg}
+    return {**base, "severity": severity, "message": msg}
 
 
 def _fill_time_utc(order: dict) -> str:

@@ -146,9 +146,11 @@ def test_query_count_does_not_grow_with_positions(env, monkeypatch, path):
     many = _count_selects(env, monkeypatch, path)
     assert many == one, (one, many)
     # PK-19's four, plus PK-20's one batched read of the paper order book,
+    # plus S2's one batched read of the paper GTT book (the paper broker's
+    # own state, a broker observation for paper GTTs),
     # plus (ticket list only) P1-D's one active-session read for every row's
     # review state — constant, never per row (asserted just above).
-    assert one <= (6 if path == "/api/tickets" else 5)
+    assert one <= (7 if path == "/api/tickets" else 6)
 
 
 def test_reconciliation_issues_are_attached_structurally(env):
@@ -159,7 +161,8 @@ def test_reconciliation_issues_are_attached_structurally(env):
     codes = {i["code"] for i in p["reconciliation_issues"]}
     assert "GTT_QUANTITY_TOO_HIGH" in codes
     # GTT 100 against 40 held: it exceeds the position (was the generic QUANTITY_MISMATCH).
-    assert p["protection_status"] == "QUANTITY_EXCEEDS_POSITION" and p["review_required"] is True
+    assert (p["protection_status"], p["protection_reason"]) == ("NOT_PROTECTED", "QUANTITY_EXCEEDS_POSITION")
+    assert p["review_required"] is True
     assert all({"id", "code", "label", "severity", "detail"} <= set(i) for i in p["reconciliation_issues"])
 
 

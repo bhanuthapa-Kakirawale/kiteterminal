@@ -151,7 +151,8 @@ def test_unprotected_state_is_text_and_icon_not_just_colour(env):
     buy_id, _ = _held_position(env, 40, kite_gtt_id=None)
     p = _position(env, buy_id)
     prot, review = _render(["protectionBadge", p], ["reviewCell", p])
-    assert "UNPROTECTED" in prot and "⛔" in prot and 'data-protection="MISSING"' in prot
+    assert "NOT PROTECTED" in prot and "⛔" in prot and 'data-protection="NOT_PROTECTED"' in prot
+    assert 'data-protection-reason="NO_GTT"' in prot and "no protective GTT" in prot
     assert "NEEDS REVIEW" in review
 
 
@@ -200,7 +201,8 @@ def test_reconciliation_issue_is_visible(env):
     review, prot, detail = _render(["reviewCell", p], ["protectionBadge", p],
                                    ["positionDetailHtml", _ticket(env, buy_id)])
     assert "GTT quantity too high" in review and 'data-issue="GTT_QUANTITY_TOO_HIGH"' in review
-    assert "GTT EXCEEDS POSITION" in prot and "covers 100; confirmed filled 40, held 40" in prot
+    assert "NOT PROTECTED" in prot and "GTT could sell more than is held" in prot
+    assert "covers 100; confirmed filled 40, held 40" in prot
     assert "Position" in detail and "NEEDS REVIEW" in detail
 
 

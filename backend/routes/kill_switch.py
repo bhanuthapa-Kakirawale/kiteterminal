@@ -1,16 +1,21 @@
 import json
 import logging
+from dataclasses import dataclass, field
 
 from fastapi import APIRouter, Depends, HTTPException
 from kiteconnect import KiteConnect
+from kiteconnect.exceptions import TokenException
 
-from backend import execution, lifecycle, order_monitor, position_quantity, risk_engine, system_events
+from backend import (
+    broker_holdings, execution, lifecycle, order_monitor, paper_broker, position_quantity, risk_engine, system_events,
+)
 from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
 from backend.models import EmergencyExitConfirmRequest
 from backend.obs import log_event
 from backend.routes.tickets import _transition, confirm_and_execute_ticket
+from backend.instance_lock import WRITE_AUTHORITY
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -66,6 +71,7 @@ def _cancel_unfilled_entry(kite: KiteConnect, conn, position) -> dict | None:
     instead (order_monitor.py then removes its GTT and closes the ticket).
     Returns None if the cancel fails — most likely the order filled a moment
     ago — so the caller falls back to a normal market exit."""
+    paper_broker.check_mode(kite, position["mode"])  # G7: exactly 'live' with Kite, or nothing is sent
     try:
         kite.cancel_order(variety=position["order_variety"] or kite.VARIETY_REGULAR, order_id=position["kite_order_id"])
     except Exception:
@@ -81,7 +87,7 @@ def _cancel_unfilled_entry(kite: KiteConnect, conn, position) -> dict | None:
     return {"ticket_id": position["id"], "symbol": position["symbol"], "status": "entry_cancelled", "message": detail}
 
 
-@router.post("/api/kill-switch/emergency-exit-confirm")
+@router.post("/api/kill-switch/emergency-exit-confirm", dependencies=WRITE_AUTHORITY)
 def emergency_exit_confirm(req: EmergencyExitConfirmRequest, kite: KiteConnect = Depends(require_trading_account)):
     """Best effort, one result per position (PK-10, P1-2): a failure to exit
     one position — a refusal, a broker error, or an unexpected exception —
@@ -110,12 +116,14 @@ def emergency_exit_confirm(req: EmergencyExitConfirmRequest, kite: KiteConnect =
             _log_summary_event(conn, account, message)
             raise HTTPException(503, {"error_code": "EMERGENCY_EXIT_UNAVAILABLE", "message": message})
         ltp_data = _fetch_ltps(kite, positions)
+        # E3: one fresh broker snapshot for the whole click, before anything is sold.
+        snapshot = _broker_snapshot(conn, kite, account) if positions else None
 
         results = []
         for pos in positions:
             attempt: dict = {}
             try:
-                results.append(_exit_one(conn, kite, account, pos, ltp_data, attempt))
+                results.append(_exit_one(conn, kite, account, pos, ltp_data, attempt, snapshot))
             except Exception as e:
                 # Anything unexpected for THIS position (P0-2 style broker
                 # surprises, a DB error, a bug): record it and move on to the
@@ -189,7 +197,168 @@ _SUMMARY_STATUSES = ("exit_submitted", "already_exiting", "exit_outcome_unknown"
                      "entry_cancelled", "risk_check_unavailable", "closed")
 
 
-def _exit_one(conn, kite: KiteConnect, account, pos, ltp_data: dict, attempt: dict) -> dict:
+# ---- E3: reconcile the exit against the broker before selling ----------------------------------
+#
+# The app's open quantity is its own record of what its fills bought and its exits sold. Before
+# Emergency Exit sells it, the account's FRESH broker data (holdings, positions, today's orders,
+# read once per click) must support it, per instrument (exchange + trading symbol, and the
+# instrument token where the broker gives one; backend/broker_holdings.py, T1 and the day's CNC
+# net counted once):
+#
+#   the broker holds at least the app's total open quantity of the instrument (every open live
+#   app position on it, summed); and no SELL of the instrument that this app did not place is
+#   working or has filled today (a manual sell, another app, or a protective GTT that fired and
+#   is not yet recorded: selling now could sell the same shares twice).
+#
+# Shares are fungible: holding enough proves only that the quantity can be delivered, never that
+# particular shares are the app's. So MORE held than the app's quantity (the user's own shares)
+# is allowed, with a note: exactly the app's open quantity is sold. Anything that cannot be
+# reconciled safely refuses the automated exit for that instrument, with what to do in Kite.
+# The broker's order book covers today only: activity on earlier days shows up as a quantity
+# difference, or not at all (a sale replaced by a purchase); that limit is documented.
+
+BROKER_RECONCILIATION_UNAVAILABLE = "BROKER_RECONCILIATION_UNAVAILABLE"
+EXIT_RECONCILIATION_FAILED = "EXIT_RECONCILIATION_FAILED"
+_TERMINAL_ORDER_STATUSES = ("COMPLETE", "CANCELLED", "REJECTED")
+_MANUAL = ("Exit this position manually in Kite after checking its holdings, positions and orders "
+           "(manual reconciliation); nothing was sent for it.")
+
+
+@dataclass
+class _Snapshot:
+    error: str | None = None
+    session_expired: bool = False
+    quantities: dict = field(default_factory=dict)
+    orders: list = field(default_factory=list)
+    app_order_ids: set = field(default_factory=set)
+    app_tags: set = field(default_factory=set)
+    verified: dict = field(default_factory=dict)     # key -> broker total the click verified against
+
+
+def _broker_snapshot(conn, kite: KiteConnect, account) -> _Snapshot:
+    """Holdings, positions and today's orders, read once, plus the account's own order ids and
+    tags (to tell this app's orders from everyone else's). Never raises: an unusable read is
+    recorded and refuses every exit of the click."""
+    snap = _Snapshot()
+    try:
+        holdings = kite.holdings()
+        positions = kite.positions()
+        orders = kite.orders()
+        if not isinstance(orders, list) or not all(isinstance(o, dict) for o in orders):
+            raise broker_holdings.BrokerDataError("orders is not a list of records")
+        snap.quantities = broker_holdings.instrument_quantities(holdings, positions)
+        snap.orders = orders
+        from backend import trailing_engine
+        # The app's own orders: every ticket's broker order, and every order a recorded GTT
+        # closure was matched to (the GTT watcher's own definition).
+        snap.app_order_ids = trailing_engine._app_order_ids(conn)
+        for row in conn.execute("SELECT order_tag FROM trade_tickets WHERE account_id = ? AND order_tag IS NOT NULL",
+                                (account["id"],)):
+            snap.app_tags.add(str(row["order_tag"]))
+    except TokenException as e:
+        snap.error, snap.session_expired = f"the Kite session has expired ({e})", True
+    except Exception as e:
+        logger.exception("Emergency Exit could not read the broker's holdings / positions / orders")
+        snap.error = f"{type(e).__name__}: {e}"
+    return snap
+
+
+def _is_app_order(snap: _Snapshot, order: dict) -> bool:
+    if str(order.get("order_id") or "") in snap.app_order_ids:
+        return True
+    tags = [order.get("tag"), *(order.get("tags") or [])]
+    return any(t and str(t) in snap.app_tags for t in tags)
+
+
+def _app_total(conn, account, key) -> int | None:
+    """The app's open quantity of the instrument across every open live position on it, now.
+    None if any of them is unknown."""
+    total = 0
+    for p in risk_engine.list_open_positions(conn, account["id"]):
+        if (broker_holdings.norm(p["exchange"]), broker_holdings.norm(p["symbol"])) != key:
+            continue
+        if p["open_quantity"] is None or p["open_quantity"] < 0:
+            return None
+        total += p["open_quantity"]
+    return total
+
+
+def _refuse(pos, code: str, why: str) -> dict:
+    return {"ticket_id": None, "symbol": pos["symbol"], "status": "refused", "error_code": code,
+            "message": f"{pos['exchange']}:{pos['symbol']}: Emergency Exit did NOT sell — {why} {_MANUAL}"}
+
+
+def _reconcile_exit(conn, account, pos, held: int, snap: _Snapshot | None) -> tuple[dict | None, str]:
+    """(refusal, note) for selling `held` of this position now. refusal None = may proceed."""
+    if snap is None or snap.error is not None:
+        why = (f"the broker's holdings, positions and orders could not be read ({snap.error if snap else 'not read'}),"
+               f" so the app's quantity cannot be reconciled with the account.")
+        if snap is not None and snap.session_expired:
+            why += " Log in to Kite again, or act in Kite directly."
+        return _refuse(pos, BROKER_RECONCILIATION_UNAVAILABLE, why), ""
+    key = (broker_holdings.norm(pos["exchange"]), broker_holdings.norm(pos["symbol"]))
+    q = snap.quantities.get(key)
+    if q is not None and q.problems:
+        return _refuse(pos, EXIT_RECONCILIATION_FAILED,
+                       f"the broker's figures for this instrument are inconsistent ({'; '.join(q.problems)})."), ""
+    token = pos["instrument_token"]
+    if q is not None and q.tokens and token and int(token) not in q.tokens:
+        return _refuse(pos, EXIT_RECONCILIATION_FAILED,
+                       f"the broker lists {q.exchange}:{q.tradingsymbol} as instrument {sorted(q.tokens)}, but this "
+                       f"position is instrument {token}."), ""
+
+    external_sells, external_buys = [], []
+    for o in snap.orders:
+        if (broker_holdings.norm(o.get("exchange")), broker_holdings.norm(o.get("tradingsymbol"))) != key:
+            continue
+        if _is_app_order(snap, o):
+            continue
+        status = str(o.get("status") or "").upper()
+        try:
+            filled = int(o.get("filled_quantity") or 0)
+        except (TypeError, ValueError):
+            filled = -1
+        working = status not in _TERMINAL_ORDER_STATUSES
+        if not status or filled < 0:
+            return _refuse(pos, EXIT_RECONCILIATION_FAILED,
+                           f"broker order {o.get('order_id')} on this instrument cannot be read "
+                           f"(status {o.get('status')!r}, filled {o.get('filled_quantity')!r})."), ""
+        if not working and filled == 0:
+            continue
+        text = f"order {o.get('order_id')} {o.get('transaction_type')} {o.get('quantity')} ({status}, filled {filled})"
+        (external_sells if str(o.get("transaction_type") or "").upper() == "SELL" else external_buys).append(text)
+    if external_sells:
+        return _refuse(pos, EXIT_RECONCILIATION_FAILED,
+                       f"SELL activity on this instrument today was not placed by this app "
+                       f"({'; '.join(external_sells[:4])}) — a manual sale, or a protective GTT that fired. Which "
+                       f"shares it sold cannot be told apart, and selling now could sell the same shares twice."), ""
+
+    app_total = _app_total(conn, account, key)
+    if app_total is None:
+        return _refuse(pos, EXIT_RECONCILIATION_FAILED,
+                       "another open app position in this instrument has an unknown quantity."), ""
+    app_total = max(app_total, held)
+    broker_total = q.total if q is not None else 0
+    verified = snap.verified.setdefault(key, broker_total)
+    if verified < app_total:
+        elsewhere = broker_holdings.same_symbol_elsewhere(snap.quantities, *key)
+        note = "".join(f" {pos['symbol']} is listed under {o.exchange} instead ({o.describe()}): possibly the same "
+                       f"security, but it is not this position's instrument." for o in elsewhere)
+        return _refuse(pos, EXIT_RECONCILIATION_FAILED,
+                       f"the app's open positions in this instrument hold {app_total} share(s), but the broker shows "
+                       f"only {verified} ({q.describe() if q is not None else 'nothing held'}) — sold outside "
+                       f"the app, or a fill the app has not seen.{note}"), ""
+    notes = []
+    if verified > app_total:
+        notes.append(f"the account holds {verified - app_total} more share(s) of {pos['symbol']} than this app's "
+                     f"positions; exactly {held} are sold")
+    if external_buys:
+        notes.append(f"BUY activity today not placed by this app: {'; '.join(external_buys[:4])}")
+    return None, (f" (Reconciled with Kite: {'; '.join(notes)}.)" if notes else " (Reconciled with Kite.)")
+
+
+def _exit_one(conn, kite: KiteConnect, account, pos, ltp_data: dict, attempt: dict,
+              snapshot: _Snapshot | None = None) -> dict:
     """Requests the exit of one open position and returns its result. Any
     exception propagates to the caller's per-position isolation; the id of an
     exit ticket created on the way is left in attempt['ticket_id'] so the
@@ -234,6 +403,12 @@ def _exit_one(conn, kite: KiteConnect, account, pos, ltp_data: dict, attempt: di
                 "error_code": "QUANTITY_UNKNOWN" if held is None else "NOTHING_HELD",
                 "message": f"{pos['symbol']}: not exited — {why}{note}. Nothing was sent; check the position in "
                            f"Kite."}
+
+    refusal, reconciled = _reconcile_exit(conn, account, pos, held, snapshot)
+    if refusal is not None:
+        refusal["message"] = refusal["message"] + note
+        return refusal
+    note = reconciled + note
 
     ticket_id = _create_emergency_exit_ticket(conn, account, pos, ltp_data)
     attempt["ticket_id"] = ticket_id

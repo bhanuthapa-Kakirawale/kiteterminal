@@ -89,6 +89,13 @@ AUTOMATION_RETRY_MINUTES = 15
 # against what the app expects — order status, GTT state, position
 # quantities. Runs only against the trading account.
 RECONCILIATION_INTERVAL_SECONDS = 180
+# A broker observation of a protective GTT (backend/gtt_observations.py) older
+# than this no longer proves protection: the position shows STALE until a loop
+# reads the GTT book again. The GTT watcher re-reads it every
+# TRAILING_CHECK_INTERVAL_SECONDS for monitored positions and reconciliation
+# every RECONCILIATION_INTERVAL_SECONDS; this allows two missed reconciliation
+# cycles plus slack (420 s).
+GTT_OBSERVATION_MAX_AGE_SECONDS = 2 * RECONCILIATION_INTERVAL_SECONDS + 60
 
 # PK-21 historical backtester. Every default a backtest uses lives here, in
 # one place, and every one of them is overridable per run from the Backtest
@@ -196,3 +203,42 @@ EGRESS_IP_TIMEOUT_SECONDS = 5.0
 # An outbound-IP observation older than this no longer counts either way:
 # the machine (or its NAT) may have changed since.
 EGRESS_OBSERVATION_MAX_AGE_HOURS = 24
+
+# ---- Phase 2: single-instance ownership and the startup restriction (docs/PHASE_2_DESIGN_REVIEW.md) ----
+# The fenced heartbeat of the owning process (app_instance.heartbeat_at / heartbeat_seq).
+HEARTBEAT_SECONDS = 15
+# app_instance.lease_seconds. Advisory only: it never grants ownership while the OS lock is held
+# elsewhere; a successor waits it out after an unclean predecessor, and it bounds HEARTBEAT_STALE.
+INSTANCE_LEASE_SECONDS = 60
+# How often a successor re-reads the predecessor's heartbeat while waiting out the lease.
+TAKEOVER_POLL_SECONDS = 2.0
+# Shutdown waits at most this long for a broker write still inside the SDK before recording the
+# shutdown (as unclean, with a note, when a write is still in flight).
+SHUTDOWN_INFLIGHT_WAIT_SECONDS = 10.0
+# Stage 1 startup reconciliation: the four reads (orders, GTTs, holdings, positions) count as one
+# complete read only when the first and last responses are at most this far apart.
+STARTUP_READ_SPAN_SECONDS = 30
+# Stage 1 retries until it passes: 30 s, 60 s, 120 s, then every 300 s.
+STARTUP_RECONCILIATION_RETRY_SECONDS = (30, 60, 120, 300)
+# An app entry fill reported by the order book may take this long to show in positions before
+# Stage 1 calls the two endpoints inconsistent.
+FILL_VISIBILITY_TOLERANCE_SECONDS = 60
+
+# ---- Phase 3: protection engine (dark; docs/PHASE_3_DESIGN_DECISIONS.md DD-8) ----------------------
+# Every value below is a PLACEHOLDER: PENDING P§10 items 9-12 (Phase 9 broker evidence: B-08, B-10,
+# B-11, B-31). The engine is fail-closed for any value; live activation needs the real ones.
+# The SDK's request timeout (kiteconnect's default) bounds one broker call (D§2.4).
+PROTECTION_SDK_TIMEOUT_SECONDS = 7
+# In-flight grace for a sent request: SDK timeout + 5 s (D§4.3 row 9; B-31). PENDING Phase 9.
+PROTECTION_INFLIGHT_GRACE_SECONDS = PROTECTION_SDK_TIMEOUT_SECONDS + 5
+# Settle rule for an unknown create (DD-8 rev. 2 / R2-5). PENDING Phase 9 (B-08).
+PROTECTION_SETTLE_SECONDS = 120
+SETTLE_MIN_COMPLETE_READS = 2
+SETTLE_READ_SPACING_SECONDS = 60
+# Late-match watch after absent_after_settle / a no_app_gtt resolution. PENDING Phase 9 (B-10).
+LATE_MATCH_WATCH_DAYS = 30
+# A read is usable for a send only while its wall-clock age is at most this (DD-8 rule ii).
+PREWRITE_MAX_AGE_SECONDS = 15
+# Bounded automatic retry of convergent ops (M-3): backoff 1, 2, 4 ... capped, and a total cap.
+PROTECTION_RETRY_BACKOFF_SECONDS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 300)
+PROTECTION_RETRY_MAX_ATTEMPTS = 10

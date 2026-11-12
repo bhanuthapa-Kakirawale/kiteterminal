@@ -1,6 +1,8 @@
 import asyncio
+import functools
 import logging
 import sqlite3
+import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -8,7 +10,8 @@ from datetime import datetime, timezone
 from kiteconnect.exceptions import TokenException
 
 from backend import (
-    config, execution, instruments, kite_client, market, obs, position_quantity, risk_engine, worker_health,
+    config, execution, instance_lock, instruments, kite_client, market, obs, position_quantity, risk_engine,
+    startup_reconciliation, worker_health,
 )
 from backend.accounts import get_default_account
 from backend.db import get_connection
@@ -42,6 +45,14 @@ POSITION_QUANTITY_REVIEW = "POSITION_QUANTITY_REVIEW"          # open quantity u
 POSSIBLE_DOUBLE_SELL = "POSSIBLE_DOUBLE_SELL"                  # exit filled AND the GTT triggered
 ORPHANED_GTT_AFTER_EXIT = "ORPHANED_GTT_AFTER_EXIT"            # position closed, its GTT delete failed
 GTT_STAGED_BEFORE_FILL = "GTT_STAGED_BEFORE_FILL"              # entry not filled, its sell GTT already live
+# C4: a GTT cancellation whose outcome Kite did not confirm. FAILED: Kite refused it or still
+# lists the GTT active. OUTCOME_UNKNOWN: it may or may not have been cancelled (no read-back, or
+# the GTT is absent / in another state). Neither is ever reported as cancelled.
+GTT_CANCEL_FAILED = "GTT_CANCEL_FAILED"
+GTT_CANCEL_OUTCOME_UNKNOWN = "GTT_CANCEL_OUTCOME_UNKNOWN"
+# C8: the broker's quantity of an instrument the app holds cannot be read reliably this cycle
+# (malformed / duplicate / negative rows, conflicting instrument tokens).
+BROKER_QUANTITY_UNVERIFIABLE = "BROKER_QUANTITY_UNVERIFIABLE"
 
 # Kite -> app findings. A reviewed one stays silent while the broker GTT
 # (quantity, trigger, status) and the app positions it is judged against
@@ -72,11 +83,45 @@ _price_seen: dict[int, tuple] = {}
 _reverse_seen: set[tuple] = set()
 
 
+# Phase 2: Stage 1 startup reconciliation (startup_reconciliation.py) runs these same checks once
+# against its own broker read, possibly while this loop's cycle runs; one at a time, so two threads
+# never race the same findings or the cross-cycle memory above.
+CLASSIFICATION_LOCK = threading.RLock()
+
+
+def _one_at_a_time(fn):
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        with CLASSIFICATION_LOCK:
+            return fn(*args, **kwargs)
+    return run
+
+
 def reset_cycle_memory() -> None:
     """Forgets every cross-cycle sighting and the last status (tests)."""
     _price_seen.clear()
     _reverse_seen.clear()
     last_cycle.clear()
+
+
+# Phase 3 DD-10 G4 (R2-7, consumer-driven): a two-cycle confirmation must rest on sightings from one
+# uninterrupted run. Every classification entry point calls this WHILE HOLDING CLASSIFICATION_LOCK; a resume
+# detected by any detector (heartbeat or engine CAS) bumps instance_lock.resume_seq, and the next consumer clears
+# the sightings itself. No cross-thread call, no lock taken from a CAS.
+_memory_resume_seq = 0
+
+
+def reset_memory_if_resumed() -> bool:
+    """True if a resume since the previous call cleared the cross-cycle sightings. Call with CLASSIFICATION_LOCK held."""
+    global _memory_resume_seq
+    from backend import instance_lock
+    seq = instance_lock.resume_seq()
+    if seq == _memory_resume_seq:
+        return False
+    _memory_resume_seq = seq
+    _price_seen.clear()
+    _reverse_seen.clear()
+    return True
 
 
 async def run_reconciliation_loop() -> None:
@@ -85,6 +130,8 @@ async def run_reconciliation_loop() -> None:
     accounts have no tickets to reconcile against)."""
     cycle_no = 0
     while True:
+        if not instance_lock.loop_may_run("reconciliation"):  # Phase 2: only the database owner
+            return
         cycle_no += 1
         with obs.correlation(f"rc-{cycle_no}"):  # PK-22E
             try:
@@ -114,7 +161,8 @@ class BrokerSnapshot:
     that every GTT is missing, nor that none exists."""
     gtts: list | None = None
     gtt_error: str | None = None
-    held: dict[str, int] | None = None
+    # C8: per (EXCHANGE, TRADINGSYMBOL), see backend/broker_holdings.py.
+    held: dict | None = None
     held_error: str | None = None
     held_loaded: bool = False
 
@@ -133,36 +181,31 @@ class BrokerSnapshot:
         gtt_observations.record_book(self.gtts)
 
     def load_held(self, kite) -> None:
-        """Shares the broker shows per symbol. Unsettled (T+1) delivery
-        quantity sits in t1_quantity, not quantity — ignoring it flagged
-        every position the day after it was bought."""
+        """What the broker holds per instrument (EXCHANGE, TRADINGSYMBOL):
+        settled + T1 holdings + the day's CNC net position, overnight CNC rows
+        not counted twice, MIS / NRML never counted (backend/broker_holdings.py).
+        A payload whose rows cannot be attributed to an instrument makes the
+        whole read unusable for this cycle (fail closed): an unattributable row
+        could be shares of any of the app's instruments."""
+        from backend import broker_holdings
         self.held_loaded = True
         try:
             holdings = kite.holdings()
-            positions = kite.positions().get("net", [])
+            positions = kite.positions()
         except Exception as e:
             logger.exception("Could not fetch holdings()/positions() for position-state check")
             self.held, self.held_error = None, f"{type(e).__name__}: {e}"
             return
-        held: dict[str, int] = {}
-        skipped = 0
-        for h in holdings:
-            if not isinstance(h, dict) or not h.get("tradingsymbol"):
-                skipped += 1
-                continue
-            qty = (h.get("quantity") or 0) + (h.get("t1_quantity") or 0)
-            held[h["tradingsymbol"]] = held.get(h["tradingsymbol"], 0) + qty
-        for p in positions:
-            if not isinstance(p, dict) or not p.get("tradingsymbol"):
-                skipped += 1
-                continue
-            held[p["tradingsymbol"]] = held.get(p["tradingsymbol"], 0) + (p.get("quantity") or 0)
-        if skipped:
-            logger.warning("event=reconciliation.malformed_holdings skipped=%d", skipped)
-        self.held = held
+        try:
+            self.held = broker_holdings.instrument_quantities(holdings, positions)
+        except broker_holdings.BrokerDataError as e:
+            logger.warning("event=reconciliation.malformed_holdings: %s", e)
+            self.held, self.held_error = None, f"malformed broker data: {e}"
 
 
+@_one_at_a_time
 def _run_cycle() -> None:
+    reset_memory_if_resumed()   # G4, under CLASSIFICATION_LOCK (the decorator holds it)
     conn = get_connection()
     try:
         account = get_default_account(conn)
@@ -196,6 +239,8 @@ def _run_cycle() -> None:
             new_findings=_row_count(conn) - before,
             failed_checks=failed,
         )
+        # Phase 2: the persisted restriction is re-derived at every cycle (owner only; never raises).
+        startup_reconciliation.refresh_persisted_state()
         if failed:
             raise ReconciliationChecksFailed(f"check(s) failed and were rolled back: {', '.join(failed)}")
     finally:
@@ -412,6 +457,10 @@ def _check_gtt_state(conn: sqlite3.Connection, kite, account, snapshot: BrokerSn
         (account["id"],),
     ).fetchall()
     by_id = {g["id"]: g for g in snapshot.gtts}
+    from backend import gtt_observations
+    # The cycle's book is complete: an app GTT absent from it is observed MISSING, so a
+    # stale 'active' sighting can never keep a position looking protected.
+    gtt_observations.record_book([], expected=[t["kite_gtt_id"] for t in tickets if t["kite_gtt_id"] not in by_id])
     _check_protection_missing(conn, account)
     checked = set()
     for t in tickets:
@@ -576,7 +625,9 @@ def _owning(row, legacy_closed: set[int]) -> bool:
             and row["closes_ticket_id"] is None and row["id"] not in legacy_closed)
 
 
-def _check_broker_gtts(conn: sqlite3.Connection, account, snapshot: BrokerSnapshot) -> None:
+def _check_broker_gtts(conn: sqlite3.Connection, account, snapshot: BrokerSnapshot, single_read: bool = False) -> None:
+    # single_read (Phase 2 Stage 1 only): at startup one complete read is enough to REPORT, since no app
+    # write has started from the new process; the cross-cycle memory is then left untouched.
     # Account scope: the GTT book is this trading account's own session's.
     # Kite also reports each GTT's user_id: one that belongs to another
     # user is never judged against this account's tickets.
@@ -589,9 +640,12 @@ def _check_broker_gtts(conn: sqlite3.Connection, account, snapshot: BrokerSnapsh
     def report(ticket_id: int | None, check_type: str, **finding) -> None:
         key = (finding["issue_code"], finding["gtt_id"], finding["actual"])
         seen_now.add(key)
-        if key in _reverse_seen:  # the same finding on the previous cycle too
+        if single_read or key in _reverse_seen:  # the same finding on the previous cycle too
             log_mismatch(conn, ticket_id, check_type, **finding)
 
+    if single_read:
+        _classify_broker_gtts(conn, account, active, report)
+        return
     try:
         _classify_broker_gtts(conn, account, active, report)
     finally:
@@ -741,13 +795,16 @@ def _check_position_state(conn: sqlite3.Connection, kite, account, snapshot: Bro
     # PK-13: what each position actually holds — filled, less what its exits
     # sold (a partial exit's residual included) — never the requested
     # quantity. A working entry counts only what has filled so far.
-    expected_by_symbol: dict[str, int] = {}
+    from backend import broker_holdings
+    # C8: by exchange AND symbol, never the symbol alone.
+    expected: dict[tuple[str, str], int] = {}
     for pos in risk_engine.list_open_positions(conn, account["id"]):
         held = pos["open_quantity"]
         if not held or held < 0:
             continue  # nothing bought yet (order_monitor follows it), or unknown / NEEDS REVIEW (flagged there)
-        expected_by_symbol[pos["symbol"]] = expected_by_symbol.get(pos["symbol"], 0) + held
-    if not expected_by_symbol:
+        key = (broker_holdings.norm(pos["exchange"]), broker_holdings.norm(pos["symbol"]))
+        expected[key] = expected.get(key, 0) + held
+    if not expected:
         return
 
     snapshot = snapshot or BrokerSnapshot()
@@ -760,14 +817,32 @@ def _check_position_state(conn: sqlite3.Connection, kite, account, snapshot: Bro
     # account for is normal when the stock is also held outside the app.
     # PK-7: a shortfall never closes a position — fewer shares held does not
     # prove which order sold them.
-    for symbol, expected_qty in expected_by_symbol.items():
-        actual_qty = snapshot.held.get(symbol, 0)
-        if actual_qty < expected_qty:
+    for (exchange, symbol), expected_qty in expected.items():
+        instrument = f"{exchange}:{symbol}"
+        q = snapshot.held.get((exchange, symbol))
+        if q is not None and q.problems:
             log_mismatch(
                 conn, None, "position_state",
-                expected=f"{expected_qty} shares", actual=f"{actual_qty} shares",
-                detail=f"{symbol}: the app's open tickets hold {expected_qty} shares but the broker shows only "
-                       f"{actual_qty} — sold outside the app, or an order didn't fill.{_armed_note(snapshot, symbol)}",
+                expected=f"{instrument} {expected_qty} shares, readable", actual=f"{instrument} unverifiable",
+                detail=f"{instrument}: the broker's holdings/positions for this instrument cannot be reconciled "
+                       f"({'; '.join(q.problems)}). The app's open tickets hold {expected_qty} share(s); compare "
+                       f"them with Kite manually.",
+                issue_code=BROKER_QUANTITY_UNVERIFIABLE, severity=URGENT, symbol=symbol,
+                expected_quantity=expected_qty, broker_quantity=None, position_state="open",
+                suggested_action=REVIEW_POSITION,
+            )
+            continue
+        actual_qty = q.total if q is not None else 0
+        if actual_qty < expected_qty:
+            elsewhere = broker_holdings.same_symbol_elsewhere(snapshot.held, exchange, symbol)
+            note = "".join(f" {symbol} is also listed under {o.exchange} ({o.describe()}): possibly the same "
+                           f"security, never counted for {instrument} — reconcile it manually." for o in elsewhere)
+            log_mismatch(
+                conn, None, "position_state",
+                expected=f"{instrument} {expected_qty} shares", actual=f"{instrument} {actual_qty} shares",
+                detail=f"{instrument}: the app's open tickets hold {expected_qty} shares but the broker shows only "
+                       f"{actual_qty}{f' ({q.describe()})' if q is not None else ''} — sold outside the app, or an "
+                       f"order didn't fill.{note}{_armed_note(snapshot, symbol)}",
                 issue_code=BROKER_POSITION_SHORTFALL, severity=URGENT, symbol=symbol,
                 expected_quantity=expected_qty, broker_quantity=actual_qty, position_state="open",
                 suggested_action=REVIEW_POSITION,

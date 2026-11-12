@@ -4,18 +4,21 @@ import logging
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import RedirectResponse
 
-from backend import automation, data_jobs, instruments, kite_client, live_arming, sector_mapping, security, workers
+from backend import (
+    automation, data_jobs, instruments, kite_client, live_arming, sector_mapping, security, startup_reconciliation, workers,
+)
 from backend.accounts import get_default_account
 from backend.db import get_connection
 from backend.ticker import collect_instrument_tokens, ticker_manager
 from backend.watchlist import watchlist_instrument_tokens
+from backend.instance_lock import WRITE_AUTHORITY
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-@router.get("/login")
+@router.get("/login", dependencies=WRITE_AUTHORITY)
 def login(request: Request):
     # P2-G: a login only THIS browser can finish: the state is cookie-bound AND sent through Kite
     # (redirect_params), which must echo it on the callback (R-F1). Supersedes any earlier login.
@@ -31,7 +34,7 @@ def _login_failed(request: Request) -> RedirectResponse:
     return response
 
 
-@router.get("/callback")
+@router.get("/callback", dependencies=WRITE_AUTHORITY)
 async def callback(request: Request):
     request_token = request.query_params.get("request_token")
     status = request.query_params.get("status")
@@ -54,6 +57,9 @@ async def callback(request: Request):
         return _login_failed(request)
 
     workers.supervisor.spawn("after_login", _after_login())
+    # Phase 2 §8.2: a new session is not the one Stage 1 reconciled against; new live entries wait for
+    # a Stage 1 run that passes after this login.
+    startup_reconciliation.request_run("login")
     # SEC-1 P1-F: a completed Kite login (the user's password and 2FA) is
     # what authorizes this browser during this launch. The cookie travels only
     # in this HttpOnly, SameSite=Strict cookie; P2-G R-F3: the port-isolated
@@ -113,7 +119,7 @@ def session_status(request: Request):
     }
 
 
-@router.post("/api/logout")
+@router.post("/api/logout", dependencies=WRITE_AUTHORITY)
 def logout(request: Request, response: Response):
     account = get_default_account()
     conn = get_connection()

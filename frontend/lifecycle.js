@@ -48,23 +48,27 @@
     NEEDS_REVIEW: "The app cannot tell this position's state from its own data — check it in Kite.",
   };
 
+  // S2/S3: the server decides the status; PROTECTED only ever comes from a fresh broker
+  // observation, never from the app's own record of its GTT.
   const PROTECTION_ICON = {
-    PROTECTED: "🛡", MISSING: "⛔", QUANTITY_MISMATCH: "⚠", QUANTITY_EXCEEDS_POSITION: "⛔",
-    NOT_PROTECTED_PENDING_FILL: "⚠", PRICE_MISMATCH: "⚠", UNKNOWN: "?", NOT_REQUESTED: "○",
+    PROTECTED: "🛡", NOT_PROTECTED: "⛔", UNVERIFIED: "?", STALE: "⌛", PENDING_FILL: "⚠", UNKNOWN: "?",
+    NOT_REQUESTED: "○",
   };
   const PROTECTION_SEVERITY = {
-    PROTECTED: "ok", MISSING: "critical", QUANTITY_MISMATCH: "critical", QUANTITY_EXCEEDS_POSITION: "critical",
-    NOT_PROTECTED_PENDING_FILL: "warning", PRICE_MISMATCH: "critical", UNKNOWN: "warning", NOT_REQUESTED: "muted",
+    PROTECTED: "ok", NOT_PROTECTED: "critical", UNVERIFIED: "warning", STALE: "warning", PENDING_FILL: "warning",
+    UNKNOWN: "warning", NOT_REQUESTED: "muted",
   };
   const PROTECTION_HINTS = {
-    PROTECTED: "An active protective GTT covers exactly the confirmed filled shares held (last known state).",
-    QUANTITY_EXCEEDS_POSITION: "The protective GTT could sell MORE shares than are confirmed held — it acts on all "
-      + "of the account's holdings of this stock. Check it in Kite now.",
-    NOT_PROTECTED_PENDING_FILL: "NOT PROTECTED — nothing has filled, but a sell GTT is already live at Kite. It "
-      + "protects nothing yet and, if it triggers before the fill, could sell shares held outside this entry.",
-    MISSING: "UNPROTECTED — no active protective GTT for the shares held. Place a stop-loss in Kite.",
-    QUANTITY_MISMATCH: "The protective GTT does not cover exactly the shares held.",
-    PRICE_MISMATCH: "The protective GTT's stop at Kite differs from the app's stop.",
+    PROTECTED: "Kite was seen recently with an active protective GTT on this instrument covering exactly the "
+      + "confirmed filled shares held.",
+    NOT_PROTECTED: "NOT PROTECTED — the shares held have no correct active protective GTT at Kite. Check the GTT "
+      + "and place a stop-loss in Kite now.",
+    UNVERIFIED: "PROTECTION UNVERIFIED — the GTT has not been observed at Kite since this terminal started. It is "
+      + "not shown as protected until the GTT book is read; check it in Kite.",
+    STALE: "PROTECTION STALE — the last observation of the GTT at Kite is too old to prove anything now.",
+    PENDING_FILL: "PENDING FILL — the entry order is accepted but nothing has filled, so there is no position yet. "
+      + "A sell GTT already live at Kite protects nothing and, if it triggers before the fill, could sell shares "
+      + "held outside this entry.",
     UNKNOWN: "Protection cannot be judged: the position's quantity or submission is unknown.",
     NOT_REQUESTED: "This ticket asked for no protective GTT.",
   };
@@ -93,15 +97,21 @@
     const s = lc.protection_status;
     // The GTT's actual status and quantity (broker-observed, or the app's record) against the
     // confirmed filled quantity: the two are always shown side by side, never conflated.
-    const seen = lc.gtt_source === "broker" ? `${lc.gtt_status} at Kite, seen ${lc.gtt_observed_at} UTC`
-      : "app record, not yet observed at Kite";
+    const where = lc.gtt_source === "paper_broker" ? "the paper broker" : "Kite";
+    const stale = s === "STALE" ? " — too old" : "";
+    const seen = lc.gtt_source
+      ? `${lc.gtt_status} at ${where}, seen ${lc.gtt_observed_at} UTC (${lc.gtt_observation_age_seconds ?? "?"}s ago`
+        + `${stale}); covers ${lc.gtt_quantity ?? "?"}`
+      : `not yet observed at Kite; the app's record says it covers ${lc.gtt_recorded_quantity ?? "?"}`;
     const gtt = lc.kite_gtt_id
-      ? ` (GTT ${lc.kite_gtt_id}: ${seen}; covers ${lc.gtt_quantity ?? "?"}; confirmed filled `
-        + `${lc.confirmed_filled_quantity ?? "?"}, held ${lc.open_quantity ?? "?"})`
+      ? ` (GTT ${lc.kite_gtt_id}: ${seen}; confirmed filled ${lc.confirmed_filled_quantity ?? "?"}, `
+        + `held ${lc.open_quantity ?? "?"})`
       : "";
+    const reason = lc.protection_reason_label ? ` · ${lc.protection_reason_label}` : "";
     return `<span class="lc-prot lc-sev-${PROTECTION_SEVERITY[s] || "muted"}" data-protection="${esc(s)}" `
+      + `data-protection-reason="${esc(lc.protection_reason || "")}" `
       + `title="${esc((PROTECTION_HINTS[s] || "") + gtt)}"><span class="lc-icon" aria-hidden="true">`
-      + `${PROTECTION_ICON[s] || ""}</span>${esc(lc.protection_label)}</span>`;
+      + `${PROTECTION_ICON[s] || ""}</span>${esc(lc.protection_label)}${esc(reason)}</span>`;
   }
 
   function modeChip(mode) {

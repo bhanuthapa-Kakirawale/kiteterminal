@@ -230,6 +230,8 @@ def check_no_presellable_quantity(conn: sqlite3.Connection, account_id: int, tic
         positions = kite.positions()
         orders = _rows(kite.orders(), "orders")
         gtts = _rows(kite.get_gtts(), "GTT list")
+        from backend import gtt_observations
+        gtt_observations.record_book(gtts)
         found = (_holdings_matches(holdings, symbol) + _positions_matches(positions, symbol)
                  + _orders_matches(orders, symbol) + _gtts_matches(gtts, symbol)
                  + _app_matches(conn, account_id, ticket))

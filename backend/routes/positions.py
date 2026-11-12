@@ -19,6 +19,7 @@ from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
 from backend.routes import kill_switch, tickets
+from backend.instance_lock import WRITE_AUTHORITY
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -60,7 +61,7 @@ def list_app_positions(view: str = Query("active", pattern="^(active|closed)$"),
         conn.close()
 
 
-@router.post("/api/app-positions/{position_id}/exit", status_code=201)
+@router.post("/api/app-positions/{position_id}/exit", status_code=201, dependencies=WRITE_AUTHORITY)
 def exit_position(position_id: int, kite: KiteConnect = Depends(require_trading_account)):
     """Creates ONE linked MARKET SELL exit ticket for the position's open
     quantity, in the position's own mode (PK-3), and runs its risk checks.

@@ -59,6 +59,7 @@ the terminal never places them (its stops are GTTs).
 """
 
 import copy
+import functools
 import json
 import logging
 import re
@@ -67,7 +68,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from kiteconnect.exceptions import GeneralException, InputException
 
-from backend import config, instruments, market, trading_calendar
+from backend import config, instance_lock, instruments, market, trading_calendar
 from backend.db import get_connection
 
 logger = logging.getLogger(__name__)
@@ -106,20 +107,54 @@ def is_paper_broker(broker) -> bool:
     return isinstance(broker, PaperBroker)
 
 
+# G7: the trading mode fails closed. Exactly "dry_run" routes to the paper
+# broker and exactly "live" to Kite (where every live gate still applies);
+# anything else (NULL, "", "LIVE", " live", "paper", a non-str) refuses every
+# broker write before any call. No case-folding, no stripping, no default:
+# an unrecognised mode is never "probably live" or "probably dry run". This
+# is the broker boundary: execution.execute_ticket, the order monitor, the
+# GTT watcher, protection upkeep and Emergency Exit all pass through
+# check_mode() / broker_for(), and no environment variable, request field or
+# setting is consulted here.
+DRY_RUN = "dry_run"
+LIVE = "live"
+VALID_MODES = (DRY_RUN, LIVE)
+
+
+class InvalidTradingMode(ModeIsolationError):
+    """The trading mode is missing or not exactly 'dry_run' / 'live'. Raised
+    before any broker call."""
+
+
+def is_valid_mode(mode) -> bool:
+    return type(mode) is str and mode in VALID_MODES
+
+
+def require_valid_mode(mode) -> str:
+    if not is_valid_mode(mode):
+        raise InvalidTradingMode(f"Trading mode {mode!r} is not exactly 'dry_run' or 'live': broker writes are "
+                                 f"refused and nothing was sent.")
+    return mode
+
+
 def check_mode(broker, mode: str | None) -> None:
     """The one mode/broker binding rule: a dry-run ticket is only ever
-    handled by the paper broker, anything else never by it."""
+    handled by the paper broker, a live one only by anything else, and an
+    unrecognised mode by nothing."""
+    require_valid_mode(mode)
     paper = is_paper_broker(broker)
-    if mode == "dry_run" and not paper:
+    if mode == DRY_RUN and not paper:
         raise ModeIsolationError("A dry-run ticket can only use the paper broker; nothing was sent.")
-    if mode != "dry_run" and paper:
-        raise ModeIsolationError(f"A {mode or 'modeless'} ticket can never use the paper broker; nothing was sent.")
+    if mode == LIVE and paper:
+        raise ModeIsolationError("A live ticket can never use the paper broker; nothing was sent.")
 
 
 def broker_for(mode: str | None, kite, conn: sqlite3.Connection, account_id: int):
-    """The broker a ticket of this mode executes against: Kite for live, a
-    paper broker (reading market data from `kite`) for dry run."""
-    if mode == "dry_run":
+    """The broker a ticket of this mode executes against: Kite for exactly
+    'live', a paper broker (reading market data from `kite`) for exactly
+    'dry_run'. Any other mode raises InvalidTradingMode."""
+    require_valid_mode(mode)
+    if mode == DRY_RUN:
         return PaperBroker(conn, account_id, market_data=kite)
     return kite
 
@@ -274,6 +309,22 @@ def _gtt_dict(row) -> dict:
     }
 
 
+def gtt_dict(row) -> dict:
+    """A paper_gtts row exactly as PaperBroker.get_gtts() lists it."""
+    return _gtt_dict(row)
+
+
+def _owner_only(method):
+    """Phase 2 (docs/PHASE_2_DESIGN_REVIEW.md §7.3): a paper write changes the shared database, so, like a
+    Kite write, only the process that owns the database may make one. Refused otherwise with
+    instance_lock.InstanceNotOwner (a definite rejection: nothing was written)."""
+    @functools.wraps(method)
+    def write(self, *args, **kwargs):
+        with instance_lock.broker_write(f"paper.{method.__name__}", "WRITE"):
+            return method(self, *args, **kwargs)
+    return write
+
+
 class PaperBroker:
     """A KiteConnect stand-in for dry-run tickets. See the module docstring."""
 
@@ -313,6 +364,7 @@ class PaperBroker:
         return {"net": [], "day": []}
 
     # -- orders ------------------------------------------------------------------
+    @_owner_only
     def place_order(self, variety, exchange, tradingsymbol, transaction_type, quantity, product, order_type,
                     price=None, trigger_price=None, tag=None, **kwargs):
         order_id = self._insert_order(variety, exchange, tradingsymbol, transaction_type, quantity, product,
@@ -398,6 +450,7 @@ class PaperBroker:
     def trades(self):
         return []
 
+    @_owner_only
     def cancel_order(self, variety, order_id, **kwargs):
         row = self._order_row(order_id)
         if row["status"] not in WORKING_STATUSES or self._conn.execute(
@@ -431,6 +484,7 @@ class PaperBroker:
             raise InputException("Paper broker: an OCO GTT's triggers must be [lower, upper]")
         return triggers, legs
 
+    @_owner_only
     def place_gtt(self, trigger_type, tradingsymbol, exchange, trigger_values, last_price, orders):
         triggers, legs = self._validate_gtt(trigger_type, trigger_values, orders)
         cursor = self._conn.execute(
@@ -454,6 +508,7 @@ class PaperBroker:
             raise InputException(f"Paper broker: GTT {trigger_id} not found")
         return row
 
+    @_owner_only
     def modify_gtt(self, trigger_id, trigger_type, tradingsymbol, exchange, trigger_values, last_price, orders):
         row = self._gtt_row(trigger_id)
         triggers, legs = self._validate_gtt(trigger_type, trigger_values, orders)
@@ -467,6 +522,7 @@ class PaperBroker:
         _raise_if_accepted_then_lost("modify_gtt")
         return {"trigger_id": trigger_id}
 
+    @_owner_only
     def delete_gtt(self, trigger_id):
         row = self._gtt_row(trigger_id)
         if row["status"] != "active" or self._conn.execute(

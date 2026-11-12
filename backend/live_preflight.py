@@ -1121,7 +1121,33 @@ def confirm_time_blockers(conn: sqlite3.Connection, account_id: int, trading_now
     checks = [_reconciliation_cycle_check(now), _critical_findings_check(conn), _isolation_check(conn, account_id)]
     checks += _critical_worker_checks(now)
     checks.append(_calendar_check(trading_now or now)[0])
+    checks.append(restriction_check(conn, account_id, now, blocking=True))
     return [c for c in checks if is_blocking_failure(c)]
+
+
+# Phase 2 (docs/PHASE_2_DESIGN_REVIEW.md §8.5): the startup restriction. RESTRICTED refuses a live NEW
+# entry at confirmation (account_safety maps it to ACCOUNT_RESTRICTED); it is never consulted for an
+# exit, a cancellation, Emergency Exit or protection upkeep. On the Live Readiness page it is shown as a
+# warning only (blocking=False), so arming LIVE is unchanged.
+RESTRICTION_CODE = "ACCOUNT_RESTRICTED"
+
+
+def restriction_check(conn: sqlite3.Connection, account_id: int, now: datetime | None = None,
+                      blocking: bool = True) -> dict:
+    from backend import startup_reconciliation
+    try:
+        derived = startup_reconciliation.derive_restriction(conn, account_id, now=now)
+    except Exception as e:  # cannot be evaluated: fail closed
+        return _check(RESTRICTION_CODE, "account_safety", FAIL if blocking else WARN,
+                      f"The startup restriction could not be evaluated ({type(e).__name__}: {e}).", blocking)
+    if derived["state"] == startup_reconciliation.NORMAL:
+        return _check(RESTRICTION_CODE, "account_safety", PASS,
+                      "NORMAL: this process owns the database and the startup reconciliation passed.", blocking)
+    reasons = startup_reconciliation.describe(derived["reasons"])
+    return _check(RESTRICTION_CODE, "account_safety", FAIL if blocking else WARN,
+                  f"The terminal is RESTRICTED ({reasons}): no new live entry until every reason clears. Exits, "
+                  f"cancellations and Emergency Exit are not affected.", blocking, "#diagnostics",
+                  detail={"reasons": derived["reasons"]})
 
 
 def evaluate(broker: bool = False, refresh: bool = False, now: datetime | None = None) -> dict:
@@ -1143,6 +1169,7 @@ def evaluate(broker: bool = False, refresh: bool = False, now: datetime | None =
         checks += _market_checks(conn, account_id, snap, now)
         checks += _worker_checks(now)
         checks += _account_safety_checks(conn, account_id)
+        checks.append(restriction_check(conn, account_id, now, blocking=False))
         checks += _reconciliation_checks(conn, account_id, now)
         checks += _broker_order_checks(conn, account_id, snap)
         checks += _mode_and_lock_checks(conn, account_id)

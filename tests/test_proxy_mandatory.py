@@ -108,6 +108,9 @@ def test_06_emergency_exit_without_a_proxy_sends_nothing_and_says_where_to_exit(
     failure, nothing sent) and the message points the user to Kite itself."""
     pos = _insert_ticket(direct.db, entry_fill_status="filled", filled_quantity=5, kite_order_id="250000000901",
                          kite_gtt_id=None, use_gtt=0)
+    # E3: the (real-client) broker holds what the app's position says.
+    _reply = wire.reply_for
+    wire.reply_for = lambda method, path: ([{"tradingsymbol": "TCS", "exchange": "NSE", "instrument_token": 2953217, "quantity": 5, "t1_quantity": 0}] if path == "/portfolio/holdings" else _reply(method, path))
     r = direct.client.post("/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "EXIT ALL"})
     assert r.status_code == 200, r.text
     [result] = r.json()["data"]["results"]
@@ -160,7 +163,8 @@ def test_09_unreachable_proxy_refuses_a_live_entry_before_any_write(real_kite, w
     assert row["status"] in ("pending_confirmation", "rejected") and row["kite_order_id"] is None, row
 
 
-def test_10_a_write_through_a_refusing_proxy_is_attempted_once_and_never_directly(monkeypatch, no_direct_sockets):
+def test_10_a_write_through_a_refusing_proxy_is_attempted_once_and_never_directly(monkeypatch, no_direct_sockets,
+                                                                                     owner_process):
     """A real local proxy that refuses the CONNECT tunnel: exactly one attempt reaches it, no
     socket ever goes to Kite directly, and the failure propagates (the order path records it as
     UNKNOWN, never resubmitted: test_kite_rest_proxy test_17/test_19b)."""

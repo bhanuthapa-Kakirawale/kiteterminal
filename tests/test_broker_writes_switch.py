@@ -8,6 +8,11 @@ from kiteconnect import KiteConnect
 
 from backend import kite_client
 
+# Phase 2: these tests are about the writes switch, not database ownership: the process holds write
+# authority (conftest.owner_process), so the switch alone decides (the ownership fence has its own
+# tests in test_broker_write_fence.py).
+pytestmark = pytest.mark.usefixtures("owner_process")
+
 WRITES = {
     "place_order": dict(variety="regular", exchange="NSE", tradingsymbol="INFY", transaction_type="BUY",
                         quantity=1, product="CNC", order_type="LIMIT", price=1.0),

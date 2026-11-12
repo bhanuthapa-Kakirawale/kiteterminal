@@ -317,10 +317,30 @@ def test_exits_never_need_the_portfolio_snapshot(env, market_open, monkeypatch):
 
     def down(*_a, **_k):
         raise NetworkException("Gateway timed out")
-    for name in ("positions", "margins"):
-        monkeypatch.setattr(env.kite, name, down)
+    # The portfolio snapshot needs funds AND positions: without funds it cannot be built, and the
+    # exit still goes through (its risk checks never need it).
+    monkeypatch.setattr(env.kite, "margins", down)
 
     r = _emergency_exit(env.client)
 
     assert r.status_code == 200, r.text
     assert [res["status"] for res in r.json()["data"]["results"]] == ["exit_submitted"]
+
+
+def test_emergency_exit_refuses_when_positions_cannot_be_read(env, market_open, monkeypatch):
+    """E3: Emergency Exit reconciles with FRESH broker positions before selling; when they cannot
+    be read the automated exit is refused (manual exit in Kite), nothing is sent."""
+    _position(env, "TCS")
+    set_mode(env.db, "live")
+
+    def down(*_a, **_k):
+        raise NetworkException("Gateway timed out")
+    monkeypatch.setattr(env.kite, "positions", down)
+
+    r = _emergency_exit(env.client)
+
+    assert r.status_code == 200, r.text
+    [res] = r.json()["data"]["results"]
+    assert (res["status"], res["error_code"]) == ("refused", "BROKER_RECONCILIATION_UNAVAILABLE")
+    assert "manually in Kite" in res["message"]
+    assert env.kite.calls_to("place_order") == []

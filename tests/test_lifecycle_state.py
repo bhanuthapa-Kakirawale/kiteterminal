@@ -85,8 +85,12 @@ def test_3_submitted_live_entry_is_entry_open(env, market_open):
     assert (lc["requested_quantity"], lc["filled_quantity"], lc["open_quantity"]) == (100, 0, 0)
     # Inverted (final order-path remediation): an accepted entry with nothing filled is NOT
     # protected, although its sell GTT for the full 100 is already live (frozen execution.py).
-    assert lc["protection_status"] == "NOT_PROTECTED_PENDING_FILL" and lc["protection_quantity"] == 100
-    assert (lc["gtt_quantity"], lc["confirmed_filled_quantity"], lc["protection_alert"]) == (100, 0, True)
+    # S2/S3: PENDING_FILL — never PROTECTED, never reported as an unprotected open position.
+    assert lc["protection_status"] == "PENDING_FILL" and lc["protection_quantity"] == 100
+    assert lc["protection_reason"] == "GTT_BEFORE_FILL"
+    # Not yet observed at Kite: the app's record (100) is shown as the record, never as the broker's.
+    assert (lc["gtt_quantity"], lc["gtt_recorded_quantity"]) == (None, 100)
+    assert (lc["confirmed_filled_quantity"], lc["protection_alert"]) == (0, True)
     assert "EXIT" not in lc["allowed_actions"]
     assert {"CANCEL_ORDER", "EMERGENCY_EXIT"} <= set(lc["allowed_actions"])
     assert buy_id in _positions(env)
@@ -164,9 +168,10 @@ def test_9_open_position_without_its_gtt_is_unprotected(env):
     buy_id, _ = _held_position(env, 40, kite_gtt_id=None)
     lc = _lc(env, buy_id)
     assert lc["lifecycle_state"] == "OPEN"  # a flag, not a separate state
-    assert lc["protection_status"] == "MISSING" and lc["protection_label"] == "UNPROTECTED"
+    assert lc["protection_status"] == "NOT_PROTECTED" and lc["protection_label"] == "NOT PROTECTED"
+    assert lc["protection_reason"] == "NO_GTT"
     assert lc["review_required"] is True and lc["severity"] == "critical"
-    assert "PROTECTION_MISSING" in lc["attention_reasons"]
+    assert "PROTECTION_NOT_PROTECTED" in lc["attention_reasons"]
     assert "EXIT" in lc["allowed_actions"]  # exiting an unprotected position stays possible
 
 
@@ -180,6 +185,8 @@ def test_9b_ticket_that_asked_for_no_gtt_is_not_requested(env):
 def test_10_exit_submitted_is_exiting_not_closed(env, market_open):
     buy_id, _ = _held_position(env, 40)
     sell_id, order_id = _place_exit(env, buy_id, 40)
+    from backend import gtt_observations
+    gtt_observations.record_book(env.kite.get_gtts())  # S2: a loop has read the GTT book
 
     lc = _lc(env, buy_id)
     assert lc["lifecycle_state"] == "EXITING" and lc["closed_at"] is None
@@ -275,7 +282,8 @@ def test_15_partial_gtt_fill_leaves_an_open_residual(env, market_open):
     _tick()
     lc = _lc(env, buy_id)
     assert lc["lifecycle_state"] == "EXIT_PARTIAL" and lc["open_quantity"] == 60
-    assert lc["protection_status"] == "MISSING"  # the spent GTT no longer protects the 60
+    # The spent GTT no longer protects the 60.
+    assert (lc["protection_status"], lc["protection_reason"]) == ("NOT_PROTECTED", "NO_GTT")
     assert lc["closed_at"] is None and buy_id in _positions(env)
 
 
@@ -284,6 +292,8 @@ def test_15_partial_gtt_fill_leaves_an_open_residual(env, market_open):
 def test_16_reconciliation_issue_sets_review_required(env):
     buy_id, _ = _held_position(env, 40)
     env.kite.set_holding("TCS", 10, average_price=3000.0)  # the broker holds fewer than the app
+    from backend import gtt_observations
+    gtt_observations.record_book(env.kite.get_gtts())  # S2: a loop has read the GTT book
     before = _lc(env, buy_id)
     assert before["review_required"] is False
     _reconcile()
@@ -340,8 +350,8 @@ def test_20_gtt_quantity_and_price_mismatch_are_reflected(env):
     lc = _lc(env, buy_id)
     # The broker-observed GTT (100) exceeds the confirmed held quantity (40): it could sell shares
     # held outside this position. Named for what it is (was the generic QUANTITY_MISMATCH).
-    assert lc["protection_status"] == "QUANTITY_EXCEEDS_POSITION"
-    assert lc["protection_label"] == "GTT EXCEEDS POSITION" and lc["severity"] == "critical"
+    assert (lc["protection_status"], lc["protection_reason"]) == ("NOT_PROTECTED", "QUANTITY_EXCEEDS_POSITION")
+    assert lc["protection_label"] == "NOT PROTECTED" and lc["severity"] == "critical"
     assert (lc["gtt_quantity"], lc["gtt_source"], lc["open_quantity"]) == (100, "broker", 40)
     [issue] = [i for i in lc["reconciliation_issues"] if i["code"] == "GTT_QUANTITY_TOO_HIGH"]
     assert (issue["expected_quantity"], issue["broker_quantity"]) == (40, 100)
@@ -349,7 +359,8 @@ def test_20_gtt_quantity_and_price_mismatch_are_reflected(env):
     price_id, gtt_id = _held_position(env, 5, current_stop_loss=2950.0)  # app stop 2950, GTT 2900
     _reconcile()
     _reconcile()  # PK-16 needs two consecutive sightings
-    assert _lc(env, price_id)["protection_status"] == "PRICE_MISMATCH"
+    assert (_lc(env, price_id)["protection_status"], _lc(env, price_id)["protection_reason"]) == (
+        "NOT_PROTECTED", "PRICE_MISMATCH")
 
 
 # ============================================================== extra states
@@ -470,7 +481,7 @@ def test_gtt_removal_findings_carry_issue_codes(env, case):
     buy_id, gtt_id = _held_position(env, 40)
     if case == "delete_fails":
         env.kite.raise_on_next("delete_gtt", RuntimeError("Kite down"))
-        expected = "ORPHANED_GTT_AFTER_EXIT"
+        expected = "GTT_CANCEL_FAILED"   # C4: the read-back still lists it active
     else:
         env.kite.gtt_book[gtt_id]["status"] = "triggered"
         expected = "POSSIBLE_DOUBLE_SELL"

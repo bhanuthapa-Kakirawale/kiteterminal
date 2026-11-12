@@ -75,8 +75,10 @@ def _ignore_live0_unknown_gate(monkeypatch):
     test that needs several UNKNOWN outcomes to exercise ANOTHER control (the
     breaker's failure count, the daily-slot accounting) switches just that
     part off; test_live_preflight.py covers the gate."""
-    from backend import live_preflight
+    from backend import live_preflight, startup_reconciliation
     monkeypatch.setattr(live_preflight, "unresolved_live_submissions", lambda *a, **k: [])
+    # Phase 2: the startup restriction's UNRESOLVED_OPERATION is the same condition; switched off with it.
+    monkeypatch.setattr(startup_reconciliation, "_unresolved", lambda ticket: False)
 
 
 def _orders(env):
@@ -367,8 +369,10 @@ def test_12c_unknown_live_submission_counts(live):
     _unknown_ticket(live, submitted_at=_now_utc_sql())  # a real order may exist
     assert _entries_today(live) == 1
     r = _confirm(live, _entry(live))
-    # LIVE-0: the UNKNOWN outcome now also blocks on its own, reported first.
-    assert r.status_code == 409 and _codes(r)[:2] == ["LIVE_PREREQUISITE_MISSING", "DAILY_ENTRY_LIMIT"]
+    # LIVE-0: the UNKNOWN outcome now also blocks on its own, reported first; Phase 2's restriction
+    # (UNRESOLVED_OPERATION) refuses it too, from check_live_critical_state.
+    assert r.status_code == 409 and _codes(r)[:3] == ["LIVE_PREREQUISITE_MISSING", "ACCOUNT_RESTRICTED",
+                                                       "DAILY_ENTRY_LIMIT"]
     assert live.kite.calls_to("place_order") == []
 
 

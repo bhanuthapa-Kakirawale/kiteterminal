@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+import schema_builds
 from conftest import (
     approval_body,
     IST, FakeKite, account_id, as_pre_pk22_database, make_candles, seed_ohlc, set_mode, ticket_row,
@@ -102,7 +103,9 @@ def test_brand_new_database_migrates_to_the_current_version(env):
     from backend import db
     history = _rows(env, "SELECT version, migration_name FROM schema_version ORDER BY version")
     assert [(h["version"], h["migration_name"]) for h in history] == [(v, n) for v, n, _ in db.MIGRATIONS]
-    assert history[-1]["version"] == db.LATEST_SCHEMA_VERSION == 10   # LIVE-0 added v5, SEC-1 v6, P1-D v7 + v8, DMB inbox v9, integrity audit v10
+    # LIVE-0 added v5, SEC-1 v6, P1-D v7 + v8, DMB inbox v9, integrity audit v10, Phase 2 v11 (v12: the registration
+    # pin, tests/schema_builds.py; a brand-new file holds nothing to protect and is created at the latest directly)
+    assert history[-1]["version"] == db.LATEST_SCHEMA_VERSION == schema_builds.expected_latest()
     conn = env.db.get_connection()
     try:
         status = db.schema_status(conn)
@@ -130,7 +133,7 @@ def test_migration_history_is_recorded_once(env):
     for _ in range(3):
         env.db.init_db()
     rows = _rows(env, "SELECT version, COUNT(*) AS n FROM schema_version GROUP BY version")
-    assert [(r["version"], r["n"]) for r in rows] == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1), (9, 1), (10, 1)]
+    assert [(r["version"], r["n"]) for r in rows] == [(v, 1) for v in range(1, schema_builds.expected_latest() + 1)]
 
 
 @pytest.mark.parametrize("tamper", ["newer_version", "renamed_migration", "gap"])
@@ -156,8 +159,16 @@ def test_unknown_or_newer_schema_is_refused_before_any_write(env, tamper):
     assert status["supported"] is False and status["up_to_date"] is False
 
 
+@pytest.mark.v11_database
 def test_interrupted_migration_rolls_back_and_resumes(env, monkeypatch):
+    """The PK-22 resume, as the Phase 2 build runs it (a database below v11 is brought to v11 by that build; on a
+    build registering v12 a normal start never applies v12 to it: test_v12_authorization_gate test_27)."""
     from backend import db
+    schema_builds.phase2_build_patched(monkeypatch, db)   # the test monkeypatches MIGRATIONS itself
+    _interrupted_migration_rolls_back_and_resumes(env, monkeypatch, db)
+
+
+def _interrupted_migration_rolls_back_and_resumes(env, monkeypatch, db):
     # A database at v2 (drop what v3/v4 created and forget them).
     for index in ("idx_trade_tickets_closes_ticket", "idx_trade_tickets_account_mode_status",
                   "idx_trade_tickets_kite_order", "idx_trade_tickets_kite_gtt"):
@@ -165,6 +176,7 @@ def test_interrupted_migration_rolls_back_and_resumes(env, monkeypatch):
     _exec(env, "DROP TABLE ohlc_history_status")
     _exec(env, "DROP TABLE symbol_transitions")
     _exec(env, "DELETE FROM schema_version WHERE version > 2")
+    schema_builds.as_legacy_installation(db)   # an old installation: no installation record yet (Phase C)
 
     def crashing_v4(conn):
         conn.execute("CREATE TABLE ohlc_history_status (instrument_token INTEGER PRIMARY KEY)")
@@ -183,9 +195,9 @@ def test_interrupted_migration_rolls_back_and_resumes(env, monkeypatch):
 
     monkeypatch.setattr(db, "MIGRATIONS", real_migrations)  # the next start resumes from v3
     db.init_db()
-    assert db.last_init["applied_migrations"] == [4, 5, 6, 7, 8, 9, 10]
+    assert db.last_init["applied_migrations"] == [4, 5, 6, 7, 8, 9, 10, 11]
     assert [r["version"] for r in _rows(env, "SELECT version FROM schema_version ORDER BY version")] == \
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]   # v11 re-runs as a no-op over its existing objects
     assert "ohlc_history_status" in {r["name"] for r in _rows(env, "SELECT name FROM sqlite_master")}
 
 
@@ -198,8 +210,20 @@ def test_a_migration_that_adds_foreign_key_violations_is_refused(env, monkeypatc
     latest = db.LATEST_SCHEMA_VERSION
     monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, (latest + 1, "test_orphan", orphaning)])
     monkeypatch.setattr(db, "LATEST_SCHEMA_VERSION", latest + 1)
-    with pytest.raises(db.DatabaseMigrationFailed, match="foreign key"):
-        db.init_db()
+    if latest + 1 in db._AUTHORIZATION_GATED_MIGRATIONS:
+        # The placeholder takes the number of a gated migration (v12, while unregistered): a start refuses it
+        # before any write, and the FK guard is reached through the authorized path (the same migrate()).
+        with pytest.raises(db.DatabaseMigrationAuthorizationRequired):
+            db.init_db()
+        conn = db.get_connection()
+        try:
+            with pytest.raises(db.DatabaseMigrationFailed, match="foreign key"):
+                db.migrate(conn, v12_authorization=db.V12MigrationAuthorization(issued_by="test_platform_pk22"))
+        finally:
+            conn.close()
+    else:
+        with pytest.raises(db.DatabaseMigrationFailed, match="foreign key"):
+            db.init_db()
     assert not _rows(env, "SELECT 1 FROM ticket_events WHERE ticket_id = 987654")
     assert max(r["version"] for r in _rows(env, "SELECT version FROM schema_version")) == latest
 
@@ -207,8 +231,9 @@ def test_a_migration_that_adds_foreign_key_violations_is_refused(env, monkeypatc
 def test_pending_migrations_on_an_existing_database_take_a_verified_backup_first(env):
     set_mode(env.db, "live")
     as_pre_pk22_database(env.db)
-    env.db.init_db()
-    backups = list(_db_file(env).parent.glob(f"test.db.pre_schema_v{env.db.LATEST_SCHEMA_VERSION}_bak*"))
+    schema_builds.restart_old_database(env.db)
+    # The start that found migrations 1..11 pending (the Phase 2 build's) took the backup of the old image first.
+    backups = list(_db_file(env).parent.glob("test.db.pre_schema_v11_bak*"))
     assert len(backups) == 1
     conn = sqlite3.connect(backups[0])
     try:
@@ -302,7 +327,7 @@ def test_an_old_database_migrates_forward_keeping_its_rows(tmp_path, monkeypatch
     conn.commit()
     conn.close()
 
-    db.init_db()
+    schema_builds.restart_old_database(db)   # v12: the Phase 2 build to v11, then the authorized v12
     db.init_db()  # and a second start changes nothing
     assert db.last_init["applied_migrations"] == [] and db.last_init["startup_row_changes"] == 0
 
@@ -332,7 +357,7 @@ def test_an_old_database_migrates_forward_keeping_its_rows(tmp_path, monkeypatch
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         conn.close()
-    assert len(list(tmp_path.glob(f"legacy.db.pre_schema_v{db.LATEST_SCHEMA_VERSION}_bak*"))) == 1
+    assert len(list(tmp_path.glob("legacy.db.pre_schema_v11_bak*"))) == 1   # the legacy image, backed up once
 
 
 # Audit P2-13, without real account data. This test used to copy the
@@ -466,7 +491,7 @@ def test_a_synthetic_pre_pk22_database_migrates_keeping_every_row(tmp_path, monk
     conn.close()
     before = _snapshot(path)
 
-    db.init_db()
+    schema_builds.restart_old_database(db)   # v12: the Phase 2 build to v11, then the authorized v12
     db.init_db()  # a second start changes nothing
     assert db.last_init["applied_migrations"] == [] and db.last_init["startup_row_changes"] == 0
     after = _snapshot(path)
@@ -528,7 +553,7 @@ def test_a_synthetic_pre_pk22_database_migrates_keeping_every_row(tmp_path, monk
         conn.close()
 
     # The automatic pre-migration backup is the database exactly as it was.
-    [backup] = tmp_path.glob(f"pre_pk22.db.pre_schema_v{db.LATEST_SCHEMA_VERSION}_bak*")
+    [backup] = tmp_path.glob("pre_pk22.db.pre_schema_v11_bak*")   # taken by the start that found 1..11 pending
     assert _snapshot(backup) == before
 
 
@@ -545,7 +570,7 @@ def test_fresh_database_never_recreates_the_legacy_dashboard_index(env):
 def test_restarted_database_carrying_the_legacy_index_loses_it(env):
     _exec(env, "CREATE UNIQUE INDEX idx_dashboard_panels_account_type ON dashboard_panels(account_id, panel_type)")
     as_pre_pk22_database(env.db)
-    env.db.init_db()
+    schema_builds.restart_old_database(env.db)
     names = {r["name"] for r in _rows(env, "SELECT name FROM sqlite_master WHERE type='index'")}
     assert "idx_dashboard_panels_account_type" not in names
     # the same panel type may now exist on two screens
@@ -557,13 +582,15 @@ def test_restarted_database_carrying_the_legacy_index_loses_it(env):
 @pytest.mark.parametrize("query, index", [
     ("SELECT id FROM trade_tickets WHERE closes_ticket_id = 1", "idx_trade_tickets_closes_ticket"),
     ("SELECT id FROM trade_tickets WHERE kite_order_id = 'x'", "idx_trade_tickets_kite_order"),
-    ("SELECT id FROM trade_tickets WHERE kite_gtt_id = 1", "idx_trade_tickets_kite_gtt"),
+    # On a v12 database the planner may prefer migration 12's unique index on the same column (it also covers
+    # this query); either is an index search on kite_gtt_id, never a scan.
+    ("SELECT id FROM trade_tickets WHERE kite_gtt_id = 1", ("idx_trade_tickets_kite_gtt", "idx_trade_tickets_unique_gtt")),
     ("SELECT id FROM trade_tickets WHERE account_id = 1 AND mode = 'live' AND status = 'executed'",
      "idx_trade_tickets_account_mode_status"),
 ])
 def test_hot_queries_use_their_index(env, query, index):
     plan = " ".join(r["detail"] for r in _rows(env, f"EXPLAIN QUERY PLAN {query}"))
-    assert index in plan, plan
+    assert any(i in plan for i in ((index,) if isinstance(index, str) else index)), plan
 
 
 # ============================================================ PK-22D historical data integrity
@@ -929,7 +956,7 @@ def test_one_bad_ticket_or_malformed_order_does_not_stop_the_monitor_cycle(env, 
     assert ticket_row(env.db, bad)["entry_fill_status"] == "pending"     # rolled back, retried next cycle
 
 
-def test_worker_recovers_after_repeated_transient_errors(monkeypatch):
+def test_worker_recovers_after_repeated_transient_errors(monkeypatch, owner_process):  # Phase 2: loops need authority
     from backend import config, order_monitor, worker_health
     worker_health.reset()
     monkeypatch.setattr(config, "ORDER_MONITOR_INTERVAL_SECONDS", 0)
@@ -980,13 +1007,23 @@ def test_reconciliation_keeps_other_checks_findings_when_one_raises(env, monkeyp
 
 def test_malformed_broker_rows_are_skipped_by_reconciliation():
     from backend.reconciliation import BrokerSnapshot
-    kite = FakeKite(holdings=[{"tradingsymbol": "INFY", "quantity": 5}, {"quantity": 9}, "junk"])
+    kite = FakeKite(holdings=[{"tradingsymbol": "INFY", "exchange": "NSE", "quantity": 5}])
     kite.get_gtts = lambda: [{"id": 1, "status": "active"}, {"status": "active"}, "junk"]
     snap = BrokerSnapshot()
     snap.load_gtts(kite)
     snap.load_held(kite)
     assert [g["id"] for g in snap.gtts] == [1]
-    assert snap.held == {"INFY": 5}
+    assert snap.held[("NSE", "INFY")].total == 5
+
+
+def test_unattributable_holdings_rows_make_the_cycles_holdings_unusable():
+    """C8: a holdings row that names no instrument could be shares of any of the app's
+    positions, so the read fails closed for this cycle (the cycle itself still completes)."""
+    from backend.reconciliation import BrokerSnapshot
+    kite = FakeKite(holdings=[{"tradingsymbol": "INFY", "exchange": "NSE", "quantity": 5}, {"quantity": 9}, "junk"])
+    snap = BrokerSnapshot()
+    snap.load_held(kite)
+    assert snap.held is None and "malformed broker data" in snap.held_error
 
 
 def test_trailing_live_failure_does_not_skip_paper_positions(env, monkeypatch):
@@ -1196,12 +1233,18 @@ def test_connections_wait_for_a_busy_writer_instead_of_failing(env):
 def test_maintenance_cli_reports_checks_and_backs_up(env, capsys):
     from backend import db_maintenance
     assert db_maintenance.main(["status", "--db", str(_db_file(env))]) == 0
-    assert "schema:    v10 of v10" in capsys.readouterr().out
+    latest = schema_builds.expected_latest()
+    assert f"schema:    v{latest} of v{latest}" in capsys.readouterr().out
     assert db_maintenance.main(["integrity", "--db", str(_db_file(env))]) == 0
     assert "integrity_check: ok" in capsys.readouterr().out
     assert db_maintenance.main(["backup", "--db", str(_db_file(env))]) == 0
     [backup] = list(_db_file(env).parent.glob("test.db.manual_*_bak"))
     assert sqlite3.connect(backup).execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    # Phase 2: a writing command refuses while the terminal (here: env's ownership) holds the lock.
+    assert db_maintenance.main(["analyze", "--db", str(_db_file(env))]) == 3
+    assert "ANOTHER_INSTANCE_RUNNING" in capsys.readouterr().err
+    from conftest import release_write_authority
+    release_write_authority()
     assert db_maintenance.main(["analyze", "--db", str(_db_file(env))]) == 0
 
 
@@ -1269,7 +1312,8 @@ def test_diagnostics_report_is_complete_and_leaks_no_secret(env, monkeypatch):
     for secret in (*SENTINELS, "test_api_key", "fake-access-token"):
         assert secret not in text, secret
     data = r.json()["data"]
-    assert data["schema"]["current_version"] == 10 and data["database_integrity"]["ok"] is True
+    assert data["schema"]["current_version"] == schema_builds.expected_latest()
+    assert data["database_integrity"]["ok"] is True
     assert data["broker_session"]["state"] == "VALID" and data["broker_session"]["verified_with_broker"] is False
     assert {"order_monitor", "trailing", "reconciliation"} <= set(data["workers"])
     assert data["market"]["session_state"] in ("OPEN", "CLOSED", "PRE_OPEN", "HOLIDAY", "WEEKEND")

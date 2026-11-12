@@ -20,7 +20,9 @@ import json
 import logging
 from datetime import datetime, time, timedelta, timezone
 
-from backend import config, data_jobs, execution, kite_client, market, risk_engine, strategy_engine, worker_health
+from backend import (
+    config, data_jobs, execution, instance_lock, kite_client, market, risk_engine, strategy_engine, worker_health,
+)
 from backend.accounts import get_default_account
 from backend.db import get_connection
 from backend.ticker import ticker_manager
@@ -117,6 +119,8 @@ async def run_automation_loop() -> None:
     # silently — and the DB reads run off the event loop.
     interrupted_marked = False
     while True:
+        if not instance_lock.loop_may_run("automation"):  # Phase 2: only the database owner
+            return
         try:
             with worker_health.cycle("automation"):
                 if not interrupted_marked:

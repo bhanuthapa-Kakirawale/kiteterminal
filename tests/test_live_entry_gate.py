@@ -145,6 +145,7 @@ def test_08_a_live_exit_is_not_refused(env, market_open, gate_closed):
 def test_09_emergency_exit_is_not_refused(env, market_open, gate_closed):
     pos = _insert_ticket(env.db, entry_fill_status="filled", filled_quantity=5, kite_order_id="250000000901",
                          kite_gtt_id=None, use_gtt=0)
+    env.kite.set_holding("TCS", 5)  # E3: the broker holds what the app's position says
     r = env.client.post("/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "EXIT ALL"})
     assert r.status_code == 200, r.text
     results = r.json()["data"]["results"]
@@ -228,15 +229,32 @@ def test_14_execute_ticket_has_exactly_one_caller():
     assert sorted(set(callers)) == [("backend/routes/tickets.py", "confirm_and_execute_ticket")], callers
 
 
+# Phase 3 (user decision B-D1, option A, 2026-11-11): besides the frozen order path, exactly two functions of the DARK
+# protection engine may make these calls, each inside a fenced transaction held across the call, and only the
+# methods named here. Nothing outside the engine imports it (test_dark_protection_schema.py test_11,
+# test_protection_s9_static.py ST2), so no live path reaches them.
+_DARK_ENGINE_WRITERS = {
+    ("backend/protection_send.py", "_call"): {"place_gtt"},
+    ("backend/emergency_exit_engine.py", "_sell"): {"place_order"},
+}
+
+
 def test_15_only_the_frozen_order_path_places_orders_or_gtts():
+    seen = set()
     for attr in ("place_order", "place_gtt", "modify_order"):
         offenders = []
         for path in (ROOT / "backend").rglob("*.py"):
             rel = path.relative_to(ROOT).as_posix()
             if rel == "backend/execution.py":
                 continue
-            offenders += [(rel, name, line) for name, line in _calls(path, attr)]
+            for name, line in _calls(path, attr):
+                if attr in _DARK_ENGINE_WRITERS.get((rel, name), set()):
+                    seen.add((rel, name, attr))
+                else:
+                    offenders.append((rel, name, line))
         assert offenders == [], (attr, offenders)
+    # The exception is exact: each allowed (function, method) is really used, so it cannot silently widen.
+    assert seen == {(rel, fn, attr) for (rel, fn), attrs in _DARK_ENGINE_WRITERS.items() for attr in attrs}
 
 
 def test_16_the_backstop_sits_immediately_before_the_broker_call():

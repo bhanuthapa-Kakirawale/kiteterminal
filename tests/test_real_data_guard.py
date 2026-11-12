@@ -86,7 +86,7 @@ def test_the_backend_database_path_of_the_app_is_refused(monkeypatch):
     real_default = REAL_DB_DIR / "kite_terminal.db"
     assert is_protected(real_default)
     monkeypatch.setattr(db, "DB_PATH", real_default)
-    with pytest.raises(RealAccountDataAccess):
+    with real_data_guard.expected(), pytest.raises(RealAccountDataAccess):
         db.get_connection()
 
 

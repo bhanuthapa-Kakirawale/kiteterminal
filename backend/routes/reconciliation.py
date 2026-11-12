@@ -6,6 +6,7 @@ from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
 from backend.models import ReconciliationReviewRequest
+from backend.instance_lock import WRITE_AUTHORITY
 
 router = APIRouter()
 
@@ -31,7 +32,7 @@ def list_mismatches(resolved: bool = False, kite: KiteConnect = Depends(require_
         conn.close()
 
 
-@router.post("/api/reconciliation/{mismatch_id}/mark-reviewed")
+@router.post("/api/reconciliation/{mismatch_id}/mark-reviewed", dependencies=WRITE_AUTHORITY)
 def mark_reviewed(mismatch_id: int, req: ReconciliationReviewRequest,
                   kite: KiteConnect = Depends(require_trading_account)):
     """SEC-1: an unresolved critical finding blocks every live new entry at

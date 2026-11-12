@@ -457,7 +457,8 @@ def test_n_gtt_delete_failure_after_fill_keeps_position_closed_and_warns(env, ma
     [warning] = [u for u in _urgent_updates(env) if u["ticket_id"] == sell_id]
     assert "ORPHANED GTT" in warning["message"] and "delete it in Kite NOW" in warning["message"]
     [flag] = _rows(env, "SELECT actual FROM reconciliation_log WHERE ticket_id = ?", buy_id)
-    assert "delete failed" in flag["actual"]
+    # C4: the delete's read-back still lists the GTT active: a FAILED cancellation, never "removed".
+    assert "CANCEL_FAILED" in flag["actual"] and "broker status active" in flag["actual"]
 
 
 # ---------------------------------------------------------------- untracked-holding sell

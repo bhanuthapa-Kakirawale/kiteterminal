@@ -1,3 +1,4 @@
+import contextlib
 import os
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -15,8 +16,20 @@ from fake_kite import FakeKite, make_candles  # noqa: E402
 import real_data_guard  # noqa: E402
 
 # Before any test runs: nothing in the suite may open, connect to, copy or
-# pass on the real account database or its backups (tests/real_data_guard.py).
+# pass on the real account database or its backups, the real .env or the
+# real UI preferences, nor connect beyond loopback (tests/real_data_guard.py).
 real_data_guard.install()
+# F-0: backend/main.py calls load_dotenv() at import. The loaders are replaced
+# BEFORE anything imports backend.main, so that call loads nothing; and every
+# KITE_* variable inherited from the shell goes, so no test runs on real
+# configuration. Tests set their own sentinel values (the env fixture).
+if "backend.main" in sys.modules:
+    raise RuntimeError("tests/conftest.py: backend.main was imported before the test isolation guard; "
+                       "its load_dotenv() may already have read the real .env")
+real_data_guard.neutralise_dotenv()
+_SCRUBBED_AT_START = real_data_guard.scrub_kite_environment()  # names only
+# V12 final readiness: captures the real db.backup_database before any test can patch it (tests/offsite_helpers.py).
+import offsite_helpers  # noqa: E402,F401
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -39,12 +52,100 @@ TERMINAL_ORIGIN = "http://127.0.0.1:8000"
 TERMINAL_HEADERS = {"X-Kite-Terminal": "1", "Origin": TERMINAL_ORIGIN}
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _session_isolated_files(tmp_path_factory):
+    """A test that does not use `env` still cannot mint an encryption key into
+    the real .env (crypto.ensure_encryption_key appends to crypto.ENV_PATH) or
+    write the real UI preferences: both point at session temp files. The
+    database path is deliberately NOT redirected: a test that forgot `env`
+    must fail on the guard, not run silently on some other database."""
+    from backend import crypto, installation_state, ui_prefs
+    session_dir = tmp_path_factory.mktemp("isolated_session")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(crypto, "ENV_PATH", session_dir / ".env.session")
+        mp.setattr(ui_prefs, "PREFS_PATH", session_dir / "ui_prefs.json")
+        # V12 final readiness, Phase C: the installation registry lives in the user profile; every test (and every
+        # child process, which inherits the variable: it is not a KITE_* name) uses a session temp dir instead.
+        # The real registry is protected by tests/real_data_guard.py.
+        mp.setenv(installation_state.REGISTRY_ENV, str(session_dir / "installation_registry"))
+        yield session_dir
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "v11_database: env creates its temporary database with the Phase 2 build (exactly schema v11, "
+                   "migration 12 pending on a build that registers it); see tests/schema_builds.py")
+
+
+@pytest.fixture(autouse=True)
+def _build_restored():
+    """Every test leaves the schema build as it found it: MIGRATIONS and LATEST_SCHEMA_VERSION (tests/schema_builds.py).
+    Defined before every fixture that takes monkeypatch, so it is torn down after monkeypatch's undo and sees the
+    final state: a simulated build leaking into later tests (a hand-restored build plus a monkeypatched MIGRATIONS)
+    fails the test that leaked it instead of corrupting every test after it."""
+    from backend import db
+    before = (db.MIGRATIONS, list(db.MIGRATIONS), db.LATEST_SCHEMA_VERSION)
+    yield
+    assert (db.MIGRATIONS, db.LATEST_SCHEMA_VERSION) == (before[1], before[2]), "the test left the schema build changed"
+    db.MIGRATIONS = before[0]   # the same list object, for modules holding a reference
+
+
 @pytest.fixture(autouse=True)
 def _no_kite_rest_proxy(monkeypatch):
-    """NET-1: backend.main's load_dotenv() would copy a real .env's
-    KITE_REST_PROXY into the test process. Every test starts on the direct
-    route; a test that needs the proxy sets it explicitly."""
+    """NET-1: every test starts on the direct route; a test that needs the
+    proxy sets it explicitly. Defence in depth since F-0: load_dotenv is
+    neutralised and inherited KITE_* variables are scrubbed, but a test that
+    set the variable without monkeypatch must not leak it into the next."""
     monkeypatch.delenv("KITE_REST_PROXY", raising=False)
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    calls = real_data_guard.dotenv_calls()
+    refused = real_data_guard.refusals()
+    unexpected = real_data_guard.unexpected_refusals()
+    write = terminalreporter.write_line
+    terminalreporter.section("test isolation (tests/real_data_guard.py)")
+    write(f"python-dotenv neutralised: {real_data_guard.dotenv_neutralised()}; "
+          f"implicit loads neutralised: {sum(c['mode'] == 'implicit' for c in calls)}; "
+          f"explicit loads delegated (temporary files): {sum(c['result'] == 'delegated' for c in calls)}; "
+          f"explicit protected loads refused: {sum(c['result'] == 'refused' for c in calls)}")
+    names = _SCRUBBED_AT_START
+    write(f"inherited KITE_* variables scrubbed at start: {len(names)}"
+          + (f" ({', '.join(names)}; names only)" if names else ""))
+    write(f"guard refusals: {len(refused)} (decoy {sum(r[2] for r in refused)}, "
+          f"expected {sum(r[3] and not r[2] for r in refused)}, unexpected {len(unexpected)}); "
+          f"network refusals: {sum(r[0] == 'network' for r in refused)}")
+    for kind, target, _, _ in unexpected:
+        write(f"UNEXPECTED REFUSAL: {kind} {target}", red=True)
+    children = _child_guard_summary()
+    if children is not None:
+        # Phase 3 S3: every child process of the multi-process harness installs its own guard
+        # (tests/child_bootstrap.py) and reports it; tests/mp_harness.py collects the reports.
+        write(f"child processes (S3 harness): {children['children']} guard reports; refusals {children['refusals']} "
+              f"(decoy {children['decoy']}, expected {children['expected']}, unexpected {len(children['unexpected'])}); "
+              f"protected opens {len(children['protected'])}; missing reports {len(children['missing_reports'])}; "
+              f"orphan processes {len(children['orphans'])}")
+        for item in children["unexpected"] + children["protected"]:
+            write(f"UNEXPECTED CHILD ACCESS: {item}", red=True)
+        for item in children["missing_reports"] + [f"orphan pid {p}" for p in children["orphans"]]:
+            write(f"CHILD PROCESS PROBLEM: {item}", red=True)
+
+
+def _child_guard_summary():
+    harness = sys.modules.get("mp_harness")
+    return harness.session_summary() if harness is not None else None
+
+
+def pytest_sessionfinish(session, exitstatus):
+    # A refusal swallowed by application code (a broad `except`) is still an isolation failure.
+    if real_data_guard.unexpected_refusals() and session.exitstatus == 0:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    # The same for a child process of the S3 harness, and for a child report that never arrived or a
+    # child process left running.
+    children = _child_guard_summary()
+    if children is not None and session.exitstatus == 0 and (
+            children["unexpected"] or children["protected"] or children["missing_reports"] or children["orphans"]):
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 # SEC-1 P1-F: a write also needs this launch's terminal credential, which the
@@ -276,6 +377,49 @@ def clear_healthy_live_state(monkeypatch) -> None:
     monkeypatch.setattr(reconciliation, "last_cycle", {})
 
 
+# Phase 2: tests never run the startup hooks, so nothing takes the instance lock or runs the startup
+# reconciliation. `env` therefore takes the REAL lock on its tmp database and runs the REAL fenced
+# takeover (grant_write_authority), then records a passed Stage 1 run (seed_stage1_passed), exactly like
+# seed_healthy_live_state above seeds a just-reconciled process. Without the grant every write route
+# answers 503 and every broker write is refused (fail closed; test_write_authority_routes.py proves it).
+def grant_write_authority(db) -> None:
+    from backend import instance_lock
+    instance_lock.reset_for_tests()
+    role = instance_lock.acquire(db.DB_PATH)
+    assert role == instance_lock.LOCKED, f"the test database's instance lock could not be taken: {role}"
+    assert not instance_lock.takeover(poll_seconds=0.01)["conflict"]
+
+
+def seed_stage1_passed(db) -> int:
+    """A passed Stage 1 run in the current epoch, after the latest login, with a complete broker read:
+    the account derives NORMAL (if nothing else restricts it). Returns the run id."""
+    from backend import instance_lock, startup_reconciliation
+    conn = db.get_connection()
+    try:
+        account_id = conn.execute("SELECT id FROM accounts WHERE is_default = 1").fetchone()["id"]
+        now = datetime.now(timezone.utc).isoformat()
+        with instance_lock.fenced_transaction(conn):
+            epoch = instance_lock.owner_epoch()
+            read_id = conn.execute(
+                "INSERT INTO broker_reads (account_id, purpose, instance_epoch, started_at, finished_at, orders_count, "
+                "gtts_count, gtts_malformed, complete) VALUES (?, 'startup', ?, ?, ?, 0, 0, 0, 1)",
+                (account_id, epoch, now, now)).lastrowid
+            run_id = conn.execute(
+                "INSERT INTO startup_reconciliation_runs (account_id, instance_epoch, trigger, started_at, finished_at, "
+                "stage1_outcome, broker_read_id, inventory, findings, reasons_after) "
+                "VALUES (?, ?, 'startup', ?, ?, 'passed', ?, '{}', '{\"seeded\": true}', '[]')",
+                (account_id, epoch, now, now, read_id)).lastrowid
+        startup_reconciliation.persist_state(conn, account_id, sticky=set(), run_id=run_id)
+        return run_id
+    finally:
+        conn.close()
+
+
+def release_write_authority() -> None:
+    from backend import instance_lock
+    instance_lock.reset_for_tests()
+
+
 def make_live_ready(env) -> None:
     """SEC-1: the state in which a REAL broker-checked Live Readiness
     evaluation passes (no stub): the stored session token, today's login,
@@ -291,6 +435,7 @@ def make_live_ready(env) -> None:
         conn.commit()
     finally:
         conn.close()
+    seed_stage1_passed(env.db)  # Phase 2: the "login" above is newer than the seeded Stage 1 run
     seed_ohlc(env.db, 2953217, "TCS", make_candles(trading_calendar.latest_completed_session(), 60, 3000.0))
     add_watch(env.db, "TCS", 2953217)
     diagnostics.reset_cache()
@@ -311,18 +456,37 @@ def add_watch(db, symbol: str, instrument_token: int) -> None:
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
+def owner_process(monkeypatch):
+    """Phase 2: process write authority WITHOUT a database, for tests of the Kite client itself (they
+    build SDK clients and send writes into a recorded transport, without `env`). Restored afterwards.
+    Tests with `env` already own their tmp database through the real lock and takeover."""
+    from backend import instance_lock
+    monkeypatch.setattr(instance_lock._state, "role", instance_lock.OWNER)
+    monkeypatch.setattr(instance_lock._state, "shutting_down", False)
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch, request):
     monkeypatch.setenv("KITE_TERMINAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
     monkeypatch.setenv("KITE_API_KEY", "test_api_key")
     monkeypatch.setenv("KITE_API_SECRET", "test_api_secret")
 
-    from backend import crypto, db, ui_prefs
+    from backend import crypto, db, installation_state, ui_prefs
     monkeypatch.setattr(crypto, "ENV_PATH", tmp_path / ".env")
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    # V12 final readiness, Phase C: each test is its own "machine" for the installation registry (a sibling of
+    # tmp_path, so tmp_path's listing is unchanged); otherwise one test's installation would be another's
+    # OTHER_INSTALLATION_PRESENT. Children inherit it (not a KITE_* name).
+    monkeypatch.setenv(installation_state.REGISTRY_ENV, str(tmp_path.parent / f"{tmp_path.name}_registry"))
     monkeypatch.setattr(ui_prefs, "PREFS_PATH", tmp_path / "ui_prefs.json")
     if not (os.environ.get("KITE_REST_PROXY") or "").strip():  # a test's own proxy fixture may have run first
         monkeypatch.setenv("KITE_REST_PROXY", TEST_REST_PROXY)
-    db.init_db()
+    # A fresh (empty) file is created at this build's latest schema. A test marked v11_database gets exactly the
+    # database the Phase 2 build creates instead (schema v11, every object as v11 made it), on either build.
+    import schema_builds
+    v11 = request.node.get_closest_marker("v11_database") is not None
+    with schema_builds.phase2_build(db) if v11 else contextlib.nullcontext():
+        db.init_db()
 
     conn = db.get_connection()
     try:
@@ -355,7 +519,19 @@ def env(tmp_path, monkeypatch):
     )
 
     from backend import kite_client
+    kite_client.fence_broker(fake)  # Phase 2: the same write fence a real client gets in create_kite_connect
     monkeypatch.setattr(kite_client, "get_kite", lambda account_id=None: fake)
+
+    # Phase 2: this test process owns its tmp database (real lock, real fenced takeover) and a passed
+    # Stage 1 run is on record, so the account derives NORMAL. Released after the test.
+    request.addfinalizer(release_write_authority)
+    grant_write_authority(db)
+    seed_stage1_passed(db)
+    # A login or resume would start Stage 1 as a background task; tests never run background tasks
+    # (like the loops). Recorded instead; test_startup_reconciliation.py runs Stage 1 explicitly.
+    from backend import startup_reconciliation
+    stage1_requests: list[str] = []
+    monkeypatch.setattr(startup_reconciliation, "request_run", lambda trigger: stage1_requests.append(trigger))
 
     # Reconciliation's cross-cycle sightings (PK-16) are process memory;
     # FakeKite GTT ids and ticket ids restart in every test.
@@ -374,7 +550,16 @@ def env(tmp_path, monkeypatch):
     from backend.main import app
     client = terminal_client(app)  # startup hooks intentionally NOT run: no background loops in tests
 
-    return SimpleNamespace(client=client, kite=fake, db=db, broadcasts=broadcasts, tmp_path=tmp_path)
+    return SimpleNamespace(client=client, kite=fake, db=db, broadcasts=broadcasts, tmp_path=tmp_path,
+                           stage1_requests=stage1_requests)
+
+
+@pytest.fixture
+def v11_env(request):
+    """env on a database at exactly schema v11, created by the Phase 2 build (the v11_database marker), on
+    either build. Request it INSTEAD of env (not alongside it)."""
+    request.node.add_marker("v11_database")
+    return request.getfixturevalue("env")
 
 
 @pytest.fixture
@@ -390,9 +575,13 @@ def market_open(monkeypatch):
 
 def as_pre_pk22_database(db) -> None:
     """Makes the test database look as if pre-PK-22 code last started it (no
-    schema_version), so the next init_db() runs the legacy migrations again.
+    schema_version), so the next start runs the legacy migrations again.
     Since PK-22 they run once per database; a test that edits the schema to
-    simulate an old database uses this before restarting."""
+    simulate an old database uses this before restarting. Restart it with
+    schema_builds.restart_old_database: since the V12 authorization gate a
+    normal start never applies migration 12 to a database holding data, so on
+    a build that registers v12 the Phase 2 build brings it to v11 and v12 is
+    then applied the authorized way (tests/schema_builds.py)."""
     conn = db.get_connection()
     try:
         conn.execute("DROP TABLE IF EXISTS schema_version")

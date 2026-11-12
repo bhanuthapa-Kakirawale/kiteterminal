@@ -1,11 +1,13 @@
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
-from backend import config, crypto
+from backend import config, crypto, installation_state
 
 logger = logging.getLogger(__name__)
 
@@ -1697,6 +1699,23 @@ class DatabaseMigrationFailed(RuntimeError):
     error_code = "DATABASE_MIGRATION_FAILED"
 
 
+class MigrationBackupFailed(DatabaseMigrationFailed):
+    """migrate()'s own pre-migration backup failed (an I/O error or its integrity check). Raised before any
+    migration transaction began: nothing was migrated. A subclass, so every existing caller of migrate() sees the
+    DatabaseMigrationFailed it always saw; db_maintenance migrate-v12 reports it as BACKUP_FAILED."""
+
+
+class DatabaseMigrationAuthorizationRequired(RuntimeError):
+    """A pending migration needs explicit operator authorization (migration 12 only; see
+    _AUTHORIZATION_GATED_MIGRATIONS). Raised before any write: nothing was changed."""
+    error_code = "DATABASE_MIGRATION_AUTHORIZATION_REQUIRED"
+
+
+# V12 final readiness, Phase C: init_db refuses an established installation whose database is missing, empty,
+# corrupt, replaced, moved or mid-maintenance (backend/installation_state.py). Raised before any write.
+DatabaseInstallationStateRefused = installation_state.DatabaseInstallationStateRefused
+
+
 def _execute_script(conn: sqlite3.Connection, script: str) -> None:
     """executescript() COMMITs first, which would end a migration's
     transaction half-way; this runs the same statements one by one."""
@@ -2072,6 +2091,184 @@ def _m010_ticket_integrity_audit(conn: sqlite3.Connection) -> None:
     _execute_script(conn, _TICKET_INTEGRITY_TABLES)
 
 
+# ---- v11: Phase 2 cross-process coordination (docs/PHASE_2_DESIGN_REVIEW.md §5.1, §6.2, §8.1) ----
+#
+# The fencing epoch and owner identity (app_instance, one row), one history row per acquisition,
+# the startup broker-read evidence, the startup reconciliation runs and the persisted per-account
+# restriction. Only Phase 2 objects: the protection journal stays dark (Phase 3) and attribution
+# tables come with Phase 7. The DDL is the design review's, verbatim. Registering it migrates every
+# database on its next start; a v11 database is refused by older builds (DATABASE_SCHEMA_UNSUPPORTED),
+# which also fences out builds that take no instance lock. Rollback: rollback_schema_v11 below.
+_APP_INSTANCE_DDL = """
+CREATE TABLE app_instance (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  epoch              INTEGER NOT NULL CHECK (epoch >= 0),          -- monotonic, never reused
+  instance_uuid      TEXT,                                         -- uuid4, new for every process start
+  pid                INTEGER,                                      -- diagnostic only
+  process_created_at TEXT,                                         -- OS process creation time (UTC); with pid = process identity
+  host               TEXT,                                         -- socket.gethostname()
+  machine_id         TEXT,                                         -- Windows MachineGuid / POSIX /etc/machine-id; diagnostic
+  lock_path          TEXT,                                         -- resolved path of the lock file held
+  db_path            TEXT,                                         -- resolved DB path at acquisition
+  app_version        TEXT, app_commit TEXT,
+  state              TEXT NOT NULL CHECK (state IN ('none','starting','owner','stopping','stopped_clean')),
+  started_at         TEXT,
+  heartbeat_at       TEXT,                                         -- UTC wall clock of the last heartbeat
+  heartbeat_seq      INTEGER NOT NULL DEFAULT 0,                   -- +1 per heartbeat; detects a foreign writer
+  lease_seconds      INTEGER NOT NULL DEFAULT 60 CHECK (lease_seconds BETWEEN 15 AND 600),
+  clean_shutdown     INTEGER NOT NULL DEFAULT 1 CHECK (clean_shutdown IN (0,1)),
+  shutdown_at        TEXT,
+  shutdown_note      TEXT,                                         -- e.g. 'broker write in flight at exit'
+  updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+_APP_INSTANCE_SEED = "INSERT INTO app_instance (id, epoch, state) VALUES (1, 0, 'none')"
+
+_APP_INSTANCE_HISTORY_DDL = """
+CREATE TABLE app_instance_history (
+  epoch               INTEGER PRIMARY KEY,
+  instance_uuid       TEXT NOT NULL UNIQUE,
+  pid                 INTEGER, process_created_at TEXT, host TEXT, machine_id TEXT,
+  lock_path           TEXT, db_path TEXT, app_version TEXT, app_commit TEXT,
+  started_at          TEXT NOT NULL,
+  ended_at            TEXT,
+  end_state           TEXT NOT NULL DEFAULT 'running' CHECK (end_state IN
+                        ('running','stopped_clean','crashed_detected','fenced','conflict')),
+  previous_epoch      INTEGER,
+  previous_end        TEXT,             -- how the predecessor ended, as detected at takeover
+  takeover_wait_s     REAL,             -- time spent waiting for the predecessor's lease
+  note                TEXT
+)
+"""
+
+_BROKER_READS_DDL = """
+CREATE TABLE broker_reads (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id       INTEGER NOT NULL REFERENCES accounts(id),
+  purpose          TEXT NOT NULL CHECK (purpose IN ('startup','reconciliation','prewrite','emergency_exit','resolution')),
+  instance_epoch   INTEGER NOT NULL,
+  started_at       TEXT NOT NULL,
+  finished_at      TEXT,
+  orders_at TEXT,    orders_error TEXT,    orders_count INTEGER,
+  gtts_at TEXT,      gtts_error TEXT,      gtts_count INTEGER,   gtts_malformed INTEGER,
+  holdings_at TEXT,  holdings_error TEXT,
+  positions_at TEXT, positions_error TEXT,
+  session_expired  INTEGER NOT NULL DEFAULT 0 CHECK (session_expired IN (0,1)),
+  complete         INTEGER NOT NULL CHECK (complete IN (0,1)),   -- every required endpoint ok and well formed
+  CHECK (complete = 0 OR (orders_error IS NULL AND gtts_error IS NULL AND holdings_error IS NULL
+                          AND positions_error IS NULL AND gtts_malformed = 0))
+)
+"""
+
+_STARTUP_RECONCILIATION_RUNS_DDL = """
+CREATE TABLE startup_reconciliation_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  instance_epoch INTEGER NOT NULL,
+  trigger TEXT NOT NULL CHECK (trigger IN ('startup','login','resume','manual','retry')),
+  started_at TEXT NOT NULL, finished_at TEXT,
+  stage1_outcome TEXT CHECK (stage1_outcome IN ('passed','incomplete','failed','blocked')),
+  broker_read_id INTEGER REFERENCES broker_reads(id),
+  inventory TEXT CHECK (inventory IS NULL OR json_valid(inventory)),
+  findings TEXT CHECK (findings IS NULL OR json_valid(findings)),
+  reasons_after TEXT CHECK (reasons_after IS NULL OR json_valid(reasons_after))
+)
+"""
+
+# §8.1 offers "columns on account_safety_state, or a new account_restriction table, one row per
+# account": the table, so the existing safety table is untouched and a rollback is a clean drop.
+# The default is RESTRICTED: a row that was never derived never reads as NORMAL.
+_ACCOUNT_RESTRICTION_DDL = """
+CREATE TABLE account_restriction (
+  account_id          INTEGER PRIMARY KEY REFERENCES accounts(id),
+  restriction_state   TEXT NOT NULL DEFAULT 'RESTRICTED' CHECK (restriction_state IN ('NORMAL','RESTRICTED')),
+  restriction_reasons TEXT NOT NULL DEFAULT '["STARTUP_RECONCILIATION_INCOMPLETE"]'
+                        CHECK (json_valid(restriction_reasons) AND json_type(restriction_reasons) = 'array'),
+  restriction_since   TEXT,
+  restriction_epoch   INTEGER,
+  last_startup_run_id INTEGER REFERENCES startup_reconciliation_runs(id),
+  updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+  CHECK (restriction_state = 'RESTRICTED' OR restriction_reasons = '[]')
+)
+"""
+
+# Creation order (foreign keys point backwards); a rollback drops them in reverse.
+PHASE2_TABLES: tuple[tuple[str, str], ...] = (
+    ("app_instance", _APP_INSTANCE_DDL),
+    ("app_instance_history", _APP_INSTANCE_HISTORY_DDL),
+    ("broker_reads", _BROKER_READS_DDL),
+    ("startup_reconciliation_runs", _STARTUP_RECONCILIATION_RUNS_DDL),
+    ("account_restriction", _ACCOUNT_RESTRICTION_DDL),
+)
+
+
+def _normalised_sql(sql: str | None) -> str:
+    """Stored CREATE text compared without comments and whitespace differences."""
+    if sql is None:
+        return ""
+    without_comments = "\n".join(line.split("--", 1)[0] for line in sql.splitlines())
+    return " ".join(without_comments.split()).rstrip(";").strip()
+
+
+def phase2_schema_status(conn: sqlite3.Connection) -> str:
+    """Read-only. 'absent' (none of the v11 objects), 'present' (all of them, exactly as v11 creates
+    them, with the single app_instance row), 'partial' (some) or 'unexpected' (a same-named object
+    in another form)."""
+    present = 0
+    for name, ddl in PHASE2_TABLES:
+        row = conn.execute("SELECT type, sql FROM sqlite_master WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            continue
+        if row[0] != "table" or _normalised_sql(row[1]) != _normalised_sql(ddl):
+            return "unexpected"
+        present += 1
+    if present == 0:
+        return "absent"
+    if present < len(PHASE2_TABLES):
+        return "partial"
+    ids = [r[0] for r in conn.execute("SELECT id FROM app_instance").fetchall()]
+    return "present" if ids == [1] else "unexpected"
+
+
+def _schema_object_names(conn: sqlite3.Connection) -> set[str]:
+    # SQLite's own objects (sqlite_sequence, the automatic index of a UNIQUE column) are not ours.
+    return {r[0] for r in conn.execute("SELECT name FROM sqlite_master").fetchall() if not r[0].startswith("sqlite_")}
+
+
+# Named outside the _mNNN_ pattern: when v11 was written, the 'm011' prefix was reserved for the Phase 1 dark
+# journal functions (isolation test 11b). Phase 3 renumbered those to v12; this registered name stays as released.
+def _migration_v11_instance_coordination(conn: sqlite3.Connection) -> None:
+    status = phase2_schema_status(conn)
+    if status == "present":
+        # A re-run over an already migrated database (a lost schema_version table, see
+        # tests/conftest.as_pre_pk22_database): every object is exactly v11's; keep its data.
+        return
+    if status != "absent":
+        raise DatabaseMigrationFailed(
+            f"DATABASE_MIGRATION_FAILED: migration 11 (phase2_instance_coordination) found the Phase 2 "
+            f"objects {status} (a partial or foreign form). Nothing was changed; restore a backup or "
+            "inspect the database by hand.")
+    before = _schema_object_names(conn)
+    for _name, ddl in PHASE2_TABLES:
+        conn.execute(ddl)
+    conn.execute(_APP_INSTANCE_SEED)
+    added = _schema_object_names(conn) - before
+    if added != {name for name, _ in PHASE2_TABLES} or phase2_schema_status(conn) != "present":
+        raise DatabaseMigrationFailed(
+            f"DATABASE_MIGRATION_FAILED: migration 11 produced an unexpected schema (added {sorted(added)}).")
+
+
+# Migration 12's MIGRATIONS entry (registered; docs/PHASE_3_V12_REGISTRATION_REMEDIATION_REPORT.md §3). A normal
+# start never applies it to a database holding data: see _AUTHORIZATION_GATED_MIGRATIONS below.
+# Migration 12's own function is defined in the protection-journal section further down this module, after
+# MIGRATIONS, so the list cannot name it directly (a NameError on import). This wrapper looks the name up only
+# when it is called, by which time the whole module has loaded; a test that substitutes that function is reached
+# through it too. Named like _migration_v11_instance_coordination, outside the _mNNN_ pattern (isolation test
+# 11b allows exactly this one return line to reference a protection-journal function before that section).
+def _migration_v12_protection_journal(conn: sqlite3.Connection) -> dict:
+    return _m012_protection_journal(conn)
+
+
 # (version, name, function) — append only; never renumber or rename a
 # released migration: the name is checked against every database's history.
 MIGRATIONS: list[tuple[int, str, object]] = [
@@ -2085,6 +2282,8 @@ MIGRATIONS: list[tuple[int, str, object]] = [
     (8, "p1d_review_generation", _m008_p1d_review_generation),
     (9, "dmb_research_inbox", _m009_dmb_research_inbox),
     (10, "ticket_integrity_audit", _m010_ticket_integrity_audit),
+    (11, "phase2_instance_coordination", _migration_v11_instance_coordination),
+    (12, "phase3_protection_journal", _migration_v12_protection_journal),
 ]
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
 
@@ -2186,17 +2385,117 @@ def _foreign_key_violations(conn: sqlite3.Connection) -> int:
     return len(conn.execute("PRAGMA foreign_key_check").fetchall())
 
 
-def migrate(conn: sqlite3.Connection) -> list[int]:
-    """Applies every pending migration; returns the versions applied."""
+# ---- the migration authorization gate (docs/PHASE_3_V12_AUTHORIZATION_GATE_IMPLEMENTATION_REPORT.md) -----------
+#
+# Registering a migration (appending it to MIGRATIONS) and migrating the trading database are separate decisions.
+# A version listed here is never applied by a normal start (init_db) or by `db_maintenance migrate`: while it is
+# pending on a database that holds data, both refuse with DATABASE_MIGRATION_AUTHORIZATION_REQUIRED before any
+# write. Only `python -m backend.db_maintenance migrate-v12 --authorize-v12` applies it, passing a
+# V12MigrationAuthorization to migrate(). Keyed by VERSION, so a renamed v12 entry is gated all the same. There is
+# deliberately no generic authorization: the only key is V12MigrationAuthorization, valid for (12, its name) only.
+# A database with no user tables (a missing or brand-new file) holds nothing to protect and is created at the
+# latest schema directly (user decision, 2026-11-11).
+_AUTHORIZATION_GATED_MIGRATIONS = {12: "phase3_protection_journal"}
+V12_MIGRATION_COMMAND = "python -m backend.db_maintenance migrate-v12 --authorize-v12"
+
+# R2-4, approved by the user on 2026-11-11 (docs/PHASE_3_V12_FINAL_REGISTRATION_PROPOSAL.md §3): open executed
+# BUY positions with a NULL mode, for every account (risk_engine._OPEN_POSITION_WHERE over mode IS NULL). Such a
+# position cannot be journaled, so migration 12 refuses while any exists (db_maintenance preflight-v12 and
+# migrate-v12, and again inside v12's own transaction).
+V12_PREFLIGHT_OPEN_NULL_MODE_SQL = (
+    "SELECT id, account_id, symbol FROM trade_tickets "
+    "WHERE status = 'executed' AND mode IS NULL AND transaction_type = 'BUY' AND closed_at IS NULL "
+    "AND id NOT IN (SELECT closes_ticket_id FROM trade_tickets WHERE closes_ticket_id IS NOT NULL "
+    "AND status = 'executed' AND entry_fill_status IS NULL) ORDER BY id"
+)
+
+
+@dataclass(frozen=True)
+class V12MigrationAuthorization:
+    """The explicit operator authorization for migration 12, and for nothing else. Constructed only by
+    db_maintenance migrate-v12 --authorize-v12 (and by tests, on temporary databases)."""
+    issued_by: str
+    version: int = 12
+    name: str = "phase3_protection_journal"
+
+
+def _valid_v12_authorization(authorization) -> bool:
+    return (type(authorization) is V12MigrationAuthorization
+            and authorization.version == 12
+            and authorization.name == _AUTHORIZATION_GATED_MIGRATIONS[12]
+            and isinstance(authorization.issued_by, str) and bool(authorization.issued_by.strip()))
+
+
+def _gated_pending(pending) -> list[tuple[int, str]]:
+    return [(version, name) for version, name, _ in pending if version in _AUTHORIZATION_GATED_MIGRATIONS]
+
+
+def _authorization_refusal(current: int, gated: list[tuple[int, str]]) -> DatabaseMigrationAuthorizationRequired:
+    versions = ", ".join(f"{version} ({name})" for version, name in gated)
+    if current < 11:
+        how = (f"The database is at schema version {current}, below 11: bring it to v11 with the Phase 2 build "
+               f"(the build before migration 12 was registered) first, then run: {V12_MIGRATION_COMMAND}")
+    else:
+        how = f"Stop the application and run: {V12_MIGRATION_COMMAND}"
+    return DatabaseMigrationAuthorizationRequired(
+        f"DATABASE_MIGRATION_AUTHORIZATION_REQUIRED: the database is at schema version {current} and this build "
+        f"registers migration {versions}, which a normal start never applies to a database holding data. Nothing "
+        f"was changed. {how} (docs/PHASE_3_V12_AUTHORIZATION_GATE_IMPLEMENTATION_REPORT.md).")
+
+
+def _v12_open_null_mode_buys(conn: sqlite3.Connection) -> list[dict]:
+    return [dict(r) for r in conn.execute(V12_PREFLIGHT_OPEN_NULL_MODE_SQL).fetchall()]
+
+
+def require_startup_migration_authorization(path) -> None:
+    """Read-only, before init_db writes anything (key, journal mode, backup, schema): refuses with
+    DatabaseMigrationAuthorizationRequired while a gated migration is pending on a database that holds data, and
+    with DatabaseSchemaUnsupported on a foreign history. A missing file is a fresh install: nothing to check."""
+    path = Path(path)
+    if not path.exists():
+        return
+    conn = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True,
+                           timeout=config.SQLITE_BUSY_TIMEOUT_SECONDS)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        current = _check_history(migration_history(conn))
+        gated = _gated_pending([m for m in MIGRATIONS if m[0] > current])
+        if gated and _has_user_tables(conn):
+            raise _authorization_refusal(current, gated)
+    finally:
+        conn.close()
+
+
+def migrate(conn: sqlite3.Connection, *, v12_authorization: V12MigrationAuthorization | None = None,
+            v12_transaction_guard=None) -> list[int]:
+    """Applies every pending migration; returns the versions applied. A pending migration in
+    _AUTHORIZATION_GATED_MIGRATIONS is refused, before any write, unless `v12_authorization` is a valid
+    V12MigrationAuthorization (or the database holds no user table yet).
+
+    `v12_transaction_guard` (V12 final readiness, Phase E): a callable(conn) that db_maintenance migrate-v12 passes
+    with its authorization. It runs INSIDE the gated migration's own BEGIN IMMEDIATE transaction, under the write
+    lock, before any DDL, next to the R2-4 re-check; any exception it raises rolls the migration back. It only
+    adds a check: it is never a way round the authorization (it is ignored without a valid one)."""
     current = _check_history(migration_history(conn))  # refuses before any write
     pending = [m for m in MIGRATIONS if m[0] > current]
     if not pending:
         return []
+    gated = _gated_pending(pending)
+    if gated and _has_user_tables(conn) and not _valid_v12_authorization(v12_authorization):
+        raise _authorization_refusal(current, gated)  # before the backup and any write
 
     target_version = pending[-1][0]
     db_file = _database_file(conn)
     if db_file is not None and _has_user_tables(conn):
-        backup = backup_database(conn, db_file.with_name(f"{db_file.name}.pre_schema_v{target_version}_bak"))
+        try:
+            backup = backup_database(conn, db_file.with_name(f"{db_file.name}.pre_schema_v{target_version}_bak"))
+        except MigrationBackupFailed:
+            raise
+        except Exception as e:  # before any BEGIN: nothing was migrated
+            raise MigrationBackupFailed(
+                f"DATABASE_MIGRATION_FAILED: the pre-migration backup failed ({type(e).__name__}: {e}); nothing "
+                "was migrated.") from e
         logger.info("event=migration.backup schema_from=%d schema_to=%d backup=%s",
                     current, target_version, backup.name)
 
@@ -2213,6 +2512,16 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 conn.execute(SCHEMA_VERSION_DDL)
+                if version in _AUTHORIZATION_GATED_MIGRATIONS:
+                    # R2-4 re-checked under the write lock, in v12's own transaction (the preflight ran before it).
+                    open_null_mode = _v12_open_null_mode_buys(conn)
+                    if open_null_mode:
+                        raise DatabaseMigrationFailed(
+                            f"DATABASE_MIGRATION_FAILED: migration {version} ({name}) refused: open executed BUY "
+                            f"ticket(s) {[r['id'] for r in open_null_mode]} have a NULL mode and could never be "
+                            "journaled. Nothing was changed; resolve them in Ticket History first.")
+                    if v12_transaction_guard is not None and _valid_v12_authorization(v12_authorization):
+                        v12_transaction_guard(conn)
                 apply(conn)
                 violations_after = _foreign_key_violations(conn)
                 if violations_after > violations_before:
@@ -2258,7 +2567,15 @@ def _run_startup_invariants(conn: sqlite3.Connection) -> None:
     _scrub_plaintext_session_tokens(conn)
 
 
-def init_db() -> None:
+def init_db(*, fresh_install: "installation_state.FreshInstallConfirmation | None" = None) -> None:
+    # First, read-only (V12 final readiness, Phase C): an established installation whose database is missing,
+    # zero bytes, empty, corrupt, replaced, moved or mid-maintenance is refused, never re-created as a fresh database
+    # (backend/installation_state.py; DatabaseInstallationStateRefused). `fresh_install` is passed only by
+    # `db_maintenance init-fresh --confirm-new-installation --acknowledge-prior-installation`; a normal start never.
+    assessment = installation_state.require_startup_ok(DB_PATH, fresh_install)
+    # Then, read-only: a start never applies a gated migration (v12) to a database holding data; it refuses
+    # here before the key can be minted, the journal mode set, a backup taken or anything migrated.
+    require_startup_migration_authorization(DB_PATH)
     crypto.ensure_encryption_key()
     conn = get_connection()
     try:
@@ -2279,5 +2596,804 @@ def init_db() -> None:
             "startup_row_changes": conn.total_changes - changes_before,
             "schema_version": LATEST_SCHEMA_VERSION,
         })
+        installation_state.record_after_startup(DB_PATH, assessment, conn)
     finally:
         conn.close()
+
+
+class SchemaRollbackRefused(RuntimeError):
+    error_code = "SCHEMA_ROLLBACK_REFUSED"
+
+
+def _quoted_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _tables_referencing_phase2(conn: sqlite3.Connection) -> list[str]:
+    """Read-only. Every user table outside PHASE2_TABLES with a foreign key into one of them: a
+    schema built on top of v11, which must be rolled back before v11 is."""
+    phase2 = {name.lower() for name, _ in PHASE2_TABLES}
+    tables = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
+        "ORDER BY name").fetchall()]
+    dependants = []
+    for table in tables:
+        if table.lower() in phase2:
+            continue
+        # foreign_key_list columns: id, seq, table, from, to, on_update, on_delete, match.
+        references = conn.execute(f"PRAGMA foreign_key_list({_quoted_identifier(table)})").fetchall()
+        if any(row[2].lower() in phase2 for row in references):
+            dependants.append(table)
+    return dependants
+
+
+def rollback_schema_v11(conn: sqlite3.Connection) -> dict:
+    """The written down-migration for v11 (docs/PHASE_2_IMPLEMENTATION_REPORT.md, rollback): drops
+    exactly the five Phase 2 tables and the schema_version row 11, so a pre-Phase-2 build accepts the
+    database again. Every trading table is untouched; only the coordination audit (instance history,
+    startup runs, startup broker reads, the persisted restriction) is lost.
+
+    Refused, writing nothing, unless the history is exactly v1..v11 of this code, the Phase 2
+    objects are exactly v11's and no other table has a foreign key into them (a dependent schema is
+    rolled back first). The caller must hold the instance lock (db_maintenance does). A file
+    database is backed up first (verified, <db>.pre_rollback_v11_bak). One transaction: an
+    interruption leaves the v11 database as it was."""
+    if conn.in_transaction:
+        raise SchemaRollbackRefused("SCHEMA_ROLLBACK_REFUSED: the connection has an open transaction.")
+    history = [(h["version"], h["migration_name"]) for h in migration_history(conn)]
+    expected = [(version, name) for version, name, _ in MIGRATIONS if version <= 11]
+    if history != expected:
+        newest = history[-1] if history else None
+        raise SchemaRollbackRefused(
+            f"SCHEMA_ROLLBACK_REFUSED: the schema history must be exactly v1..v11 of this code; it ends at "
+            f"{newest}. Nothing was changed.")
+    status = phase2_schema_status(conn)
+    if status != "present":
+        raise SchemaRollbackRefused(
+            f"SCHEMA_ROLLBACK_REFUSED: the Phase 2 objects are {status}, not exactly v11's. Nothing was changed.")
+    dependants = _tables_referencing_phase2(conn)
+    if dependants:
+        raise SchemaRollbackRefused(
+            f"SCHEMA_ROLLBACK_REFUSED: table(s) {dependants} have foreign keys into the Phase 2 tables; dropping "
+            "those would leave them dangling. Roll back the dependent schema(s) first. Nothing was changed.")
+    backup = None
+    db_file = _database_file(conn)
+    if db_file is not None:
+        backup = backup_database(conn, db_file.with_name(f"{db_file.name}.pre_rollback_v11_bak"))
+    previous_isolation = conn.isolation_level
+    conn.isolation_level = None
+    try:
+        violations_before = _foreign_key_violations(conn)
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for name, _ddl in reversed(PHASE2_TABLES):
+                conn.execute(f"DROP TABLE {name}")
+            conn.execute("DELETE FROM schema_version WHERE version = 11")
+            if phase2_schema_status(conn) != "absent" or _check_history(migration_history(conn)) != 10:
+                raise SchemaRollbackRefused("SCHEMA_ROLLBACK_REFUSED: the rollback did not reach schema v10.")
+            if _foreign_key_violations(conn) > violations_before:
+                raise SchemaRollbackRefused("SCHEMA_ROLLBACK_REFUSED: the rollback would add foreign key violations.")
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            logger.exception("event=schema_rollback.failed version=11 (rolled back)")
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
+    finally:
+        conn.isolation_level = previous_isolation
+    logger.warning("event=schema_rollback.applied from=11 to=10 backup=%s", backup.name if backup else None)
+    _note_schema_change(conn, "rollback_schema_v11")
+    return {"rolled_back_to": 10, "backup": str(backup) if backup else None}
+
+
+def _note_schema_change(conn: sqlite3.Connection, by: str) -> None:
+    """A deliberate schema rollback re-binds the installation record (if there is one), so the next start does not
+    take the lower version for a database put back by hand (installation_state SCHEMA_REGRESSED)."""
+    db_file = _database_file(conn)
+    if db_file is not None:
+        installation_state.note_schema_change(db_file, by=by, conn=conn)
+
+
+# ---- GTT-after-fill Phase 1: the dark protection-journal schema ---------------
+#
+# docs/PROPOSAL_GTT_AFTER_FILL_LIFECYCLE_REVIEW.md §5.2 and §12 (Phase 1);
+# docs/PHASE_1_DARK_SCHEMA_REPORT.md.
+#
+# REGISTERED as migration 12 (phase3_protection_journal), applied to a database
+# holding data only by `db_maintenance migrate-v12 --authorize-v12` and removed
+# only by `db_maintenance rollback-schema-v12 --confirm`. The dark entry points
+# apply_dark_protection_schema() / rollback_dark_protection_schema() remain for
+# scratch v11 databases only: they refuse a v12 history, the account database
+# and its backups.
+#
+# Phase 3 stage S1 amended the objects to docs/PHASE_3_DESIGN_DECISIONS.md
+# §4.1 (R6) and renumbered the helpers to v12; registered as v12 by the
+# separately authorized registration (DD-2).
+#
+# Objects, created and removed all-or-nothing in one transaction:
+#   protection_operations              write-ahead journal of GTT writes (§5.2.3)
+#   protection_operation_resolutions   the evidence of a manual resolution (Q3)
+#   idx_protection_ops_one_open_change at most one open create/modify per position
+#   idx_protection_ops_one_open_cancel at most one open cancel per (position, target GTT)
+#   idx_trade_tickets_unique_gtt       a GTT protects at most one ticket. While
+#                                      existing rows share a kite_gtt_id it is not
+#                                      created: logged and reported, like
+#                                      _ensure_single_exit_owner_index
+#   trade_tickets.protection_state     the §3.3 Protection-region state; NULL =
+#                                      not tracked by the journal (every existing row)
+#   ticket_events event types          the 13 protection_* types of DD-7 (table rebuild)
+
+PROTECTION_OPERATION_STATES = (
+    "intent", "sending", "acknowledged", "unknown", "needs_review",
+    "confirmed", "adopted", "rejected", "not_sent", "absent_after_settle", "resolved_manual",
+)
+# Open = may still change what exists at the broker. needs_review is open on
+# purpose: it blocks every automated write on the position (§5.2.3). Every
+# other state is terminal; a superseded op keeps its state (the overlay, Q1).
+PROTECTION_OPEN_OPERATION_STATES = ("intent", "sending", "acknowledged", "unknown", "needs_review")
+# States only reachable once the request has left the process (§3.7, M-8).
+_PROTECTION_SENT_STATES = ("sending", "acknowledged", "confirmed", "rejected", "unknown", "adopted",
+                           "absent_after_settle")
+PROTECTION_STATES = (
+    "PROTECTION_NOT_REQUIRED", "PROTECTION_PENDING", "PROTECTION_INTENT", "PROTECTION_SUBMITTED",
+    "PROTECTION_ACKNOWLEDGED", "PROTECTION_CONFIRMED", "PROTECTION_STALE", "PROTECTION_RESIZE_PENDING",
+    "PROTECTION_FAILED", "PROTECTION_UNKNOWN", "PROTECTION_MISMATCH", "PROTECTION_TRIGGERED",
+    "PROTECTION_CANCEL_PENDING", "PROTECTION_CANCEL_UNKNOWN", "PROTECTION_NEEDS_REVIEW",
+)
+PROTECTION_EVENT_TYPES = (
+    "protection_pending", "protection_submitted", "protection_confirmed",
+    "protection_unknown", "protection_adopted", "protection_cancelled",
+    "protection_rejected", "protection_not_sent", "protection_absent_after_settle",
+    "protection_needs_review", "protection_superseded", "protection_resolved",
+    "protection_late_gtt_appeared",
+)
+
+
+def _sql_list(values) -> str:
+    return ", ".join(f"'{v}'" for v in values)
+
+
+# The R6 §4.1 DDL, character for character apart from layout. Its explanatory
+# comments live here, not in the SQL, so the stored schema carries none:
+#   mode       [R2-4] copied verbatim from trade_tickets.mode by the DD-5
+#              INSERT ... SELECT; the ticket's non-NULL domain is exactly
+#              ('dry_run', 'live'), a NULL ticket mode yields no row; never
+#              execution_settings.mode.
+#   table CHECKs, in order:
+#     kind / reason / direction (DD-3, DD-4): one closed reason list per kind;
+#       direction is set exactly for a modify, and fixed for four reasons.
+#       [R3-1] an attribution_cap op is sent (first send or retry) only while
+#       DX classifies it caps_sell_exposure, re-proved at every send; never as
+#       none/redundant. Enforced by the engine's CAS, not expressible here.
+#     retry bound (DD-4): only cancels and exposure-reducing modifies may be
+#       sent more than once.
+#     targets and results (Phase 1, kept): modify / cancel name their GTT; a
+#       create that was acknowledged, confirmed or adopted knows its GTT id.
+#     sent_at (D§4.1, M-8): 'intent' and 'not_sent' have sent nothing, every
+#       sent state has; absent_after_settle is a sent create with >= 2
+#       complete reads after it.
+#     overlay (Q1): the superseded_* triplet is all set or all NULL, and never
+#       on 'intent' (an intent that is superseded becomes 'not_sent').
+#     resolution (Q3): resolution_id is set exactly for resolved_manual.
+#     open vs terminal: resolved_at is NULL exactly while the op is open.
+# target_gtt_id / result_gtt_id / linked_gtt_id carry INTEGER affinity like
+# trade_tickets.kite_gtt_id, so a paper id ('PAPER-G-<n>', §5.8) is kept as
+# text. Not STRICT (P1-Q8). The two-way foreign key with the resolutions table
+# is legal in SQLite: the resolution row is inserted first, then the op's CAS
+# sets resolution_id.
+_PROTECTION_OPEN_SQL = _sql_list(PROTECTION_OPEN_OPERATION_STATES)
+_PROTECTION_OPERATIONS_DDL = f"""CREATE TABLE protection_operations (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    op_uuid               TEXT NOT NULL UNIQUE,
+    account_id            INTEGER NOT NULL REFERENCES accounts(id),
+    position_id           INTEGER NOT NULL REFERENCES trade_tickets(id),
+    mode                  TEXT NOT NULL CHECK (mode IN ('live', 'dry_run')),
+    kind                  TEXT NOT NULL CHECK (kind IN ('create', 'modify', 'cancel')),
+    reason                TEXT NOT NULL CHECK (reason IN ('fill', 'user_recreate',
+                              'fill_resize', 'exit_fill', 'trailing', 'attribution_cap', 'user_modify',
+                              'position_closed', 'supersede_cleanup', 'duplicate_cleanup', 'exit_prepare',
+                              'user_cancel')),
+    direction             TEXT CHECK (direction IS NULL OR direction IN ('up', 'down', 'tighten', 'loosen')),
+    state                 TEXT NOT NULL CHECK (state IN ({_sql_list(PROTECTION_OPERATION_STATES)})),
+    basis_filled_quantity INTEGER NOT NULL CHECK (basis_filled_quantity >= 0),
+    basis_exits_filled    INTEGER NOT NULL CHECK (basis_exits_filled >= 0),
+    requested_quantity    INTEGER NOT NULL CHECK (requested_quantity >= 0),
+    request_fingerprint   TEXT NOT NULL CHECK (json_valid(request_fingerprint)),
+    request_payload       TEXT NOT NULL CHECK (json_valid(request_payload)),
+    target_gtt_id         INTEGER,
+    result_gtt_id         INTEGER,
+    instance_epoch        INTEGER NOT NULL,
+    attempts              INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    complete_reads_after  INTEGER NOT NULL DEFAULT 0 CHECK (complete_reads_after >= 0),
+    superseded_at         TEXT,
+    superseded_by_kind    TEXT CHECK (superseded_by_kind IS NULL OR
+                              superseded_by_kind IN ('emergency_exit', 'exit', 'close', 'user')),
+    superseded_by_ref     TEXT,
+    resolution_id         INTEGER REFERENCES protection_operation_resolutions(id),
+    created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at            TEXT NOT NULL DEFAULT (datetime('now')),
+    sent_at               TEXT,
+    acknowledged_at       TEXT,
+    resolved_at           TEXT,
+    last_checked_at       TEXT,
+    evidence              TEXT CHECK (evidence IS NULL OR json_valid(evidence)),
+    CHECK ((kind = 'create' AND reason IN ('fill', 'user_recreate') AND direction IS NULL)
+        OR (kind = 'modify' AND reason IN ('fill_resize', 'exit_fill', 'trailing', 'attribution_cap', 'user_modify')
+                            AND direction IS NOT NULL)
+        OR (kind = 'cancel' AND reason IN ('position_closed', 'supersede_cleanup', 'duplicate_cleanup',
+                                           'exit_prepare', 'user_cancel') AND direction IS NULL)),
+    CHECK (reason != 'fill_resize' OR direction = 'up'),
+    CHECK (reason NOT IN ('exit_fill', 'attribution_cap') OR direction = 'down'),
+    CHECK (reason != 'trailing' OR direction = 'tighten'),
+    CHECK (attempts <= 1 OR kind = 'cancel' OR (kind = 'modify' AND direction IN ('down', 'tighten'))),
+    CHECK (kind = 'create' OR target_gtt_id IS NOT NULL),
+    CHECK (kind != 'create' OR state NOT IN ('acknowledged', 'confirmed', 'adopted') OR result_gtt_id IS NOT NULL),
+    CHECK (state NOT IN ('intent', 'not_sent') OR sent_at IS NULL),
+    CHECK (state NOT IN ({_sql_list(_PROTECTION_SENT_STATES)}) OR sent_at IS NOT NULL),
+    CHECK (state != 'absent_after_settle' OR (kind = 'create' AND sent_at IS NOT NULL AND complete_reads_after >= 2)),
+    CHECK ((superseded_at IS NULL) = (superseded_by_kind IS NULL)
+       AND (superseded_at IS NULL) = (superseded_by_ref IS NULL)),
+    CHECK (NOT (state = 'intent' AND superseded_at IS NOT NULL)),
+    CHECK ((state = 'resolved_manual') = (resolution_id IS NOT NULL)),
+    CHECK ((state IN ({_PROTECTION_OPEN_SQL})) = (resolved_at IS NULL))
+)"""
+# At most one open exposure-changing op per position (D§3 Q3, kept).
+_PROTECTION_OPS_ONE_OPEN_CHANGE_DDL = (
+    "CREATE UNIQUE INDEX idx_protection_ops_one_open_change ON protection_operations(position_id)\n"
+    f"  WHERE kind IN ('create', 'modify') AND state IN ({_PROTECTION_OPEN_SQL})"
+)
+# At most one open cancel per (position, target GTT) (amends D§3 Q3; M-7): an
+# Emergency Exit can cancel every known GTT id beside an unresolved change.
+_PROTECTION_OPS_ONE_OPEN_CANCEL_DDL = (
+    "CREATE UNIQUE INDEX idx_protection_ops_one_open_cancel ON protection_operations(position_id, target_gtt_id)\n"
+    f"  WHERE kind = 'cancel' AND state IN ({_PROTECTION_OPEN_SQL})"
+)
+# One evidence-backed manual resolution per op (Q3): no 'other' outcome; the
+# evidence read is a v11 broker_reads row (hence _require_current_schema); the
+# engine also requires it complete and taken at resolution time.
+_PROTECTION_OPERATION_RESOLUTIONS_DDL = """CREATE TABLE protection_operation_resolutions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    op_id            INTEGER NOT NULL UNIQUE REFERENCES protection_operations(id),
+    outcome          TEXT NOT NULL CHECK (outcome IN ('linked_gtt', 'no_app_gtt', 'deleted_in_kite_verified')),
+    linked_gtt_id    INTEGER,
+    reason           TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    evidence_read_id INTEGER NOT NULL REFERENCES broker_reads(id),
+    resolver         TEXT NOT NULL CHECK (length(trim(resolver)) > 0),
+    instance_epoch   INTEGER NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK ((outcome = 'linked_gtt') = (linked_gtt_id IS NOT NULL))
+)"""
+# (name, CREATE statement) of the objects that exist exactly as written here.
+_DARK_SCHEMA_OBJECTS = (
+    ("protection_operations", _PROTECTION_OPERATIONS_DDL),
+    ("protection_operation_resolutions", _PROTECTION_OPERATION_RESOLUTIONS_DDL),
+    ("idx_protection_ops_one_open_change", _PROTECTION_OPS_ONE_OPEN_CHANGE_DDL),
+    ("idx_protection_ops_one_open_cancel", _PROTECTION_OPS_ONE_OPEN_CANCEL_DDL),
+)
+_UNIQUE_GTT_INDEX_DDL = (
+    "CREATE UNIQUE INDEX idx_trade_tickets_unique_gtt ON trade_tickets(kite_gtt_id) "
+    "WHERE kite_gtt_id IS NOT NULL"
+)
+_PROTECTION_STATE_COLUMN_DDL = (
+    "protection_state TEXT CHECK (protection_state IS NULL OR protection_state IN "
+    f"({_sql_list(PROTECTION_STATES)}))"
+)
+_TICKET_EVENTS_COLUMNS = ("id", "ticket_id", "event_type", "detail", "created_at")
+# Appended to (and, on rollback, removed from) the end of the event_type
+# allow-list, so a rollback restores the table's stored SQL byte for byte.
+_PROTECTION_EVENT_TYPES_SUFFIX = ", " + _sql_list(PROTECTION_EVENT_TYPES)
+_EVENT_TYPE_LIST_RE = re.compile(r"CHECK\s*\(\s*event_type\s+IN\s*\(([^)]*)\)", re.IGNORECASE)
+_TICKET_EVENTS_HEADER_RE = re.compile(r"""^\s*CREATE\s+TABLE\s+(?:"ticket_events"|ticket_events)(?=[\s(])""",
+                                      re.IGNORECASE)
+
+# The account database and every backup beside it. Fixed at import: tests
+# redirect DB_PATH, never this.
+_ACCOUNT_DB_FILE = Path(__file__).parent / "kite_terminal.db"
+
+
+class DarkSchemaRefused(RuntimeError):
+    """The dark schema was not applied or removed: the database is not in a
+    state this code can change safely. Nothing was written."""
+    error_code = "DARK_SCHEMA_REFUSED"
+
+
+def _normalised_sql(sql: str | None) -> str | None:
+    return " ".join(sql.split()) if sql is not None else None
+
+
+def _schema_object(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT type, sql FROM sqlite_master WHERE name = ?", (name,)).fetchone()
+
+
+def _ticket_events_sql(conn: sqlite3.Connection) -> str:
+    row = _schema_object(conn, "ticket_events")
+    if row is None or row["type"] != "table":
+        raise DarkSchemaRefused("DARK_SCHEMA_REFUSED: ticket_events is missing.")
+    return row["sql"]
+
+
+def _event_type_list_span(sql: str) -> tuple[int, int]:
+    """(start, end) of the event_type allow-list's content, trailing blanks
+    excluded."""
+    matches = list(_EVENT_TYPE_LIST_RE.finditer(sql))
+    if len(matches) != 1:
+        raise DarkSchemaRefused("DARK_SCHEMA_REFUSED: ticket_events has no single event_type allow-list.")
+    content = matches[0].group(1)
+    start = matches[0].start(1)
+    return start, start + len(content.rstrip())
+
+
+def _ticket_event_types(sql: str) -> list[str]:
+    start, end = _event_type_list_span(sql)
+    return re.findall(r"'([^']*)'", sql[start:end])
+
+
+def dark_protection_schema_status(conn: sqlite3.Connection) -> dict:
+    """Read-only. state: 'absent' (none of the objects), 'present' (all of
+    them, each exactly as this code creates it; the unique GTT index may be
+    missing, see unique_gtt_index), 'partial' (some) or 'unexpected' (an
+    object of that name exists in another form)."""
+    objects = {name: _schema_object(conn, name) for name, _ in _DARK_SCHEMA_OBJECTS}
+    gtt_index = _schema_object(conn, "idx_trade_tickets_unique_gtt")
+    column = _column_exists(conn, "trade_tickets", "protection_state")
+    events_sql = _ticket_events_sql(conn)
+    event_types = _ticket_event_types(events_sql)
+    added_events = [t for t in PROTECTION_EVENT_TYPES if t in event_types]
+
+    present = {
+        **{name: row is not None for name, row in objects.items()},
+        "trade_tickets.protection_state": column,
+        "ticket_events.protection_event_types": bool(added_events),
+    }
+    # A Phase 1-era dark schema (old table, 6-type suffix) is 'unexpected' here.
+    mismatched = [name for name, ddl in _DARK_SCHEMA_OBJECTS
+                  if objects[name] is not None and _normalised_sql(objects[name]["sql"]) != _normalised_sql(ddl)]
+    if gtt_index is not None and _normalised_sql(gtt_index["sql"]) != _normalised_sql(_UNIQUE_GTT_INDEX_DDL):
+        mismatched.append("idx_trade_tickets_unique_gtt")
+    if column and _normalised_sql(_PROTECTION_STATE_COLUMN_DDL) not in _normalised_sql(
+            _schema_object(conn, "trade_tickets")["sql"]):
+        mismatched.append("trade_tickets.protection_state")
+    if added_events and not events_sql[:_event_type_list_span(events_sql)[1]].endswith(
+            _PROTECTION_EVENT_TYPES_SUFFIX):
+        mismatched.append("ticket_events.protection_event_types")
+
+    if mismatched:
+        state = "unexpected"
+    elif all(present.values()):
+        state = "present"
+    elif gtt_index is None and not any(present.values()):
+        state = "absent"
+    else:
+        state = "partial"
+    return {
+        "state": state,
+        "objects": present,
+        "unique_gtt_index": gtt_index is not None,
+        "mismatched": mismatched,
+    }
+
+
+def _refuse_account_database(conn: sqlite3.Connection) -> None:
+    db_file = _database_file(conn)
+    if db_file is None:
+        return  # in-memory
+    resolved = Path(os.path.normcase(os.path.realpath(db_file)))
+    account = Path(os.path.normcase(os.path.realpath(_ACCOUNT_DB_FILE)))
+    if resolved.parent == account.parent and resolved.name.startswith(account.name):
+        raise DarkSchemaRefused(
+            f"DARK_SCHEMA_REFUSED: {db_file.name} is the account database or one of its backups. The dark "
+            "protection schema is not authorised on account data."
+        )
+
+
+def _require_no_transaction(conn: sqlite3.Connection, label: str) -> None:
+    # Checked first: the backup would wait forever on this connection's own
+    # write lock, and BEGIN IMMEDIATE would fail half-way.
+    if conn.in_transaction:
+        raise DarkSchemaRefused(f"DARK_SCHEMA_REFUSED: {label} needs a connection with no open transaction.")
+
+
+def _require_current_schema(conn: sqlite3.Connection) -> None:
+    current = _check_history(migration_history(conn))  # DatabaseSchemaUnsupported if foreign
+    if current != LATEST_SCHEMA_VERSION:
+        raise DarkSchemaRefused(
+            f"DARK_SCHEMA_REFUSED: the database is at schema version {current}, not {LATEST_SCHEMA_VERSION}. "
+            "Run init_db() first."
+        )
+
+
+def _require_dark_history(conn: sqlite3.Connection) -> None:
+    """The dark entry points run only on a database whose history is exactly v1..v11 of this code (runbook §6,
+    registration-gate item). Before registration this equals _require_current_schema. After registration (LATEST
+    12) it still refuses a v12 history, so a dark rollback can never drop the v12 objects and leave schema_version
+    row 12 behind: on a v12 database the journal is removed only by rollback_schema_v12."""
+    current = _check_history(migration_history(conn))  # DatabaseSchemaUnsupported if foreign or newer than code
+    if current != 11:
+        hint = ("Run init_db() first." if current < 11 else
+                "On a v12 database the journal is created by migration 12 and removed only by rollback_schema_v12.")
+        raise DarkSchemaRefused(
+            f"DARK_SCHEMA_REFUSED: the database is at schema version {current}, not 11. {hint}")
+
+
+def _run_dark_step(conn: sqlite3.Connection, label: str, step) -> dict:
+    """One transaction, as migrate() runs a migration: foreign keys off around
+    it (table rebuilds), BEGIN IMMEDIATE, no new foreign key violations, then
+    COMMIT; any exception (BaseException included) rolls everything back."""
+    _require_no_transaction(conn, label)
+    previous_isolation = conn.isolation_level
+    foreign_keys_were_on = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+    conn.isolation_level = None
+    try:
+        violations_before = _foreign_key_violations(conn)
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = step(conn)
+            violations_after = _foreign_key_violations(conn)
+            if violations_after > violations_before:
+                raise DatabaseMigrationFailed(
+                    f"DATABASE_MIGRATION_FAILED: {label} would add "
+                    f"{violations_after - violations_before} foreign key violation(s)."
+                )
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            logger.exception("event=dark_schema.failed step=%s (rolled back)", label)
+            raise
+        finally:
+            conn.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys_were_on else 'OFF'}")
+    finally:
+        conn.isolation_level = previous_isolation
+    return result
+
+
+def _backup_before(conn: sqlite3.Connection, suffix: str) -> str | None:
+    db_file = _database_file(conn)
+    if db_file is None or not _has_user_tables(conn):
+        return None
+    return backup_database(conn, db_file.with_name(f"{db_file.name}.{suffix}")).name
+
+
+def _rebuild_ticket_events(conn: sqlite3.Connection, new_sql: str) -> None:
+    """Replaces ticket_events with `new_sql` (its CREATE TABLE), keeping every
+    row, its indexes and its AUTOINCREMENT high-water mark."""
+    columns = tuple(r["name"] for r in conn.execute("PRAGMA table_info(ticket_events)").fetchall())
+    if columns != _TICKET_EVENTS_COLUMNS:
+        raise DarkSchemaRefused(f"DARK_SCHEMA_REFUSED: ticket_events has unexpected columns {columns}.")
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type IN ('trigger', 'view') AND tbl_name = 'ticket_events'"
+                    ).fetchone() is not None:
+        raise DarkSchemaRefused("DARK_SCHEMA_REFUSED: ticket_events has a trigger or view; not rebuilding it.")
+    create_sql, renamed = _TICKET_EVENTS_HEADER_RE.subn("CREATE TABLE ticket_events_new", new_sql, count=1)
+    if not renamed:
+        raise DarkSchemaRefused("DARK_SCHEMA_REFUSED: the ticket_events definition is not in the expected form.")
+    indexes = [r["sql"] for r in conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'ticket_events' AND sql IS NOT NULL "
+        "ORDER BY name"
+    ).fetchall()]
+    sequence = conn.execute("SELECT rowid, seq FROM sqlite_sequence WHERE name = 'ticket_events'").fetchone()
+    rows_before = conn.execute("SELECT COUNT(*) FROM ticket_events").fetchone()[0]
+    column_list = ", ".join(_TICKET_EVENTS_COLUMNS)
+
+    conn.execute(create_sql)
+    conn.execute(f"INSERT INTO ticket_events_new ({column_list}) SELECT {column_list} FROM ticket_events")
+    conn.execute("DROP TABLE ticket_events")
+    conn.execute("ALTER TABLE ticket_events_new RENAME TO ticket_events")
+    for sql in indexes:
+        conn.execute(sql)
+    if sequence is not None:
+        # The rebuild re-creates this row; put it back where and as it was.
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'ticket_events'")
+        conn.execute("INSERT INTO sqlite_sequence (rowid, name, seq) VALUES (?, 'ticket_events', ?)",
+                     (sequence["rowid"], sequence["seq"]))
+
+    if conn.execute("SELECT COUNT(*) FROM ticket_events").fetchone()[0] != rows_before:
+        raise DatabaseMigrationFailed("DATABASE_MIGRATION_FAILED: the ticket_events rebuild lost rows.")
+    if _normalised_sql(_ticket_events_sql(conn)) != _normalised_sql(
+            _TICKET_EVENTS_HEADER_RE.sub('CREATE TABLE "ticket_events"', new_sql, count=1)):
+        raise DatabaseMigrationFailed("DATABASE_MIGRATION_FAILED: ticket_events was not rebuilt as intended.")
+
+
+def _duplicate_gtt_ids(conn: sqlite3.Connection) -> list:
+    """GTT ids linked to more than one ticket: what idx_trade_tickets_unique_gtt cannot be built over."""
+    return [r["kite_gtt_id"] for r in conn.execute(
+        "SELECT kite_gtt_id FROM trade_tickets WHERE kite_gtt_id IS NOT NULL "
+        "GROUP BY kite_gtt_id HAVING COUNT(*) > 1 ORDER BY kite_gtt_id"
+    ).fetchall()]
+
+
+def _ensure_unique_gtt_index(conn: sqlite3.Connection) -> dict:
+    if _schema_object(conn, "idx_trade_tickets_unique_gtt") is not None:
+        return {"unique_gtt_index": "present", "duplicate_gtt_ids": []}
+    duplicates = _duplicate_gtt_ids(conn)
+    if duplicates:
+        # Existing data already breaks the invariant. As with the exit-owner
+        # index: not created, never blocks, reported for review.
+        logger.warning(
+            "Not creating idx_trade_tickets_unique_gtt: GTT id(s) %s are linked to more than one ticket — "
+            "review them in Ticket History.", duplicates,
+        )
+        return {"unique_gtt_index": "skipped_duplicate_gtt_ids", "duplicate_gtt_ids": duplicates}
+    conn.execute(_UNIQUE_GTT_INDEX_DDL)
+    return {"unique_gtt_index": "created", "duplicate_gtt_ids": []}
+
+
+_V12_NAME = "phase3_protection_journal"
+_V12_OBJECT_NAMES = frozenset({name for name, _ in _DARK_SCHEMA_OBJECTS} | {"idx_trade_tickets_unique_gtt"})
+
+
+def _m012_registered(conn: sqlite3.Connection) -> dict:
+    """Migration 12 as MIGRATIONS will run it once registered (M-9, DD-6; Phase 3 S2). Runs inside
+    migrate()'s transaction, which takes the backup and rolls everything back on any exception, so it
+    takes no backup, opens no transaction and checks no history (that is still v11 here) and, unlike
+    the dark entry points, does not refuse the account database: migrating it is what registration is
+    for. Registered as MIGRATIONS[11] through _migration_v12_protection_journal."""
+    status = dark_protection_schema_status(conn)
+    if status["state"] == "present" and status["unique_gtt_index"]:
+        # A re-run over an already migrated database (a lost schema_version table), or a scratch
+        # database the dark apply already created: every object is exactly v12's; keep its data.
+        return {"action": "already_present"}
+    if status["state"] == "present":
+        raise DatabaseMigrationFailed(
+            f"DATABASE_MIGRATION_FAILED: migration 12 ({_V12_NAME}) found the Phase 3 objects present without "
+            "idx_trade_tickets_unique_gtt (a dark apply that skipped it over duplicate GTT ids), which is not "
+            "exactly v12's schema. Nothing was changed; restore a backup or inspect the database by hand.")
+    if status["state"] != "absent":
+        raise DatabaseMigrationFailed(
+            f"DATABASE_MIGRATION_FAILED: migration 12 ({_V12_NAME}) found the Phase 3 objects {status['state']} "
+            f"(a partial or foreign form; mismatched: {status['mismatched']}). Nothing was changed; restore a "
+            "backup or inspect the database by hand.")
+    duplicates = _duplicate_gtt_ids(conn)  # before any DDL
+    if duplicates:
+        raise DatabaseMigrationFailed(
+            f"DATABASE_MIGRATION_FAILED: migration 12 ({_V12_NAME}) cannot create idx_trade_tickets_unique_gtt: "
+            f"GTT id(s) {duplicates} are linked to more than one ticket. Nothing was changed; the database "
+            "stays at v11. Review those tickets in Ticket History, then start again.")
+    before = _schema_object_names(conn)
+    events_sql = _ticket_events_sql(conn)
+    _, list_end = _event_type_list_span(events_sql)
+    for _name, ddl in _DARK_SCHEMA_OBJECTS:
+        conn.execute(ddl)
+    conn.execute(f"ALTER TABLE trade_tickets ADD COLUMN {_PROTECTION_STATE_COLUMN_DDL}")
+    _rebuild_ticket_events(conn, events_sql[:list_end] + _PROTECTION_EVENT_TYPES_SUFFIX + events_sql[list_end:])
+    conn.execute(_UNIQUE_GTT_INDEX_DDL)  # never skipped: the duplicates were refused above
+    added = _schema_object_names(conn) - before
+    status = dark_protection_schema_status(conn)
+    if added != _V12_OBJECT_NAMES or status["state"] != "present" or not status["unique_gtt_index"]:
+        raise DatabaseMigrationFailed(
+            f"DATABASE_MIGRATION_FAILED: migration 12 ({_V12_NAME}) produced an unexpected schema "
+            f"(added {sorted(added)}, state {status['state']}).")
+    return {"action": "applied"}
+
+
+def _m012_protection_journal(conn: sqlite3.Connection, *, registered: bool = True) -> dict:
+    """Creates the Phase 3 objects. The bare function (registered=True) is the
+    future MIGRATIONS entry: see _m012_registered; every refusal there is a
+    DatabaseMigrationFailed. The dark caller passes registered=False: it runs
+    inside _run_dark_step's transaction, only after the status check has found
+    the objects all absent, and skips (and reports) the unique GTT index while
+    existing tickets share a GTT id."""
+    if registered:
+        try:
+            return _m012_registered(conn)
+        except DarkSchemaRefused as e:  # a ticket_events shape the rebuild cannot handle
+            raise DatabaseMigrationFailed(
+                f"DATABASE_MIGRATION_FAILED: migration 12 ({_V12_NAME}) refused the database: {e} "
+                "Nothing was changed (the migration is rolled back).") from e
+    if dark_protection_schema_status(conn)["state"] != "absent":
+        raise DarkSchemaRefused("DARK_SCHEMA_REFUSED: the dark schema changed while it was being applied.")
+    events_sql = _ticket_events_sql(conn)
+    _, list_end = _event_type_list_span(events_sql)
+    for _name, ddl in _DARK_SCHEMA_OBJECTS:
+        conn.execute(ddl)
+    conn.execute(f"ALTER TABLE trade_tickets ADD COLUMN {_PROTECTION_STATE_COLUMN_DDL}")
+    _rebuild_ticket_events(conn, events_sql[:list_end] + _PROTECTION_EVENT_TYPES_SUFFIX + events_sql[list_end:])
+    result = _ensure_unique_gtt_index(conn)
+    if dark_protection_schema_status(conn)["state"] != "present":
+        raise DatabaseMigrationFailed("DATABASE_MIGRATION_FAILED: the dark schema is incomplete after applying.")
+    return result
+
+
+def _r012_protection_journal(conn: sqlite3.Connection) -> dict:
+    """Removes exactly the objects _m012 creates. Runs inside _run_dark_step's
+    transaction, and only after the checks that they hold no data."""
+    events_sql = _ticket_events_sql(conn)
+    _, list_end = _event_type_list_span(events_sql)
+    list_start = list_end - len(_PROTECTION_EVENT_TYPES_SUFFIX)
+    conn.execute("DROP INDEX IF EXISTS idx_trade_tickets_unique_gtt")
+    conn.execute("DROP INDEX idx_protection_ops_one_open_cancel")
+    conn.execute("DROP INDEX idx_protection_ops_one_open_change")
+    conn.execute("DROP TABLE protection_operation_resolutions")  # the child first; foreign keys are off here
+    conn.execute("DROP TABLE protection_operations")
+    conn.execute("ALTER TABLE trade_tickets DROP COLUMN protection_state")
+    _rebuild_ticket_events(conn, events_sql[:list_start] + events_sql[list_end:])
+    if dark_protection_schema_status(conn)["state"] != "absent":
+        raise DatabaseMigrationFailed("DATABASE_MIGRATION_FAILED: dark schema objects remain after the rollback.")
+    return {}
+
+
+def apply_dark_protection_schema(conn: sqlite3.Connection) -> dict:
+    """Creates the dark schema on a fully migrated scratch database. Repeating
+    it changes nothing (except creating the unique GTT index once duplicates
+    that blocked it are gone). Refuses the account database, a database not
+    at LATEST_SCHEMA_VERSION, and any partial or foreign form of the objects."""
+    _refuse_account_database(conn)
+    _require_no_transaction(conn, "apply_dark_protection_schema")
+    _require_dark_history(conn)
+    status = dark_protection_schema_status(conn)
+    if status["state"] in ("partial", "unexpected"):
+        raise DarkSchemaRefused(
+            f"DARK_SCHEMA_REFUSED: the dark schema is {status['state']} ({status}); not touching it."
+        )
+    if status["state"] == "present" and status["unique_gtt_index"]:
+        return {"action": "already_present", "unique_gtt_index": "present", "duplicate_gtt_ids": [],
+                "backup": None}
+    backup = _backup_before(conn, "pre_dark_protection_schema_bak")
+    if status["state"] == "absent":
+        result = _run_dark_step(conn, "apply_dark_protection_schema",
+                                lambda c: _m012_protection_journal(c, registered=False))
+        action = "applied"
+    else:
+        result = _run_dark_step(conn, "apply_dark_protection_schema", _ensure_unique_gtt_index)
+        action = "already_present"
+    logger.info("event=dark_schema.applied action=%s unique_gtt_index=%s", action, result["unique_gtt_index"])
+    return {"action": action, **result, "backup": backup}
+
+
+def _protection_held_data(conn: sqlite3.Connection) -> dict:
+    """Read-only, on a database whose Phase 3 objects are present: what a
+    rollback of them would delete."""
+    return {
+        "protection_operations rows": conn.execute("SELECT COUNT(*) FROM protection_operations").fetchone()[0],
+        # Counted on its own: a resolution row is data even if its op is gone.
+        "protection_operation_resolutions rows": conn.execute(
+            "SELECT COUNT(*) FROM protection_operation_resolutions").fetchone()[0],
+        "trade_tickets.protection_state values": conn.execute(
+            "SELECT COUNT(*) FROM trade_tickets WHERE protection_state IS NOT NULL").fetchone()[0],
+        "protection_* ticket_events": conn.execute(
+            f"SELECT COUNT(*) FROM ticket_events WHERE event_type IN ({_sql_list(PROTECTION_EVENT_TYPES)})"
+        ).fetchone()[0],
+    }
+
+
+def rollback_dark_protection_schema(conn: sqlite3.Connection) -> dict:
+    """Removes the dark schema and nothing else. Refuses while any of it holds
+    data (a journal row, a resolution row, a protection_state, a protection_*
+    event of the suffix), so no application data can be deleted; repeating it
+    changes nothing."""
+    _refuse_account_database(conn)
+    _require_no_transaction(conn, "rollback_dark_protection_schema")
+    _require_dark_history(conn)
+    status = dark_protection_schema_status(conn)
+    if status["state"] == "absent":
+        return {"action": "already_absent", "backup": None}
+    if status["state"] != "present":
+        raise DarkSchemaRefused(
+            f"DARK_SCHEMA_REFUSED: the dark schema is {status['state']} ({status}); not touching it."
+        )
+    held = _protection_held_data(conn)
+    if any(held.values()):
+        raise DarkSchemaRefused(
+            f"DARK_SCHEMA_REFUSED: the dark schema holds data ({held}); a rollback would delete it."
+        )
+    backup = _backup_before(conn, "pre_dark_protection_rollback_bak")
+    _run_dark_step(conn, "rollback_dark_protection_schema", _r012_protection_journal)
+    logger.info("event=dark_schema.rolled_back")
+    return {"action": "rolled_back", "backup": backup}
+
+
+def v12_schema_problems(conn: sqlite3.Connection, *, empty_journal: bool) -> list[str]:
+    """Read-only, for db_maintenance migrate-v12's verification: why the database's Phase 3 objects are not exactly
+    v12's (unique GTT index included). With empty_journal (right after migration 12), also any data they hold: a
+    journal row, a resolution row, a protection_state value or a protection_* event. [] = verified."""
+    try:
+        status = dark_protection_schema_status(conn)
+    except DarkSchemaRefused as e:
+        return [str(e)]
+    problems = []
+    if status["state"] != "present" or not status["unique_gtt_index"]:
+        problems.append(f"the v12 objects are {status['state']} (unique GTT index "
+                        f"{'present' if status['unique_gtt_index'] else 'missing'}; mismatched {status['mismatched']})")
+    elif empty_journal:
+        held = _protection_held_data(conn)
+        if any(held.values()):
+            problems.append(f"the v12 objects hold data right after migration 12 ({held})")
+    return problems
+
+
+V12_TABLE_NAMES = ("protection_operations", "protection_operation_resolutions")
+
+
+def v12_objects_state(conn: sqlite3.Connection) -> str:
+    """Read-only, for db_maintenance (failure classification, rollback verification): 'absent', 'present',
+    'partial' or 'unexpected' for the Phase 3 objects."""
+    return dark_protection_schema_status(conn)["state"]
+
+
+def rollback_schema_v12(conn: sqlite3.Connection) -> dict:
+    """The written down-migration for v12 (docs/PHASE_3_DESIGN_DECISIONS.md M-9; Phase 3 S2): drops
+    exactly the Phase 3 objects (via _r012_protection_journal) and the schema_version row 12, so a
+    Phase 2 (v11) build accepts the database again. Every trading table and every v11 table
+    (broker_reads included) is untouched.
+
+    Refused, writing nothing and taking no backup, unless this code registers v12 as
+    phase3_protection_journal, the history is exactly v1..v12 of this code, the Phase 3 objects are
+    exactly v12's (unique GTT index included) and they hold no data: no journal row, no resolution row
+    (an orphan one included), no protection_state value, no protection_* event. Once they hold data,
+    the way back is restoring a verified backup. On a build without v12 it always refuses. Exposed
+    as `python -m backend.db_maintenance rollback-schema-v12 --confirm`.
+
+    The caller must hold the instance lock. A file database is backed up first (verified,
+    <db>.pre_rollback_v12_bak). One transaction: an interruption leaves the v12 database as it was."""
+    if conn.in_transaction:
+        raise SchemaRollbackRefused("SCHEMA_ROLLBACK_REFUSED: the connection has an open transaction.")
+    history = [(h["version"], h["migration_name"]) for h in migration_history(conn)]
+    expected = [(version, name) for version, name, _ in MIGRATIONS if version <= 12]
+    # The length and name checks matter: on a build without v12, `expected` is v1..v11 and a v11
+    # database would match it.
+    if len(expected) != 12 or expected[-1] != (12, _V12_NAME) or history != expected:
+        newest = history[-1] if history else None
+        registered = len(expected) == 12 and expected[-1] == (12, _V12_NAME)
+        raise SchemaRollbackRefused(
+            f"SCHEMA_ROLLBACK_REFUSED: the schema history must be exactly v1..v12 of this code; it ends at "
+            f"{newest}{'' if registered else ' and this build does not register migration 12'}. "
+            "Nothing was changed.")
+    try:
+        status = dark_protection_schema_status(conn)
+    except DarkSchemaRefused as e:
+        raise SchemaRollbackRefused(f"SCHEMA_ROLLBACK_REFUSED: {e} Nothing was changed.") from e
+    if status["state"] != "present" or not status["unique_gtt_index"]:
+        raise SchemaRollbackRefused(
+            f"SCHEMA_ROLLBACK_REFUSED: the Phase 3 objects are {status['state']} (unique GTT index "
+            f"{'present' if status['unique_gtt_index'] else 'missing'}), not exactly v12's. Nothing was changed.")
+    held = _protection_held_data(conn)
+    if any(held.values()):
+        raise SchemaRollbackRefused(
+            f"SCHEMA_ROLLBACK_REFUSED: the Phase 3 objects hold data ({held}); a rollback would delete it. "
+            "Restore a verified backup instead. Nothing was changed.")
+    backup = None
+    db_file = _database_file(conn)
+    if db_file is not None:
+        try:
+            backup = backup_database(conn, db_file.with_name(f"{db_file.name}.pre_rollback_v12_bak"))
+        except MigrationBackupFailed:
+            raise
+        except Exception as e:  # before any BEGIN: nothing was changed
+            raise MigrationBackupFailed(
+                f"DATABASE_MIGRATION_FAILED: the pre-rollback backup failed ({type(e).__name__}: {e}); nothing "
+                "was rolled back.") from e
+    previous_isolation = conn.isolation_level
+    foreign_keys_were_on = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+    conn.isolation_level = None
+    try:
+        violations_before = _foreign_key_violations(conn)
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Re-checked under the write lock: nothing may have been written since the checks above.
+            if any(_protection_held_data(conn).values()):
+                raise SchemaRollbackRefused("SCHEMA_ROLLBACK_REFUSED: the Phase 3 objects gained data; nothing "
+                                            "was changed.")
+            _r012_protection_journal(conn)
+            conn.execute("DELETE FROM schema_version WHERE version = 12")
+            if (_check_history(migration_history(conn)) != 11
+                    or dark_protection_schema_status(conn)["state"] != "absent"):
+                raise SchemaRollbackRefused("SCHEMA_ROLLBACK_REFUSED: the rollback did not reach schema v11.")
+            if _foreign_key_violations(conn) > violations_before:
+                raise SchemaRollbackRefused("SCHEMA_ROLLBACK_REFUSED: the rollback would add foreign key violations.")
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            logger.exception("event=schema_rollback.failed version=12 (rolled back)")
+            raise
+        finally:
+            conn.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys_were_on else 'OFF'}")
+    finally:
+        conn.isolation_level = previous_isolation
+    logger.warning("event=schema_rollback.applied from=12 to=11 backup=%s", backup.name if backup else None)
+    _note_schema_change(conn, "rollback_schema_v12")
+    return {"rolled_back_to": 11, "backup": str(backup) if backup else None}

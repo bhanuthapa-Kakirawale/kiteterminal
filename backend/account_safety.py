@@ -108,6 +108,8 @@ TICKET_REVIEW_CHANGED = "TICKET_REVIEW_CHANGED"
 TICKET_EVIDENCE_MISMATCH = "TICKET_EVIDENCE_MISMATCH"
 TICKET_REVIEW_NOT_APPLICABLE = "TICKET_REVIEW_NOT_APPLICABLE"
 KITE_REST_PROXY_REQUIRED = "KITE_REST_PROXY_REQUIRED"
+# Phase 2: the startup restriction (startup_reconciliation.derive_restriction) is not NORMAL.
+ACCOUNT_RESTRICTED = "ACCOUNT_RESTRICTED"
 
 VARIETY_REGULAR = "regular"
 VARIETY_AMO = "amo"
@@ -561,6 +563,11 @@ def check_live_critical_state(conn: sqlite3.Connection, account_id: int, now: da
                               f"The live trading state could not be evaluated ({type(e).__name__}: {e}) — no new "
                               f"live entry is sent. Exits are still allowed.", http_status=503)]
     failures = []
+    # Phase 2: the startup restriction has its own code. A known state, like RECONCILIATION_CRITICAL
+    # (409), and never permanent: the ticket stays approvable once every reason clears.
+    # Listed after the existing failures, so their codes stay the primary error_code.
+    restricted = [b for b in blockers if b["code"] == live_preflight.RESTRICTION_CODE]
+    blockers = [b for b in blockers if b["code"] != live_preflight.RESTRICTION_CODE]
     critical = [b for b in blockers if b["code"] in live_preflight.CONFIRM_TIME_CRITICAL_CODES]
     unverified = [b for b in blockers if b["code"] not in live_preflight.CONFIRM_TIME_CRITICAL_CODES]
     if critical:
@@ -573,6 +580,10 @@ def check_live_critical_state(conn: sqlite3.Connection, account_id: int, now: da
                                       "right now: " + " ".join(b["message"] for b in unverified)
                                       + " Nothing was executed; exits are still allowed. See Live Readiness.",
                                       http_status=503))
+    if restricted:
+        failures.append(SafetyFailure(ACCOUNT_RESTRICTED,
+                                      "Live entry refused — " + " ".join(b["message"] for b in restricted)
+                                      + " Nothing was executed."))
     return failures
 
 

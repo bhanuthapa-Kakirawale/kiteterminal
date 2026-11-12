@@ -863,26 +863,39 @@ def test_the_tick_socket_still_delivers_events_before_ticks(env, monkeypatch):
 # ---------------------------------------------------------------- migration v5 and the maintenance CLI
 
 def test_migration_v5_creates_the_live_readiness_table_idempotently(env):
+    import schema_builds
     from backend import db
-    assert db.LATEST_SCHEMA_VERSION == 10   # SEC-1 added v6, P1-D v7 + v8, DMB inbox v9, integrity audit v10
+    # SEC-1 added v6, P1-D v7 + v8, DMB inbox v9, integrity audit v10, Phase 2 v11 (v12: the registration pin)
+    assert db.LATEST_SCHEMA_VERSION == schema_builds.expected_latest()
     names = {r["name"] for r in _rows(env, "SELECT name FROM sqlite_master WHERE type='table'")}
     assert "live_readiness" in names
     env.db.init_db()
     env.db.init_db()
-    assert env.db.last_init == {"applied_migrations": [], "startup_row_changes": 0, "schema_version": 10}
+    assert env.db.last_init == {"applied_migrations": [], "startup_row_changes": 0,
+                                "schema_version": schema_builds.expected_latest()}
 
 
+@pytest.mark.v11_database
 def test_maintenance_migrate_applies_the_pending_migration(env, capsys):
+    """`migrate` as the Phase 2 build runs it: on a build that registers v12 it never applies v12 (the
+    authorization gate, test_v12_authorization_gate test_05), so the v4 -> v11 path is the Phase 2 build's."""
     from backend import db_maintenance
+    from schema_builds import phase2_build
     _exec(env, "DROP TABLE live_readiness")
     _exec(env, "DELETE FROM schema_version WHERE version >= 5")   # v5, and SEC-1's v6 + P1-D's v7 on top
-    assert db_maintenance.main(["migrate", "--db", str(env.db.DB_PATH)]) == 0
-    out = capsys.readouterr().out
-    assert "v4 -> v10" in out and "applied migrations:  [5, 6, 7, 8, 9, 10]" in out
-    assert "live_readiness" in {r["name"] for r in _rows(env, "SELECT name FROM sqlite_master")}
-    assert list(env.tmp_path.glob("test.db.pre_schema_v10_bak*"))            # the verified automatic backup
-    assert db_maintenance.main(["migrate", "--db", str(env.db.DB_PATH)]) == 0
-    assert "applied migrations:  none" in capsys.readouterr().out
+    import schema_builds
+    schema_builds.as_legacy_installation(env.db)   # an old installation: no installation record yet (Phase C)
+    # Phase 2: migrate takes the instance lock; "STOP THE APP FIRST" - here, the env's ownership grant.
+    from conftest import release_write_authority
+    release_write_authority()
+    with phase2_build(env.db):
+        assert db_maintenance.main(["migrate", "--db", str(env.db.DB_PATH)]) == 0
+        out = capsys.readouterr().out
+        assert "v4 -> v11" in out and "applied migrations:  [5, 6, 7, 8, 9, 10, 11]" in out
+        assert "live_readiness" in {r["name"] for r in _rows(env, "SELECT name FROM sqlite_master")}
+        assert list(env.tmp_path.glob("test.db.pre_schema_v11_bak*"))            # the verified automatic backup
+        assert db_maintenance.main(["migrate", "--db", str(env.db.DB_PATH)]) == 0
+        assert "applied migrations:  none" in capsys.readouterr().out
 
 
 def test_maintenance_migrate_refuses_without_the_encryption_key(env, monkeypatch, capsys):
@@ -891,6 +904,8 @@ def test_maintenance_migrate_refuses_without_the_encryption_key(env, monkeypatch
     monkeypatch.setattr(crypto, "ENV_PATH", env.tmp_path / "missing.env")
     _exec(env, f"DELETE FROM schema_version WHERE version = {env.db.LATEST_SCHEMA_VERSION}")
     before = _db_digest(env)
+    from conftest import release_write_authority
+    release_write_authority()   # Phase 2: migrate takes the instance lock ("STOP THE APP FIRST")
     assert db_maintenance.main(["migrate", "--db", str(env.db.DB_PATH)]) == 2
     assert "refusing to migrate" in capsys.readouterr().err
     assert _db_digest(env) == before

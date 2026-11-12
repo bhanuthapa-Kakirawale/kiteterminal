@@ -21,8 +21,8 @@ import time
 from datetime import datetime, timezone
 
 from backend import (
-    account_safety, db, kite_client, obs, ohlc_integrity, reconciliation, trading_calendar, version, worker_health,
-    workers,
+    account_safety, db, instance_lock, kite_client, obs, ohlc_integrity, reconciliation, startup_reconciliation,
+    trading_calendar, version, worker_health, workers,
 )
 from backend.accounts import get_default_account
 
@@ -189,8 +189,34 @@ def readiness(now: datetime | None = None) -> dict:
     if not obs.file_logging_status()["enabled"]:
         warnings.append({"code": "LOG_FILE_DISABLED", "message": "Logs go to the console only."})
 
+    # Phase 2: database ownership is a blocker (nothing can be written without it); the startup
+    # restriction is a warning here (it refuses only new live entries, at confirmation).
+    code = instance_lock.refusal_code()
+    if code is not None:
+        blockers.append({"code": code, "message": instance_lock.refusal_message(code)})
+    for warning in instance_lock.status()["warnings"]:
+        warnings.append({"code": "DATABASE_IN_SYNCED_FOLDER", "message": warning})
+    restriction = _restriction(account["id"])
+    if restriction["state"] != startup_reconciliation.NORMAL:
+        warnings.append({"code": "ACCOUNT_RESTRICTED",
+                         "message": f"RESTRICTED ({startup_reconciliation.describe(restriction['reasons'])}): no new "
+                                    "live entry until every reason clears. Exits are not affected."})
+
     return {"ready": not blockers, "execution_mode": mode, "blockers": blockers, "warnings": warnings,
             "checked_at": _now_utc(), "market_open_required": False}
+
+
+def _restriction(account_id: int) -> dict:
+    try:
+        return startup_reconciliation.status(account_id)
+    except Exception as e:  # diagnostics never raise; an unevaluable restriction is RESTRICTED
+        return {"state": startup_reconciliation.RESTRICTED, "reasons": [f"UNEVALUABLE: {type(e).__name__}"],
+                "last_run": None}
+
+
+def _instance(account_id: int) -> dict:
+    """Phase 2: who owns the database, the fencing epoch, the heartbeat, and the startup restriction."""
+    return {**instance_lock.status(), "restriction": _restriction(account_id)}
 
 
 def _has_table(conn: sqlite3.Connection, name: str) -> bool:
@@ -218,6 +244,7 @@ def report(refresh_integrity: bool = False, now: datetime | None = None) -> dict
         "schema": schema,
         "database_integrity": integrity_status(refresh=refresh_integrity),
         "startup": dict(db.last_init),
+        "instance": _instance(account["id"]),
         "workers": worker_view,
         "last_cycles": {name: worker_view.get(name, {}).get("last_ok_at")
                         for name in ("order_monitor", "reconciliation", "trailing", "data_jobs", "automation")},

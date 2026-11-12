@@ -315,6 +315,10 @@ def test_a_new_kite_login_ends_every_manual_review(env, market_open, clock, monk
     assert _calls_since(env, mark) == []
     _assert_untouched_pending(env, t["id"])
     _re_review(env, t["id"])
+    # Phase 2: new live entries also wait for a Stage 1 run that passes after the new login (the app
+    # starts it on login; tests run it explicitly).
+    from backend import startup_reconciliation
+    assert startup_reconciliation.run_stage1("login")["outcome"] == "passed"
     r = _confirm(env, t["id"])
     assert r.status_code == 200 and r.json()["data"]["status"] == "executed", r.text
 
@@ -612,7 +616,8 @@ def test_s9b_exit_remains_possible_while_every_entry_control_and_a_stale_review_
     _block_every_entry_control(live, monkeypatch)
     stale = _stale_manual_entry(live)
     r = _confirm(live, stale)
-    assert _codes(r) == ["TRADING_LOCKED", "LIVE_PREREQUISITE_MISSING", "DAILY_LOSS_LIMIT", "DAILY_ENTRY_LIMIT",
+    assert _codes(r) == ["TRADING_LOCKED", "LIVE_PREREQUISITE_MISSING", "ACCOUNT_RESTRICTED",  # Phase 2
+                         "DAILY_LOSS_LIMIT", "DAILY_ENTRY_LIMIT",
                          "MAX_NOTIONAL_EXCEEDED", "TICKET_REVIEW_REQUIRED", "BROKER_CIRCUIT_OPEN",
                          "AMO_CONFIRMATION_REQUIRED"]
     _new_kite_session(live)

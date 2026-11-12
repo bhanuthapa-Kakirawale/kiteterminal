@@ -7,6 +7,10 @@ buy exclude pledged collateral; the requirement is Kite's figure plus charges, n
 be the notional (the notional is only a floor for cash-equity CNC). Missing, stale or
 inconsistent data refuses. Kite's RMS stays the final broker-side control.
 
+M3: the order is never priced at 0. A LIMIT entry is sized at its limit price; a MARKET entry at
+the instrument's upper circuit limit from a fresh quote (the worst price a MARKET BUY can fill
+at), asked of Kite as the equivalent LIMIT. Charges are required and positive, never defaulted.
+
 Behind the hard gate (lifted in-test by conftest `env`). FakeKite and scratch databases only.
 """
 
@@ -22,6 +26,9 @@ from test_baseline_api import _insert_ticket, _manual_ticket
 
 ORDER_VALUE = 5 * 3000.0  # 5 TCS at the FakeKite LTP
 CHARGES = round(ORDER_VALUE * 0.001, 2)
+UPPER_CIRCUIT = 3600.0    # FakeKite's default band: LTP + 20%
+WORST_VALUE = 5 * UPPER_CIRCUIT  # what a MARKET BUY of 5 can cost at most
+WORST_CHARGES = round(WORST_VALUE * 0.001, 2)
 
 
 def _create(env, **overrides) -> dict:
@@ -62,9 +69,13 @@ def test_01_sufficient_funds_pass_with_kites_figure_for_the_exact_order(env, mar
     assert env.kite.calls_to("margins")[-1] == {"segment": "equity"}
     (call,) = env.kite.calls_to("order_margins")
     (params,) = call["params"]
+    # M3: never price 0 — the MARKET entry is asked about as a LIMIT at its upper circuit, from a fresh quote.
+    assert env.kite.calls_to("quote")[-1] == {"keys": ["NSE:TCS"]}
     assert params == {"exchange": "NSE", "tradingsymbol": "TCS", "transaction_type": "BUY", "variety": "regular",
-                      "product": "CNC", "order_type": "MARKET", "quantity": 5, "price": 0}
+                      "product": "CNC", "order_type": "LIMIT", "quantity": 5, "price": UPPER_CIRCUIT}
     assert len(env.kite.calls_to("place_order")) == 1
+    # The order actually sent is still the ticket's own MARKET order.
+    assert env.kite.calls_to("place_order")[0]["order_type"] == "MARKET"
 
 
 def test_02_insufficient_live_balance_refuses(env, market_open):
@@ -84,7 +95,7 @@ def test_03_pledged_collateral_never_funds_a_delivery_buy():
 
 
 def test_04_charges_are_part_of_the_requirement(env, market_open):
-    env.kite.margins_live_balance = ORDER_VALUE + CHARGES / 2  # covers the order, not its charges
+    env.kite.margins_live_balance = WORST_VALUE + WORST_CHARGES / 2  # covers the order, not its charges
     t, r = _live_confirm(env)
     _assert_refused(env, t, r, "INSUFFICIENT_FUNDS", 409)
 
@@ -131,26 +142,38 @@ def test_08_exits_never_need_margin(env, market_open):
 # ---------------------------------------------------------------- the evaluation (unit)
 
 class _Broker:
-    def __init__(self, funds=None, rows=None, fail=None):
+    def __init__(self, funds=None, rows=None, fail=None, quotes=None):
         self.funds = funds if funds is not None else {
             "enabled": True, "net": 100_000.0,
             "available": {"live_balance": 100_000.0, "collateral": 0.0, "cash": 100_000.0}}
         self.rows = rows
         self.fail = fail or {}
+        self.quotes = quotes
+        self.sent = []
 
     def margins(self, segment=None):
         if "margins" in self.fail:
             raise self.fail["margins"]
         return self.funds
 
+    def quote(self, keys):
+        if "quote" in self.fail:
+            raise self.fail["quote"]
+        if self.quotes is not None:
+            return self.quotes
+        return {k: {"last_price": 3000.0, "upper_circuit_limit": UPPER_CIRCUIT, "lower_circuit_limit": 2400.0}
+                for k in keys}
+
     def order_margins(self, params):
         if "order_margins" in self.fail:
             raise self.fail["order_margins"]
+        self.sent.append(params)
         if self.rows is not None:
             return self.rows
         p = params[0]
-        return [{"tradingsymbol": p["tradingsymbol"], "exchange": p["exchange"], "total": ORDER_VALUE,
-                 "charges": {"total": CHARGES}}]
+        value = p["price"] * p["quantity"]
+        return [{"tradingsymbol": p["tradingsymbol"], "exchange": p["exchange"], "total": value,
+                 "charges": {"total": round(value * 0.001, 2)}}]
 
 
 def _ticket(**fields):
@@ -163,14 +186,16 @@ def _ticket(**fields):
 def test_09_pass_reports_every_figure():
     out = margin_preflight.evaluate(_Broker(), _ticket(), "regular", 3000.0)
     assert out["verdict"] == "PASS"
-    assert out["available"] == 100_000.0 and out["order_margin"] == ORDER_VALUE and out["charges"] == CHARGES
-    assert out["required"] == ORDER_VALUE + CHARGES and out["order_value"] == ORDER_VALUE
+    assert out["available"] == 100_000.0 and out["order_margin"] == WORST_VALUE and out["charges"] == WORST_CHARGES
+    assert out["required"] == WORST_VALUE + WORST_CHARGES and out["order_value"] == WORST_VALUE
+    assert (out["margin_price"], out["margin_price_basis"], out["reference_price"]) == (
+        UPPER_CIRCUIT, "upper_circuit", 3000.0)
 
 
 def test_10_a_broker_figure_below_the_cash_equity_notional_uses_the_notional():
-    rows = [{"tradingsymbol": "TCS", "exchange": "NSE", "total": ORDER_VALUE / 5, "charges": {"total": 0}}]
+    rows = [{"tradingsymbol": "TCS", "exchange": "NSE", "total": WORST_VALUE / 5, "charges": {"total": 1.0}}]
     out = margin_preflight.evaluate(_Broker(rows=rows), _ticket(), "regular", 3000.0)
-    assert out["notional_floor_applied"] is True and out["required"] == ORDER_VALUE
+    assert out["notional_floor_applied"] is True and out["required"] == WORST_VALUE + 1.0
 
 
 @pytest.mark.parametrize("broker", [
@@ -190,12 +215,27 @@ def test_10_a_broker_figure_below_the_cash_equity_notional_uses_the_notional():
     _Broker(rows=[{"tradingsymbol": "TCS", "exchange": "NSE", "total": 0}]),
     _Broker(rows=[{"tradingsymbol": "TCS", "exchange": "NSE", "total": None}]),
     _Broker(rows=[{"tradingsymbol": "TCS", "exchange": "NSE", "total": 10.0, "charges": {"total": -1}}]),
+    _Broker(rows=[{"tradingsymbol": "TCS", "exchange": "NSE", "total": WORST_VALUE}]),
+    _Broker(rows=[{"tradingsymbol": "TCS", "exchange": "NSE", "total": WORST_VALUE, "charges": {}}]),
+    _Broker(rows=[{"tradingsymbol": "TCS", "exchange": "NSE", "total": WORST_VALUE, "charges": {"total": 0}}]),
+    _Broker(rows=[{"tradingsymbol": "TCS", "exchange": "NSE", "total": WORST_VALUE, "charges": {"total": "18"}}]),
+    _Broker(fail={"quote": NetworkException("timeout")}),
+    _Broker(quotes={}),
+    _Broker(quotes={"NSE:TCS": {"last_price": 3000.0}}),
+    _Broker(quotes={"NSE:TCS": {"last_price": 3000.0, "upper_circuit_limit": 0}}),
+    _Broker(quotes={"NSE:TCS": {"last_price": 3000.0, "upper_circuit_limit": None}}),
+    _Broker(quotes={"NSE:TCS": {"last_price": 3000.0, "upper_circuit_limit": 2999.0}}),
+    _Broker(quotes={"NSE:TCS": {"last_price": 0, "upper_circuit_limit": 3600.0}}),
+    _Broker(quotes={"NSE:TCS": {"last_price": math.nan, "upper_circuit_limit": 3600.0}}),
+    _Broker(quotes={"NSE:INFY": {"last_price": 1500.0, "upper_circuit_limit": 1800.0}}),
     _Broker(rows=[{"tradingsymbol": "TCS", "exchange": "NSE", "total": 1}, {"tradingsymbol": "TCS",
                                                                          "exchange": "NSE", "total": 1}]),
 ], ids=["funds-error", "order-margin-error", "writes-disabled", "segment-disabled", "live-balance-missing",
         "live-balance-string", "net-infinite", "collateral-negative", "available-missing", "funds-not-object",
         "no-rows", "other-symbol", "other-exchange", "total-zero", "total-missing", "charges-negative",
-        "two-rows"])
+        "charges-missing", "charges-total-missing", "charges-zero", "charges-string", "quote-error", "quote-empty",
+        "circuit-missing", "circuit-zero", "circuit-none", "circuit-below-ltp", "ltp-zero", "ltp-nan",
+        "quote-other-instrument", "two-rows"])
 def test_11_unavailable_or_inconsistent_margin_data_fails_closed(broker):
     out = margin_preflight.evaluate(broker, _ticket(), "regular", 3000.0)
     assert out["verdict"] == "MARGIN_DATA_UNAVAILABLE", out
@@ -219,7 +259,7 @@ def test_13_preview_shows_funds_margin_charges_and_cap_for_a_live_entry(env, mar
     t = _create(env)
     data = env.client.get(f"/api/tickets/{t['id']}/margin-preview").json()["data"]
     assert data["applicable"] is True and data["verdict"] == "PASS"
-    assert data["order_value"] == ORDER_VALUE and data["charges"] == CHARGES
+    assert data["order_value"] == WORST_VALUE and data["charges"] == WORST_CHARGES
     assert data["max_order_notional"] is not None and data["available"] > 0
     assert env.kite.calls_to("place_order") == []
 
@@ -249,3 +289,53 @@ def test_15_final_gate_unit_runs_the_margin_check_last(env, monkeypatch):
         conn.close()
     assert decision.passed, decision.failures
     assert seen == [3000.0]  # called with the LTP the price checks used
+
+
+# ---------------------------------------------------------------- M3: pricing, never 0
+
+def test_16_a_market_entry_is_never_priced_at_zero():
+    broker = _Broker()
+    out = margin_preflight.evaluate(broker, _ticket(), "regular", 3000.0)
+    assert out["verdict"] == "PASS"
+    [[params]] = broker.sent
+    assert params["price"] == UPPER_CIRCUIT and params["price"] > 0 and params["order_type"] == "LIMIT"
+
+
+def test_17_a_limit_entry_is_sized_at_its_own_limit_price_without_a_quote():
+    broker = _Broker(fail={"quote": AssertionError("a LIMIT entry needs no quote")})
+    out = margin_preflight.evaluate(broker, _ticket(entry_order_type="LIMIT", entry_price=3010.0), "regular", None)
+    assert out["verdict"] == "PASS" and out["margin_price_basis"] == "limit_price"
+    [[params]] = broker.sent
+    assert (params["order_type"], params["price"]) == ("LIMIT", 3010.0)
+
+
+@pytest.mark.parametrize("price", [None, 0, -1.0, math.inf, "3000"])
+def test_18_a_limit_entry_without_a_usable_price_fails_closed(price):
+    out = margin_preflight.evaluate(_Broker(), _ticket(entry_order_type="LIMIT", entry_price=price), "regular", None)
+    assert out["verdict"] == "MARGIN_DATA_UNAVAILABLE", out
+
+
+@pytest.mark.parametrize("quantity", [0, -5, None, 2.5, True])
+def test_19_an_unusable_quantity_fails_closed(quantity):
+    out = margin_preflight.evaluate(_Broker(), _ticket(quantity=quantity), "regular", 3000.0)
+    assert out["verdict"] == "MARGIN_DATA_UNAVAILABLE", out
+
+
+def test_20_the_callers_ltp_never_replaces_the_worst_case_price():
+    # A MARKET order can fill above the LTP the caller just read: the circuit, not the LTP, sizes it.
+    out = margin_preflight.evaluate(_Broker(), _ticket(), "regular", 3000.0)
+    assert out["order_value"] == WORST_VALUE > 5 * 3000.0
+
+
+def test_21_funds_between_the_expected_and_the_worst_case_value_are_refused():
+    funds = {"enabled": True, "net": 16_000.0, "available": {"live_balance": 16_000.0, "collateral": 0.0}}
+    out = margin_preflight.evaluate(_Broker(funds=funds), _ticket(), "regular", 3000.0)
+    assert out["verdict"] == "INSUFFICIENT_FUNDS"        # 15,000 at the LTP would have passed
+
+
+def test_22_writes_stay_disabled_and_the_gate_fails_closed():
+    """The order-margin POST refused by the writes switch is not worked around: the verdict is
+    MARGIN_DATA_UNAVAILABLE, never a guessed figure."""
+    broker = _Broker(fail={"order_margins": BrokerWritesDisabled("order.margins", "POST")})
+    failures, evidence = margin_preflight.check(broker, _ticket(), "regular", 3000.0)
+    assert [f.code for f in failures] == ["MARGIN_DATA_UNAVAILABLE"] and evidence["required"] is None

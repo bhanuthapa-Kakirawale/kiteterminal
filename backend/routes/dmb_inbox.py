@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from backend import dmb_inbox, kite_client
 from backend.accounts import get_trading_account
+from backend.instance_lock import WRITE_AUTHORITY
 
 router = APIRouter()
 
@@ -85,7 +86,7 @@ def get_imports(account_id: int = Depends(require_inbox_reader)):
     return {"data": dmb_inbox.list_imports(account_id)}
 
 
-@router.post("/api/dmb-inbox/imports", status_code=201)
+@router.post("/api/dmb-inbox/imports", status_code=201, dependencies=WRITE_AUTHORITY)
 def post_import(req: ImportRequest, s: dict = Depends(require_inbox_session)):
     result = dmb_inbox.import_bundle(s["account_id"], s["session_id"], req.session_date, req.bundle_id)
     if result["status"] == "REJECTED":
@@ -106,27 +107,27 @@ def get_item(item_id: int, account_id: int = Depends(require_inbox_reader)):
     return {"data": _run(dmb_inbox.get_item, account_id, item_id), "disclaimer": dmb_inbox.DISCLAIMER}
 
 
-@router.post("/api/dmb-inbox/items/{item_id}/dismiss")
+@router.post("/api/dmb-inbox/items/{item_id}/dismiss", dependencies=WRITE_AUTHORITY)
 def post_dismiss(item_id: int, req: DismissRequest, s: dict = Depends(require_inbox_session)):
     return {"data": _run(dmb_inbox.dismiss, s["account_id"], item_id, s["session_id"], req.reason)}
 
 
-@router.post("/api/dmb-inbox/items/{item_id}/notes", status_code=201)
+@router.post("/api/dmb-inbox/items/{item_id}/notes", status_code=201, dependencies=WRITE_AUTHORITY)
 def post_note(item_id: int, req: NoteRequest, s: dict = Depends(require_inbox_session)):
     return {"data": _run(dmb_inbox.add_note, s["account_id"], item_id, s["session_id"], req.text)}
 
 
-@router.post("/api/dmb-inbox/items/{item_id}/research-watchlist")
+@router.post("/api/dmb-inbox/items/{item_id}/research-watchlist", dependencies=WRITE_AUTHORITY)
 def post_watch(item_id: int, req: WatchRequest, s: dict = Depends(require_inbox_session)):
     return {"data": _run(dmb_inbox.set_research_watch, s["account_id"], item_id, s["session_id"], req.watched)}
 
 
-@router.post("/api/dmb-inbox/items/{item_id}/start-ticket")
+@router.post("/api/dmb-inbox/items/{item_id}/start-ticket", dependencies=WRITE_AUTHORITY)
 def post_start_ticket(item_id: int, s: dict = Depends(require_inbox_session)):
     return {"data": _run(dmb_inbox.start_ticket, s["account_id"], item_id, s["session_id"])}
 
 
-@router.post("/api/dmb-inbox/items/{item_id}/ticket-link", status_code=201)
+@router.post("/api/dmb-inbox/items/{item_id}/ticket-link", status_code=201, dependencies=WRITE_AUTHORITY)
 def post_ticket_link(item_id: int, req: LinkTicketRequest, s: dict = Depends(require_inbox_session)):
     return {"data": _run(dmb_inbox.link_ticket, s["account_id"], item_id, s["session_id"], req.ticket_id,
                          req.start_event_id, req.handoff_nonce)}

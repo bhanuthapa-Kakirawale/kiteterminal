@@ -111,6 +111,20 @@ exchanges nothing (P2-G).
   built from `tests/fixtures/pre_pk22_schema.sql`: the exact DDL that the
   pre-PK-22 code (commit `6446c79`) produced, captured from an empty temporary
   database. It never uses the developer's local backup.
+- **No real configuration, no network (Phase 0 / F-0).** The same guard also
+  refuses the repository's real `.env` (and any `.env.*` beside it, except the
+  `.env.example` template), `backend/.env` and `backend/ui_prefs.json`, plus
+  any `socket.connect` beyond loopback. Before anything imports
+  `backend.main` (whose `load_dotenv()` runs at import), `conftest.py`
+  replaces python-dotenv's loaders: implicit discovery loads nothing, an
+  explicit protected path is refused, an explicit temporary file still loads.
+  Every `KITE_*` variable inherited from the shell is removed, and a session
+  fixture points `crypto.ENV_PATH` / `ui_prefs.PREFS_PATH` at temporary files.
+  Each refusal is logged. One outside `real_data_guard.expected()` fails the
+  session even if application code swallowed it, and the run ends with a
+  "test isolation" summary. `tests/test_harness_isolation.py` proves all of
+  this, including a child process showing that `import backend.main` opens no
+  `.env` and no database. `tests/demo_server.py` installs the same guard.
 - **`tests/conftest.py`** — the `env` fixture spins up a fresh throwaway
   SQLite database per test, a fresh encryption key, 5 seeded instruments, an
   active session, and monkeypatches `kite_client.get_kite` to return a
@@ -372,6 +386,154 @@ manually (see §2):
 - `/ws/ticks`: overflow (PK-22), event-before-tick ordering and ending on a
   closed tab (LIVE-0) are tested; a live KiteTicker feed end-to-end is not.
 - No load or rate-limit test for the Kite historical-data queue.
+
+### 1.6 Phase 2: single instance, fencing and the startup restriction
+
+Details: `docs/PHASE_2_IMPLEMENTATION_REPORT.md`; design `docs/PHASE_2_DESIGN_REVIEW.md` §10.
+
+- **The `env` fixture now owns its tmp database.**
+  - It takes the real instance lock on `tmp_path/test.db.instance.lock` and
+    runs the real fenced takeover (`conftest.grant_write_authority`).
+  - It records a passed Stage 1 run (`conftest.seed_stage1_passed`), so the
+    account derives NORMAL. `make_live_ready` re-seeds after it changes the
+    login time.
+  - It fences the FakeKite (`kite_client.fence_broker`) and releases the lock
+    after the test.
+  - A login or resume that would start Stage 1 in the background is recorded
+    in `env.stage1_requests` instead.
+- **Fail closed without the grant.** A test without `env` has no write
+  authority:
+  - every write route answers 503;
+  - SDK and FakeKite broker writes are refused (`InstanceNotOwner`);
+  - background loops return at once.
+
+  Tests of the Kite client itself use the database-free `owner_process`
+  fixture.
+- **Never call `monkeypatch.undo()`** in an `env` test. That Phase 1 lesson
+  still applies.
+- **New suites:**
+  - `test_schema_v11.py`: the migration, idempotency, refusals, interruption
+    (including `os._exit` in a child process) and rollback;
+  - `test_instance_lock.py`: L1–L6, E1–E4, S1–S2, C1–C2, heartbeat, R8, the
+    loops;
+  - `test_broker_write_fence.py`: E5/E6, the login refusal;
+  - `test_write_authority_routes.py`: route completeness, 503 for every write
+    route;
+  - `test_startup_reconciliation.py`: R1–R7, restriction and release, exits
+    while RESTRICTED, F1;
+  - `test_cli_instance_lock.py`: the CLI audit.
+- **Child processes** run `tests/instance_lock_child.py`, which installs the
+  Phase 0 guard before any backend import.
+- **WIN-INT** (not in the suite; run by hand on a controlled Windows machine
+  with the app stopped): `python tests/winint_phase2.py l3-subst X:`,
+  `l6-share \\host\share\dir`, `r8-sleep` and `l2-timing`. The suite skips the
+  corresponding placeholders with a `WIN-INT PENDING` reason.
+- **Full regression** (sequential, the same standing exclusions as Phases 0
+  and 1):
+  `python -m pytest -rs -p no:cacheprovider --ignore=tests/test_calendar_parity.py --ignore=tests/test_dmb_handoff_roundtrip.py`.
+
+### 1.7 Phase 3 S3: the multi-process harness and the shared FakeKite
+
+Details: `docs/PHASE_3_S3_IMPLEMENTATION_REPORT.md`.
+
+- **One broker for several processes.** `tests/shared_fake_kite.py` runs one
+  FakeKite in a child process on `127.0.0.1` (any other host is refused).
+  - It applies calls one at a time and logs each one: the sending pid, its
+    in-memory epoch, whether the effect was applied, and what happened to the
+    response.
+  - Its client, `RemoteFakeKite`, has FakeKite's method surface and nothing
+    else. Children fence it with `kite_client.fence_broker`.
+  - Callables cannot cross a process boundary, so one-shot faults replace
+    FakeKite's hooks: `raise_before`, `accept_then_raise`, `accept_then_drop`,
+    `accept_then_hold`, `accept_then_malformed` and `hold_before`. Gates
+    release themselves after `max_hold_seconds`.
+- **Application children.** `tests/mp_app_child.py` is a real application
+  process driven by JSON-line commands:
+  - start, takeover, heartbeat (also as a thread), fenced and unfenced writes;
+  - broker calls, Stage 1, crash, barrier parks, clock offsets;
+  - a lock bypass (a different lock file for the same database).
+
+  Timing is scaled in the children only: heartbeat 0.2 s, busy timeout 1 s.
+  The lease stays at 15 s, the schema minimum.
+- **Orchestration and cleanup.** `tests/mp_harness.py` and its `mp` fixture
+  handle every child.
+  - Reader threads drain stdout and stderr, and every wait has a deadline.
+  - Teardown runs exit → terminate → kill, closes the Job Object, reaps every
+    descendant from a Toolhelp process snapshot, and asserts that no process
+    is left alive.
+  - On Windows a venv's `python.exe` is a launcher that runs the real
+    interpreter outside the Job. `Child.pid` is therefore the interpreter's
+    own pid, and `kill_hard` and `suspend` act on it.
+- **Guard in every child.** Every S3 child imports `tests/child_bootstrap.py`
+  first, which installs the Phase 0 guard and writes a JSON guard report.
+  - The `mp` fixture fails a test whose child reports an unexpected refusal or
+    a protected path.
+  - The terminal summary adds a `child processes (S3 harness)` line. The
+    session fails on any unexpected child refusal, protected open, missing
+    report or orphan process.
+- **Suites:**
+  - `test_mp_harness_selftest.py`: H1–H16, the harness itself;
+  - `test_mp_coordination.py`: MP-L1–L5, E1–E5, S1–S4, C1, F2L, D1–D3, W2, W6;
+  - `test_fake_kite_models_s3.py`: the new opt-in FakeKite models (rollover,
+    repeated modify/delete semantics, placement refusal before visibility, a
+    DDPI-rejected trigger, a duplicate create, a hidden triggered order,
+    pruned and partial listings).
+- **Residual tests.** Tests named `test_residual_*` pin today's disclosed
+  residual behaviour (an unfenced write after a takeover; a stale owner's send
+  before it notices). They are not safety properties. The stage that closes a
+  residual must update them deliberately.
+- **Models only.** The FakeKite models and fault modes are not verified Kite
+  behaviour; broker evidence is Phase 9. Run the S3 suites with the real
+  application stopped: isolation does not depend on it, but the timing bounds do.
+- **Focused run:**
+  `python -m pytest -rs -p no:cacheprovider -o faulthandler_timeout=300 tests/test_mp_harness_selftest.py tests/test_fake_kite_models_s3.py tests/test_mp_coordination.py`.
+
+### 1.8 Migration v12: one suite, two builds
+
+Details: `docs/PHASE_3_V12_REGISTRATION_REMEDIATION_REPORT.md`.
+
+The suite runs unchanged on two builds:
+- today's build, where v12 is prepared but not registered;
+- the build that registers v12.
+
+`tests/schema_builds.py` makes that possible:
+
+- **The registration pin.** `V12_REGISTERED_IN_THIS_BUILD` is the only registration state a test asserts. Every "latest schema version" test reads `schema_builds.expected_latest()`. The registration diff flips the pin.
+- **Builds.**
+  - `phase2_build(db)` runs as `MIGRATIONS[:11]`.
+  - `registered_build(db)` adds the exact final entry, the late-bound `db._migration_v12_protection_journal`; it does nothing on a build that already registers v12.
+  - Both restore the globals by hand. Never use `monkeypatch.undo()`, which would also undo env's `DB_PATH`.
+- **Databases.**
+  - `@pytest.mark.v11_database`, or the `v11_env` fixture, makes `env` create its temporary database with the Phase 2 build: exactly v11, on either build.
+  - Without the marker, a fresh `env` database is at this build's latest version, which is v12 once registered.
+  - `to_v11` and `to_v12` move env's database between versions the authorized way.
+  - `restart_old_database(db)` replaces `init_db()` after `as_pre_pk22_database`. Since the authorization gate, a start never applies v12 to a database holding data.
+- **The protection journal.** `protection_helpers.journal(env)` applies the dark schema on a v11 database. On a v12 database it checks that the v12 objects exist.
+- **Duplicate GTT ids.** Two tickets sharing a `kite_gtt_id` can exist only on a v11 database: v12's unique index forbids them. Tests that need that state carry `v11_database`. The index is never weakened.
+- **Validating the registration.** Before the registration is authorized, the registered build is validated in a throwaway copy of the repository's git-visible files, never in the repository. It contains no database, backup or `.env`. The exact diff is applied there and the full approved suite is run.
+- **New suites:**
+  - `test_rollback_v12_cli.py`: the `rollback-schema-v12` command;
+  - `test_migrate_v12_failure_paths.py`: disk space, the internal backup, failure after COMMIT, DD-6 inside the transaction;
+  - `test_db_restore_wal.py`: WAL and sidecar behaviour, `restore-backup`, and the naive-copy hazard;
+  - `test_gtt_unique_insertion.py`: duplicate broker GTT ids in `routes/tickets.py`.
+
+### 1.9 V12 final readiness suites
+
+Details and evidence: `output/audits/v12_final_readiness_2026-11-11/` (TEST_REPORT, FAULT_INJECTION_REPORT,
+MUTATION_TEST_REPORT).
+
+- **New suites:**
+  - `test_storage_classification.py`: the fixed-local-drive classifier. A FakeAdapter covers every category (removable, USB-on-fixed, UNC, `\\?\UNC`, mapped, subst, junction or symlink onto a share or another drive, traversal, cloud, unavailable, invalid, every API failure → UNKNOWN). Windows integration uses this machine's temp disk, a real junction, an unused drive letter and a UNC string with no network.
+  - `test_installation_state.py`: an evidence-based fresh install versus a deleted, zero-byte, empty, corrupt, replaced, re-created, moved or rewound database; `init-fresh` and `acknowledge-database`; the real `main.on_startup` order (the lock file comes first).
+  - `test_backup_verification.py`: the off-machine backup record (no contents), the logical digest, failure domains (the real same-disk refusal on this machine), the staleness and tampering refusals.
+  - `test_migrate_v12_hardening.py`: storage and installation checks before the lock; the mandatory `--offsite-record` with live re-verification; identity binding before and **inside** v12's transaction; the in-progress marker; audit read-back.
+  - `test_restore_fault_injection.py`: the 20 restore scenarios, with real crashes (`os._exit` in a child at `db_maintenance._checkpoint` points) and real I/O faults.
+  - `test_migrate_v12_fault_injection.py`: interrupts, DDL and unique-index failures, a partial state after a failed rollback, real post-commit defects, power loss before and after COMMIT, audit failures, never applying twice.
+- **The installation registry** lives in the user profile in production. The session fixture points `KT_INSTALLATION_REGISTRY_DIR` at a temp dir; child processes inherit it, since it is not a `KITE_*` name. `tests/real_data_guard.py` protects the real `%LOCALAPPDATA%\KiteTerminal`, and now also watches `os.rename`, `os.replace`, `os.remove` and `os.mkdir`.
+- **The off-machine record in tests.** `tests/offsite_helpers.py` makes it through the real `backup --dest` path. Only the storage *class* of the simulated external disk (removable disk 99) is faked, because the test machine has one physical disk. Every `migrate-v12` call in the suite goes through it.
+- **A schema rewound by hand** (an old database restarting on new code) must call `schema_builds.as_legacy_installation(db)`: a real upgrade has no installation record yet, while a rewound database *with* one is refused as `SCHEMA_REGRESSED`.
+- **Never `monkeypatch.undo()`** in a test that uses `env`: it also undoes env's `DB_PATH`. The guard then refuses the real database (as it did once during this work). Scope fault patches with `pytest.MonkeyPatch.context()`.
+- **Mutation testing** (`MUTATION_TEST_REPORT.md`) runs in an allowlist clone (`backend/`, `tests/`, `frontend/`, `pytest.ini`; never a database, backup, `.env` or prefs file). 16 mutations of the safety checks are applied one at a time; each must make its mapped tests fail, while the unmutated clone passes.
 
 ## 2. Manual Verification Checklist
 

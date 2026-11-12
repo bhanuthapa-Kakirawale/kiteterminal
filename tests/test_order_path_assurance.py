@@ -536,6 +536,9 @@ def test_22b_writes_disabled_emergency_exit_sends_no_sell(writes_disabled, wire,
     position = _insert_ticket(env.db, executed_at="2026-09-01 04:00:00", entry_fill_status="filled",
                               filled_price=3000.0, filled_quantity=5, filled_at="2026-09-01 04:00:05",
                               kite_order_id="250000000778")
+    # E3: the (real-client) broker holds what the app's position says.
+    _reply = wire.reply_for
+    wire.reply_for = lambda method, path: ([{"tradingsymbol": "TCS", "exchange": "NSE", "instrument_token": 2953217, "quantity": 5, "t1_quantity": 0}] if path == "/portfolio/holdings" else _reply(method, path))
     r = env.client.post("/api/kill-switch/emergency-exit-confirm", json={"confirmation_phrase": "EXIT ALL"})
     assert r.status_code == 200, r.text
     results = r.json()["data"]["results"]

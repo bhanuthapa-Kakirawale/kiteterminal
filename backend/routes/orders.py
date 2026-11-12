@@ -7,6 +7,7 @@ from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.kite_client import require_trading_account
 from backend.models import ExecutionModeRequest
+from backend.instance_lock import WRITE_AUTHORITY
 
 router = APIRouter()
 
@@ -54,7 +55,7 @@ def get_mode(kite: KiteConnect = Depends(require_trading_account)):
     return {"data": {"mode": execution.get_execution_mode()}}
 
 
-@router.post("/api/execution/mode")
+@router.post("/api/execution/mode", dependencies=WRITE_AUTHORITY)
 def set_mode(req: ExecutionModeRequest, kite: KiteConnect = Depends(require_trading_account)):
     """SEC-1: arming LIVE requires a fresh, broker-checked Live Readiness
     pass (read-only broker calls only). It may pass with the trading lock
@@ -96,6 +97,8 @@ def list_trades(kite: KiteConnect = Depends(require_trading_account)):
 @router.get("/api/gtts")
 def list_gtts(kite: KiteConnect = Depends(require_trading_account)):
     gtts = _call(kite.get_gtts)
+    from backend import gtt_observations
+    gtt_observations.record_book(gtts)
     gtt_ids = [g["id"] for g in gtts]
     _, by_gtt_id = _linked_ticket_map([], gtt_ids)
     for g in gtts:
@@ -103,7 +106,7 @@ def list_gtts(kite: KiteConnect = Depends(require_trading_account)):
     return {"data": gtts}
 
 
-@router.post("/api/orders/{order_id}/cancel")
+@router.post("/api/orders/{order_id}/cancel", dependencies=WRITE_AUTHORITY)
 def cancel_order(order_id: str, variety: str = "regular", kite: KiteConnect = Depends(require_trading_account)):
     """Phase 8 Part A.4: a prominent single-click cancel for a pending
     order — this did not exist anywhere in the app before this phase.
@@ -159,7 +162,7 @@ def cancel_order(order_id: str, variety: str = "regular", kite: KiteConnect = De
     }}
 
 
-@router.post("/api/gtts/{gtt_id}/cancel")
+@router.post("/api/gtts/{gtt_id}/cancel", dependencies=WRITE_AUTHORITY)
 def cancel_gtt(gtt_id: int, kite: KiteConnect = Depends(require_trading_account)):
     """Phase 8 Part A.4: cancels a GTT directly. Deliberately sets the
     linked ticket's kite_gtt_id to NULL rather than leaving it dangling —
@@ -171,25 +174,59 @@ def cancel_gtt(gtt_id: int, kite: KiteConnect = Depends(require_trading_account)
     would see the GTT gone and (per its Phase 6 logic for a triggered/
     deleted GTT) synthesize a fake fill and mark the position closed —
     wrong, since cancelling here means the position is still genuinely
-    open, just no longer protected."""
+    open, just no longer protected.
+
+    C4: the outcome is what the broker confirms on a read-back, never the
+    delete's acknowledgement. Only CANCEL_CONFIRMED clears the linked
+    ticket's kite_gtt_id. CANCEL_FAILED (502) and CANCEL_OUTCOME_UNKNOWN
+    (409) keep it, write a persistent reconciliation finding and tell the
+    user to delete the GTT in Kite; an expired session is still a 401."""
+    from backend import gtt_cancellation
     account = get_trading_account()
-    _call(lambda: kite.delete_gtt(gtt_id))
+    outcome = gtt_cancellation.cancel(kite, gtt_id)
 
     conn = get_connection()
     try:
         ticket = conn.execute(
-            "SELECT id FROM trade_tickets WHERE account_id = ? AND kite_gtt_id = ? AND mode = 'live'",
+            "SELECT id, symbol FROM trade_tickets WHERE account_id = ? AND kite_gtt_id = ? AND mode = 'live'",
             (account["id"], gtt_id),
         ).fetchone()
-        if ticket is not None:
-            conn.execute("UPDATE trade_tickets SET kite_gtt_id = NULL WHERE id = ?", (ticket["id"],))
-            conn.execute(
-                "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'modified', ?)",
-                (ticket["id"], f"GTT {gtt_id} cancelled manually — position now unprotected, still open"),
-            )
-        system_events.log_event(conn, account["id"], "gtt_cancelled_manually", f"gtt_id={gtt_id}")
+        if outcome.confirmed:
+            if ticket is not None:
+                conn.execute("UPDATE trade_tickets SET kite_gtt_id = NULL WHERE id = ?", (ticket["id"],))
+                conn.execute(
+                    "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'modified', ?)",
+                    (ticket["id"], f"GTT {gtt_id} cancelled manually (confirmed by the broker) — position now "
+                                   f"unprotected, still open"),
+                )
+            system_events.log_event(conn, account["id"], "gtt_cancelled_manually", f"gtt_id={gtt_id}")
+        else:
+            symbol = ticket["symbol"] if ticket is not None else f"GTT {gtt_id}"
+            gtt_cancellation.record_finding(conn, outcome, ticket_id=ticket["id"] if ticket else None,
+                                            symbol=symbol, context="a manual cancellation from the GTT page")
+            if ticket is not None:
+                conn.execute(
+                    "INSERT INTO ticket_events (ticket_id, event_type, detail) VALUES (?, 'modified', ?)",
+                    (ticket["id"], f"Manual cancellation of GTT {gtt_id}: {outcome.state} — {outcome.detail}"),
+                )
+            # No system event: 'gtt_cancelled_manually' would claim a cancellation; the
+            # reconciliation finding above is the persistent, actionable record.
         conn.commit()
     finally:
         conn.close()
 
-    return {"data": {"cancelled": True, "gtt_id": gtt_id, "linked_ticket_id": ticket["id"] if ticket else None}}
+    linked = ticket["id"] if ticket else None
+    if outcome.confirmed:
+        return {"data": {"cancelled": True, "outcome": outcome.state, "gtt_id": gtt_id, "linked_ticket_id": linked,
+                         "broker_status": outcome.broker_status}}
+    if isinstance(outcome.error, TokenException):
+        raise HTTPException(status_code=401, detail={
+            "error_code": "SESSION_EXPIRED", "outcome": outcome.state, "gtt_id": gtt_id,
+            "message": f"Your Zerodha session has expired, so GTT {gtt_id} was not cancelled. Reconnect, or "
+                       f"delete it in Kite."})
+    failed = outcome.state == gtt_cancellation.FAILED
+    raise HTTPException(status_code=502 if failed else 409, detail={
+        "error_code": "GTT_CANCEL_FAILED" if failed else "GTT_CANCEL_OUTCOME_UNKNOWN", "outcome": outcome.state,
+        "gtt_id": gtt_id, "linked_ticket_id": linked, "broker_status": outcome.broker_status,
+        "message": f"{outcome.detail} {'Delete it in Kite now.' if failed else 'Check it in Kite now.'} A "
+                   f"reconciliation finding was recorded."})

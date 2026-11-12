@@ -8,6 +8,7 @@ from backend import data_jobs, instruments, sector_mapping, watchlist
 from backend.accounts import get_trading_account
 from backend.kite_client import require_trading_account
 from backend.ticker import collect_instrument_tokens, ticker_manager
+from backend.instance_lock import WRITE_AUTHORITY
 
 router = APIRouter()
 
@@ -35,7 +36,7 @@ def get_watchlist(kite: KiteConnect = Depends(require_trading_account)):
     return {"data": watchlist.seed_live_quotes(kite, rows)}
 
 
-@router.post("/api/watchlist", status_code=201)
+@router.post("/api/watchlist", status_code=201, dependencies=WRITE_AUTHORITY)
 async def add_watchlist_symbol(req: WatchlistAddRequest, kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
 
@@ -68,7 +69,7 @@ async def add_watchlist_symbol(req: WatchlistAddRequest, kite: KiteConnect = Dep
     return {"data": row}
 
 
-@router.delete("/api/watchlist/{watchlist_id}")
+@router.delete("/api/watchlist/{watchlist_id}", dependencies=WRITE_AUTHORITY)
 def remove_watchlist_symbol(watchlist_id: int, kite: KiteConnect = Depends(require_trading_account)):
     account = get_trading_account()
     watchlist.remove_from_watchlist(account["id"], watchlist_id)
@@ -82,7 +83,7 @@ def get_watchlist_tags(kite: KiteConnect = Depends(require_trading_account)):
     return {"data": watchlist.distinct_tags(account["id"])}
 
 
-@router.put("/api/watchlist/{watchlist_id}/tag")
+@router.put("/api/watchlist/{watchlist_id}/tag", dependencies=WRITE_AUTHORITY)
 def update_watchlist_tag(
     watchlist_id: int, req: WatchlistTagRequest, kite: KiteConnect = Depends(require_trading_account)
 ):

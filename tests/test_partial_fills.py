@@ -17,6 +17,7 @@ import pytest
 from kiteconnect.exceptions import InputException
 
 from conftest import approval_body, account_id, as_pre_pk22_database, displayed_mode, set_mode, ticket_row
+from schema_builds import restart_old_database
 from test_baseline_api import _insert_ticket, _manual_ticket
 from test_live_safety import (  # noqa: F401 — market_open is a fixture
     _closed_trades_for, _monitor, _precondition, _protective_oco_gtt, _rows, _sells, _urgent_updates, market_open,
@@ -210,6 +211,7 @@ def test_5_emergency_exit_sells_the_40_held_not_the_100_ordered(env, market_open
 
 def test_5b_emergency_exit_on_a_working_partial_entry_cancels_the_rest_and_sells_the_fill(env, market_open):
     buy_id, order_id, gtt_id = _place_entry(env)
+    env.kite.positions_from_fills = True  # E3: Kite's positions show the day's CNC fills
     _fill(env, order_id, 25)
     _monitor(env)
     _fill(env, order_id, 40)  # more filled since the monitor last looked
@@ -357,7 +359,7 @@ def test_17_to_19_gtt_sell_partially_filled_leaves_60_open(env, market_open):
     [alert] = _messages(env, "UNPROTECTED: the exit order has ended")
     assert "60 share(s) are still held" in alert
     [result] = _emergency_exit(env)
-    assert result["status"] == "exit_submitted" and [s["quantity"] for s in _sells(env)] == [60]
+    assert result["status"] == "exit_submitted" and [s["quantity"] for s in _sells(env)] == [60], result["message"]
 
 
 def test_gtt_partial_then_complete_closes_once(env, market_open):
@@ -621,7 +623,7 @@ def test_migration_backfills_only_certain_fills_and_is_idempotent(env, monkeypat
         conn.close()
 
     as_pre_pk22_database(env.db)  # PK-22: the legacy migration runs once per database
-    db.init_db()
+    restart_old_database(db)      # the next start (v12: Phase 2 build to v11, then the authorized v12)
     after_first = {k: ticket_row(env.db, v)["filled_quantity"] for k, v in rows.items()}
     assert after_first == {"dry": 5, "legacy": 5, "filled": 5, "pending": 0, "partial": None,
                            "unconfirmed": None, "draft": None}

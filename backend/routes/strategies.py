@@ -10,6 +10,7 @@ from backend.models import STRATEGY_PARAMS_MODELS, BacktestRequest, StrategyConf
 from backend.strategies import STRATEGIES
 from backend.ticker import ticker_manager
 from backend.watchlist import list_watchlist
+from backend.instance_lock import WRITE_AUTHORITY
 
 router = APIRouter()
 
@@ -47,7 +48,7 @@ def list_strategies(kite: KiteConnect = Depends(require_trading_account)):
         conn.close()
 
 
-@router.post("/api/strategies/scan-now")
+@router.post("/api/strategies/scan-now", dependencies=WRITE_AUTHORITY)
 def scan_now(kite: KiteConnect = Depends(require_trading_account)):
     # Manual trigger for the same entry -> exit -> breakeven chain the daily
     # job runs — now covers every strategy_configs row with enabled=True in
@@ -81,7 +82,7 @@ def list_stop_adjustments(status: str = "pending", kite: KiteConnect = Depends(r
         conn.close()
 
 
-@router.post("/api/strategies/stop-adjustments/{proposal_id}/confirm")
+@router.post("/api/strategies/stop-adjustments/{proposal_id}/confirm", dependencies=WRITE_AUTHORITY)
 def confirm_stop_adjustment(proposal_id: int, kite: KiteConnect = Depends(require_trading_account)):
     conn = get_connection()
     try:
@@ -94,7 +95,7 @@ def confirm_stop_adjustment(proposal_id: int, kite: KiteConnect = Depends(requir
         conn.close()
 
 
-@router.post("/api/strategies/stop-adjustments/{proposal_id}/reject")
+@router.post("/api/strategies/stop-adjustments/{proposal_id}/reject", dependencies=WRITE_AUTHORITY)
 def reject_stop_adjustment(proposal_id: int, kite: KiteConnect = Depends(require_trading_account)):
     conn = get_connection()
     try:
@@ -107,7 +108,7 @@ def reject_stop_adjustment(proposal_id: int, kite: KiteConnect = Depends(require
         conn.close()
 
 
-@router.post("/api/strategies/backtests")
+@router.post("/api/strategies/backtests", dependencies=WRITE_AUTHORITY)
 def run_backtest_endpoint(req: BacktestRequest, kite: KiteConnect = Depends(require_trading_account)):
     _require_known_strategy(req.strategy_name)
     if req.start_date > req.end_date:
@@ -196,7 +197,7 @@ def get_strategy_config(strategy_name: str, kite: KiteConnect = Depends(require_
         conn.close()
 
 
-@router.put("/api/strategies/{strategy_name}")
+@router.put("/api/strategies/{strategy_name}", dependencies=WRITE_AUTHORITY)
 def save_strategy_config(
     strategy_name: str, req: StrategyConfigUpdateRequest, kite: KiteConnect = Depends(require_trading_account)
 ):

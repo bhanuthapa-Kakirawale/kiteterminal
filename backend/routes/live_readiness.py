@@ -18,6 +18,7 @@ from backend import live_preflight
 from backend.accounts import get_trading_account
 from backend.db import get_connection
 from backend.models import StaticIpConfirmRequest
+from backend.instance_lock import WRITE_AUTHORITY
 
 router = APIRouter()
 
@@ -35,7 +36,7 @@ def live_readiness(broker: bool = False, refresh: bool = False):
     return {"data": live_preflight.evaluate(broker=broker, refresh=refresh)}
 
 
-@router.post("/api/live-readiness/static-ip")
+@router.post("/api/live-readiness/static-ip", dependencies=WRITE_AUTHORITY)
 def confirm_static_ip(req: StaticIpConfirmRequest):
     account = _trading_account()
     if not req.confirm:
@@ -53,7 +54,7 @@ def confirm_static_ip(req: StaticIpConfirmRequest):
         conn.close()
 
 
-@router.post("/api/live-readiness/static-ip/clear")
+@router.post("/api/live-readiness/static-ip/clear", dependencies=WRITE_AUTHORITY)
 def clear_static_ip():
     account = _trading_account()
     conn = get_connection()
@@ -63,7 +64,7 @@ def clear_static_ip():
         conn.close()
 
 
-@router.post("/api/live-readiness/egress-check")
+@router.post("/api/live-readiness/egress-check", dependencies=WRITE_AUTHORITY)
 def egress_check():
     account = _trading_account()
     conn = get_connection()
